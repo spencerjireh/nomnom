@@ -1,6 +1,6 @@
 __pycache__/
 *.pyc
-.bundler-last.json
+.nomnom-last.json
 *-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9].txt
 .DS_Store
 .pytest_cache/

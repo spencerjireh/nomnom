@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""bundler.py - bundle selected repo files into a chat-pasteable .txt.
+"""nomnom.py - feed your repo to the LLM, one .txt snack at a time.
 
-Run: python3 bundler.py [/path/to/repo]
+Run: python3 nomnom.py [/path/to/repo]
 Stdlib only. macOS/Linux. Python 3.8+.
 """
 
@@ -27,7 +27,7 @@ JUNK_DIRS = {
 }
 LARGE_FILE_BYTES = 1_000_000
 BINARY_SNIFF_BYTES = 8192
-LAST_SELECTION_FILE = ".bundler-last.json"
+LAST_SELECTION_FILE = ".nomnom-last.json"
 
 
 # ---------- gitignore ----------
@@ -548,7 +548,7 @@ def confirm(prompt: str, default: bool = True) -> bool:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Bundle selected repo files into a chat-pasteable .txt."
+        description="nomnom: feed your repo to the LLM, one .txt snack at a time."
     )
     parser.add_argument(
         "repo", nargs="?", default=".",

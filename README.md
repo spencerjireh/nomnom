@@ -1,30 +1,32 @@
-# bundler
+# nomnom
 
-[![tests](https://github.com/spencerjireh/python-file-copier/actions/workflows/test.yml/badge.svg)](https://github.com/spencerjireh/python-file-copier/actions/workflows/test.yml)
+[![tests](https://github.com/spencerjireh/nomnom/actions/workflows/test.yml/badge.svg)](https://github.com/spencerjireh/nomnom/actions/workflows/test.yml)
 
-A tiny single-file Python CLI that bundles selected files from any project into one `.txt` you can paste into a chat app. Like [repomix](https://github.com/yamadashy/repomix), but pocket-sized.
+> the LLM is hungry. feed it your repo.
+
+A tiny single-file Python CLI that nomnoms selected files from any project into one `.txt` you can paste into a chat app. Like [repomix](https://github.com/yamadashy/repomix), but pocket-sized and slightly less serious.
 
 - One file. **Stdlib only.** No `pip install`, no `uv`, no virtualenv.
 - Interactive `curses` picker with expand/collapse, filter, and folder cascade-check.
 - Respects `.gitignore`. Skips junk dirs, binaries, and symlinks by default.
-- Output mimics repomix: `<file path="...">…</file>` blocks the LLM can parse cleanly.
+- Output mimics repomix: `<file path="...">…</file>` blocks the LLM can chew on.
 
 ## Install
 
 There is no install. Drop the file anywhere:
 
 ```sh
-curl -O https://raw.githubusercontent.com/spencerjireh/python-file-copier/main/bundler.py
+curl -O https://raw.githubusercontent.com/spencerjireh/nomnom/main/nomnom.py
 ```
 
-## Use
+## Feed it
 
 ```sh
-python3 bundler.py            # bundle the current directory
-python3 bundler.py ~/code/foo # bundle a specific repo
+python3 nomnom.py            # nom the current directory
+python3 nomnom.py ~/code/foo # nom a specific repo
 ```
 
-You'll get an interactive picker, a confirmation summary, then a file like `foo-20260503-101415.txt` in your current dir.
+You'll get an interactive picker, a confirmation summary, then a file like `foo-20260503-101415.txt` in your current dir. Drag it into your favourite chat app and watch the model graze.
 
 ## Picker keys
 
@@ -57,7 +59,7 @@ foo/
 </file>
 ```
 
-Bundler also stashes your last selection in `.bundler-last.json` at the repo root, so a second run offers to reuse it.
+nomnom also stashes your last selection in `.nomnom-last.json` at the repo root, so a second run offers to reuse it. (Yes, it remembers what you fed it last time.)
 
 ## Requirements
 

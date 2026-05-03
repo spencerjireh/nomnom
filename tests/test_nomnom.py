@@ -1,4 +1,4 @@
-"""Tests for bundler.py.
+"""Tests for nomnom.py.
 
 Covers the pure-logic surface: gitignore matching, repo scanning,
 tree model, selection cascade, output rendering, and last-selection
@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-import bundler
+import nomnom as bundler
 
 
 # ---------- helpers ----------
