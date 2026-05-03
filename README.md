@@ -4,7 +4,7 @@
 
 > the LLM is hungry. feed it your repo.
 
-A tiny single-file Python CLI that nomnoms selected files from any project into one `.txt` you can paste into a chat app. Like [repomix](https://github.com/yamadashy/repomix), but pocket-sized and slightly less serious.
+A single-file Python CLI that bundles selected files from any project into one `.txt` you can paste into a chat app. Output format is similar to [repomix](https://github.com/yamadashy/repomix); the distribution model is different — one file, stdlib only, no install step.
 
 - One file. **Stdlib only.** No `pip install`, no `uv`, no virtualenv.
 - Interactive `curses` picker with color, expand/collapse, mouse, fuzzy filter, and folder cascade-check.
@@ -13,13 +13,13 @@ A tiny single-file Python CLI that nomnoms selected files from any project into 
 
 ## Install
 
-There is no install. Drop the file anywhere:
+Single file, stdlib only. Drop it anywhere Python can find it:
 
 ```sh
 curl -O https://raw.githubusercontent.com/spencerjireh/nomnom/main/nomnom.py
 ```
 
-Want a real `nomnom` command on your `$PATH`?
+For a `nomnom` command on `$PATH`:
 
 ```sh
 chmod +x nomnom.py
@@ -35,6 +35,26 @@ python3 nomnom.py --copy .       # straight to your clipboard, no file
 ```
 
 You'll get an interactive picker, a confirmation summary, then either a file like `foo-20260503-101415.txt` in your current dir or the bundle on your clipboard. Drag it into your favourite chat app and watch the model graze.
+
+nomnom writes `.nomnom-last.json` at the target repo root to remember the last selection — a second run on the same repo offers to reuse it.
+
+## What you get
+
+```text
+This is a packed representation of selected files from foo, bundled on …
+
+<file_tree>
+foo/
+├── src/
+│   └── api/
+│       └── handlers.py
+└── README.md
+</file_tree>
+
+<file path="src/api/handlers.py">
+…
+</file>
+```
 
 ## Flags
 
@@ -86,26 +106,6 @@ gh pr create --fill
 
 Conflicts are refused: registering `.foo` as text when it's already in BINARY_EXTENSIONS errors out and tells you to unregister it first. Re-registering an existing entry is a harmless no-op. nomnom doesn't touch git itself — review and commit are yours.
 
-## What you get
-
-```text
-This is a packed representation of selected files from foo, bundled on …
-
-<file_tree>
-foo/
-├── src/
-│   └── api/
-│       └── handlers.py
-└── README.md
-</file_tree>
-
-<file path="src/api/handlers.py">
-…
-</file>
-```
-
-nomnom also stashes your last selection in `.nomnom-last.json` at the repo root, so a second run offers to reuse it. (Yes, it remembers what you fed it last time.)
-
 ## Environment
 
 - `NO_COLOR=1` — disable color in the picker.
@@ -137,4 +137,4 @@ CI runs the tests on macOS and Linux against Python 3.8 – 3.12.
 
 ## License
 
-MIT
+MIT — see [LICENSE](./LICENSE).

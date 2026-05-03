@@ -1,3 +1,10 @@
+[project]
+name = "nomnom"
+version = "0.1.0"
+description = "Feed your repo to the LLM, one .txt snack at a time."
+requires-python = ">=3.8"
+license = { file = "LICENSE" }
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
