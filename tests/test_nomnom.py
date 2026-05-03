@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-import nomnom as bundler
+import nomnom
 
 
 # ---------- helpers ----------
@@ -57,7 +57,7 @@ class TestGlobToRegex:
         ("foo[12]", "foo3", False),
     ])
     def test_unanchored(self, pattern, path, expected):
-        regex = bundler._glob_to_regex(pattern, anchored=False)
+        regex = nomnom._glob_to_regex(pattern, anchored=False)
         assert bool(regex.match(path)) is expected
 
     @pytest.mark.parametrize("pattern,path,expected", [
@@ -67,7 +67,7 @@ class TestGlobToRegex:
         ("a/b", "x/a/b", False),
     ])
     def test_anchored(self, pattern, path, expected):
-        regex = bundler._glob_to_regex(pattern, anchored=True)
+        regex = nomnom._glob_to_regex(pattern, anchored=True)
         assert bool(regex.match(path)) is expected
 
     @pytest.mark.parametrize("pattern,path,expected", [
@@ -79,44 +79,44 @@ class TestGlobToRegex:
         ("a/**/b", "a/x/y/b", True),
     ])
     def test_double_star(self, pattern, path, expected):
-        regex = bundler._glob_to_regex(pattern, anchored=True)
+        regex = nomnom._glob_to_regex(pattern, anchored=True)
         assert bool(regex.match(path)) is expected
 
     def test_path_with_descendants_is_treated_as_match(self):
         # The matcher uses (?:/.*)?$ so "build" matches "build/anything"
-        regex = bundler._glob_to_regex("build", anchored=True)
+        regex = nomnom._glob_to_regex("build", anchored=True)
         assert regex.match("build/x.txt")
 
 
 class TestGitignoreMatcher:
     def test_simple_glob_unanchored(self, tmp_path):
         (tmp_path / ".gitignore").write_text("*.log\n")
-        gi = bundler.load_gitignore(tmp_path)
+        gi = nomnom.load_gitignore(tmp_path)
         assert gi.is_ignored("foo.log", is_dir=False)
         assert gi.is_ignored("src/foo.log", is_dir=False)
         assert not gi.is_ignored("foo.txt", is_dir=False)
 
     def test_anchored_pattern(self, tmp_path):
         (tmp_path / ".gitignore").write_text("/build\n")
-        gi = bundler.load_gitignore(tmp_path)
+        gi = nomnom.load_gitignore(tmp_path)
         assert gi.is_ignored("build", is_dir=True)
         assert not gi.is_ignored("src/build", is_dir=True)
 
     def test_dir_only_matches_dir_not_file(self, tmp_path):
         (tmp_path / ".gitignore").write_text("foo/\n")
-        gi = bundler.load_gitignore(tmp_path)
+        gi = nomnom.load_gitignore(tmp_path)
         assert gi.is_ignored("foo", is_dir=True)
         assert not gi.is_ignored("foo", is_dir=False)
 
     def test_negation(self, tmp_path):
         (tmp_path / ".gitignore").write_text("*.log\n!keep.log\n")
-        gi = bundler.load_gitignore(tmp_path)
+        gi = nomnom.load_gitignore(tmp_path)
         assert gi.is_ignored("debug.log", is_dir=False)
         assert not gi.is_ignored("keep.log", is_dir=False)
 
     def test_blank_lines_and_comments(self, tmp_path):
         (tmp_path / ".gitignore").write_text("\n# comment\n\n*.tmp\n")
-        gi = bundler.load_gitignore(tmp_path)
+        gi = nomnom.load_gitignore(tmp_path)
         assert gi.is_ignored("x.tmp", is_dir=False)
         assert not gi.is_ignored("x.txt", is_dir=False)
 
@@ -124,14 +124,14 @@ class TestGitignoreMatcher:
         (tmp_path / ".gitignore").write_text("a.txt\n")
         (tmp_path / "sub").mkdir()
         (tmp_path / "sub" / ".gitignore").write_text("b.txt\n")
-        gi = bundler.load_gitignore(tmp_path)
+        gi = nomnom.load_gitignore(tmp_path)
         assert gi.is_ignored("a.txt", is_dir=False)
         assert gi.is_ignored("sub/a.txt", is_dir=False)
         assert gi.is_ignored("sub/b.txt", is_dir=False)
         assert not gi.is_ignored("b.txt", is_dir=False)
 
     def test_no_gitignore_means_nothing_ignored(self, tmp_path):
-        gi = bundler.load_gitignore(tmp_path)
+        gi = nomnom.load_gitignore(tmp_path)
         assert not gi.is_ignored("anything.txt", is_dir=False)
         assert not gi.is_ignored("any/dir", is_dir=True)
 
@@ -142,16 +142,16 @@ class TestIsBinary:
     def test_text_file_is_not_binary(self, tmp_path):
         p = tmp_path / "t.txt"
         p.write_text("hello world\n")
-        assert bundler.is_binary(p) is False
+        assert nomnom.is_binary(p) is False
 
     def test_null_byte_makes_binary(self, tmp_path):
         p = tmp_path / "b.bin"
         p.write_bytes(b"hello\x00world")
-        assert bundler.is_binary(p) is True
+        assert nomnom.is_binary(p) is True
 
     def test_unreadable_treated_as_binary(self, tmp_path):
         # A path that doesn't exist returns True (treated as skip).
-        assert bundler.is_binary(tmp_path / "missing") is True
+        assert nomnom.is_binary(tmp_path / "missing") is True
 
 
 # ---------- scan_repo ----------
@@ -165,8 +165,8 @@ class TestScanRepo:
             },
             "README.md": "readme",
         })
-        gi = bundler.load_gitignore(tmp_path)
-        items = bundler.scan_repo(tmp_path, gi)
+        gi = nomnom.load_gitignore(tmp_path)
+        items = nomnom.scan_repo(tmp_path, gi)
         assert rels(items) == [
             "src",
             "src/api",
@@ -183,8 +183,8 @@ class TestScanRepo:
             ".git": {"HEAD": "ref"},
             ".venv": {"bin": {"activate": "junk"}},
         })
-        gi = bundler.load_gitignore(tmp_path)
-        items = bundler.scan_repo(tmp_path, gi)
+        gi = nomnom.load_gitignore(tmp_path)
+        items = nomnom.scan_repo(tmp_path, gi)
         paths = rels(items)
         assert "node_modules" not in paths
         assert "__pycache__" not in paths
@@ -199,8 +199,8 @@ class TestScanRepo:
             "app.log": "noise",
             "app.py": "code",
         })
-        gi = bundler.load_gitignore(tmp_path)
-        paths = rels(bundler.scan_repo(tmp_path, gi))
+        gi = nomnom.load_gitignore(tmp_path)
+        paths = rels(nomnom.scan_repo(tmp_path, gi))
         assert "secrets" not in paths
         assert "secrets/key.txt" not in paths
         assert "app.log" not in paths
@@ -211,8 +211,8 @@ class TestScanRepo:
             "code.py": "print('hi')",
             "blob.bin": b"\x00\x01\x02\x03",
         })
-        gi = bundler.load_gitignore(tmp_path)
-        paths = rels(bundler.scan_repo(tmp_path, gi))
+        gi = nomnom.load_gitignore(tmp_path)
+        paths = rels(nomnom.scan_repo(tmp_path, gi))
         assert "code.py" in paths
         assert "blob.bin" not in paths
 
@@ -220,24 +220,24 @@ class TestScanRepo:
     def test_symlinks_skipped(self, tmp_path):
         make_repo(tmp_path, {"real.py": "x"})
         os.symlink(tmp_path / "real.py", tmp_path / "link.py")
-        gi = bundler.load_gitignore(tmp_path)
-        paths = rels(bundler.scan_repo(tmp_path, gi))
+        gi = nomnom.load_gitignore(tmp_path)
+        paths = rels(nomnom.scan_repo(tmp_path, gi))
         assert "real.py" in paths
         assert "link.py" not in paths
 
     def test_empty_repo(self, tmp_path):
-        gi = bundler.load_gitignore(tmp_path)
-        assert bundler.scan_repo(tmp_path, gi) == []
+        gi = nomnom.load_gitignore(tmp_path)
+        assert nomnom.scan_repo(tmp_path, gi) == []
 
 
 # ---------- build_tree / visible_indices ----------
 
 class TestBuildTree:
     def _items(self, *pairs):
-        return [bundler.ScanItem(rel=r, is_dir=is_dir) for r, is_dir in pairs]
+        return [nomnom.ScanItem(rel=r, is_dir=is_dir) for r, is_dir in pairs]
 
     def test_parent_child_links(self):
-        nodes = bundler.build_tree(self._items(
+        nodes = nomnom.build_tree(self._items(
             ("src", True),
             ("src/api", True),
             ("src/api/handlers.py", False),
@@ -252,13 +252,13 @@ class TestBuildTree:
         assert by_rel["src/api/handlers.py"] in nodes[by_rel["src/api"]].children
 
     def test_depth(self):
-        nodes = bundler.build_tree(self._items(
+        nodes = nomnom.build_tree(self._items(
             ("a", True), ("a/b", True), ("a/b/c.py", False),
         ))
         assert [n.depth for n in nodes] == [0, 1, 2]
 
     def test_default_collapsed(self):
-        nodes = bundler.build_tree(self._items(
+        nodes = nomnom.build_tree(self._items(
             ("src", True), ("src/main.py", False),
         ))
         assert all(not n.expanded for n in nodes)
@@ -266,22 +266,22 @@ class TestBuildTree:
 
 class TestVisibleIndices:
     def test_root_always_visible(self):
-        nodes = bundler.build_tree([
-            bundler.ScanItem(rel="a", is_dir=True),
-            bundler.ScanItem(rel="b.py", is_dir=False),
+        nodes = nomnom.build_tree([
+            nomnom.ScanItem(rel="a", is_dir=True),
+            nomnom.ScanItem(rel="b.py", is_dir=False),
         ])
-        assert bundler.visible_indices(nodes) == [0, 1]
+        assert nomnom.visible_indices(nodes) == [0, 1]
 
     def test_collapsed_dir_hides_children(self):
-        nodes = bundler.build_tree([
-            bundler.ScanItem(rel="src", is_dir=True),
-            bundler.ScanItem(rel="src/a.py", is_dir=False),
-            bundler.ScanItem(rel="src/b.py", is_dir=False),
+        nodes = nomnom.build_tree([
+            nomnom.ScanItem(rel="src", is_dir=True),
+            nomnom.ScanItem(rel="src/a.py", is_dir=False),
+            nomnom.ScanItem(rel="src/b.py", is_dir=False),
         ])
         # src collapsed (default) -> only src visible
-        assert bundler.visible_indices(nodes) == [0]
+        assert nomnom.visible_indices(nodes) == [0]
         nodes[0].expanded = True
-        assert bundler.visible_indices(nodes) == [0, 1, 2]
+        assert nomnom.visible_indices(nodes) == [0, 1, 2]
 
 
 # ---------- cascade_check ----------
@@ -289,18 +289,18 @@ class TestVisibleIndices:
 class TestCascadeCheck:
     def _three_level(self):
         items = [
-            bundler.ScanItem(rel="src", is_dir=True),
-            bundler.ScanItem(rel="src/api", is_dir=True),
-            bundler.ScanItem(rel="src/api/h.py", is_dir=False),
-            bundler.ScanItem(rel="src/api/m.py", is_dir=False),
-            bundler.ScanItem(rel="src/u.py", is_dir=False),
-            bundler.ScanItem(rel="README.md", is_dir=False),
+            nomnom.ScanItem(rel="src", is_dir=True),
+            nomnom.ScanItem(rel="src/api", is_dir=True),
+            nomnom.ScanItem(rel="src/api/h.py", is_dir=False),
+            nomnom.ScanItem(rel="src/api/m.py", is_dir=False),
+            nomnom.ScanItem(rel="src/u.py", is_dir=False),
+            nomnom.ScanItem(rel="README.md", is_dir=False),
         ]
-        return bundler.build_tree(items)
+        return nomnom.build_tree(items)
 
     def test_cascade_check_dir_sets_all_descendants(self):
         nodes = self._three_level()
-        bundler.cascade_check(nodes, 0, True)  # src
+        nomnom.cascade_check(nodes, 0, True)  # src
         for n in nodes[:5]:
             assert n.checked is True
         assert nodes[5].checked is False  # README is sibling
@@ -309,7 +309,7 @@ class TestCascadeCheck:
         nodes = self._three_level()
         for n in nodes:
             n.checked = True
-        bundler.cascade_check(nodes, 1, False)  # src/api
+        nomnom.cascade_check(nodes, 1, False)  # src/api
         assert nodes[1].checked is False
         assert nodes[2].checked is False
         assert nodes[3].checked is False
@@ -318,7 +318,7 @@ class TestCascadeCheck:
 
     def test_cascade_on_leaf_only_affects_leaf(self):
         nodes = self._three_level()
-        bundler.cascade_check(nodes, 5, True)
+        nomnom.cascade_check(nodes, 5, True)
         assert nodes[5].checked is True
         assert all(n.checked is False for n in nodes[:5])
 
@@ -327,11 +327,11 @@ class TestCascadeCheck:
 
 class TestRenderAsciiTree:
     def test_single_file(self):
-        out = bundler.render_ascii_tree(["a.py"], "repo")
+        out = nomnom.render_ascii_tree(["a.py"], "repo")
         assert out == "repo/\n└── a.py"
 
     def test_dirs_before_files(self):
-        out = bundler.render_ascii_tree(
+        out = nomnom.render_ascii_tree(
             ["README.md", "src/main.py"], "repo"
         )
         lines = out.splitlines()
@@ -340,7 +340,7 @@ class TestRenderAsciiTree:
         assert lines.index("├── src/") < lines.index("└── README.md")
 
     def test_nested_indentation(self):
-        out = bundler.render_ascii_tree(
+        out = nomnom.render_ascii_tree(
             ["src/api/handlers.py", "src/api/models.py"], "repo"
         )
         assert "repo/" in out
@@ -355,7 +355,7 @@ class TestRenderAsciiTree:
 class TestRenderOutput:
     def test_includes_header_and_files(self, tmp_path):
         (tmp_path / "a.py").write_text("print('a')\n")
-        out = bundler.render_output("myrepo", tmp_path, ["a.py"], None)
+        out = nomnom.render_output("myrepo", tmp_path, ["a.py"], None)
         assert "packed representation of selected files from myrepo" in out
         assert '<file path="a.py">' in out
         assert "print('a')" in out
@@ -363,7 +363,7 @@ class TestRenderOutput:
 
     def test_includes_tree_when_provided(self, tmp_path):
         (tmp_path / "a.py").write_text("x")
-        out = bundler.render_output(
+        out = nomnom.render_output(
             "myrepo", tmp_path, ["a.py"], "myrepo/\n└── a.py"
         )
         assert "<file_tree>" in out
@@ -372,18 +372,18 @@ class TestRenderOutput:
 
     def test_omits_tree_when_none(self, tmp_path):
         (tmp_path / "a.py").write_text("x")
-        out = bundler.render_output("myrepo", tmp_path, ["a.py"], None)
+        out = nomnom.render_output("myrepo", tmp_path, ["a.py"], None)
         assert "<file_tree>" not in out
 
     def test_handles_non_utf8(self, tmp_path):
         (tmp_path / "weird.txt").write_bytes(b"valid\xff\xfeinvalid utf8")
-        out = bundler.render_output("r", tmp_path, ["weird.txt"], None)
+        out = nomnom.render_output("r", tmp_path, ["weird.txt"], None)
         assert '<file path="weird.txt">' in out
         # Should not raise; content goes through errors="replace"
         assert "valid" in out
 
     def test_read_error_inlined(self, tmp_path):
-        out = bundler.render_output("r", tmp_path, ["does-not-exist.py"], None)
+        out = nomnom.render_output("r", tmp_path, ["does-not-exist.py"], None)
         assert "<<read error" in out
 
 
@@ -392,46 +392,59 @@ class TestRenderOutput:
 class TestPickOutputPath:
     def test_unique_when_no_collision(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
-        p = bundler.pick_output_path("repo")
+        p = nomnom.pick_output_path("repo")
         assert p.parent == tmp_path
         assert p.name.startswith("repo-") and p.name.endswith(".txt")
 
     def test_appends_suffix_on_collision(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
-        p1 = bundler.pick_output_path("repo")
+        # Freeze the timestamp so both calls collide and the suffix path runs.
+        fixed = "20260503-120000"
+
+        class _FrozenDatetime:
+            @staticmethod
+            def now():
+                class _T:
+                    def strftime(self, _fmt):
+                        return fixed
+                return _T()
+
+        monkeypatch.setattr(nomnom, "datetime", _FrozenDatetime)
+        p1 = nomnom.pick_output_path("repo")
+        assert p1.name == f"repo-{fixed}.txt"
         p1.write_text("first")
-        p2 = bundler.pick_output_path("repo")
-        # Either timestamp differs (extremely fast tests run in same second though),
-        # or a -2 suffix was added.
-        assert p2 != p1
-        assert p2.parent == tmp_path
+        p2 = nomnom.pick_output_path("repo")
+        assert p2.name == f"repo-{fixed}-2.txt"
+        p2.write_text("second")
+        p3 = nomnom.pick_output_path("repo")
+        assert p3.name == f"repo-{fixed}-3.txt"
 
 
 # ---------- last selection ----------
 
 class TestLastSelection:
     def test_save_and_load_roundtrip(self, tmp_path):
-        bundler.save_last_selection(tmp_path, ["a.py", "src/b.py"])
-        out = bundler.load_last_selection(tmp_path)
+        nomnom.save_last_selection(tmp_path, ["a.py", "src/b.py"])
+        out = nomnom.load_last_selection(tmp_path)
         assert out == ["a.py", "src/b.py"]
 
     def test_load_missing_returns_none(self, tmp_path):
-        assert bundler.load_last_selection(tmp_path) is None
+        assert nomnom.load_last_selection(tmp_path) is None
 
     def test_load_invalid_json_returns_none(self, tmp_path):
-        (tmp_path / bundler.LAST_SELECTION_FILE).write_text("{not json")
-        assert bundler.load_last_selection(tmp_path) is None
+        (tmp_path / nomnom.LAST_SELECTION_FILE).write_text("{not json")
+        assert nomnom.load_last_selection(tmp_path) is None
 
     def test_load_wrong_shape_returns_none(self, tmp_path):
-        (tmp_path / bundler.LAST_SELECTION_FILE).write_text(
+        (tmp_path / nomnom.LAST_SELECTION_FILE).write_text(
             json.dumps({"selected": [1, 2, 3]})
         )
-        assert bundler.load_last_selection(tmp_path) is None
+        assert nomnom.load_last_selection(tmp_path) is None
 
     def test_save_is_deterministically_sorted(self, tmp_path):
-        bundler.save_last_selection(tmp_path, ["z.py", "a.py", "m.py"])
+        nomnom.save_last_selection(tmp_path, ["z.py", "a.py", "m.py"])
         data = json.loads(
-            (tmp_path / bundler.LAST_SELECTION_FILE).read_text()
+            (tmp_path / nomnom.LAST_SELECTION_FILE).read_text()
         )
         assert data["selected"] == ["a.py", "m.py", "z.py"]
 
@@ -442,24 +455,24 @@ class TestIsBinaryExtensions:
     def test_known_text_extension_skips_byte_sniff(self, tmp_path):
         p = tmp_path / "trick.py"
         p.write_bytes(b"print('hi')\x00")
-        assert bundler.is_binary(p) is False
+        assert nomnom.is_binary(p) is False
 
     def test_known_binary_extension_skipped_without_reading(self, tmp_path):
-        assert bundler.is_binary(tmp_path / "missing.png") is True
+        assert nomnom.is_binary(tmp_path / "missing.png") is True
 
     def test_known_text_name_no_extension(self, tmp_path):
         p = tmp_path / "Makefile"
         p.write_text("all:\n\techo hi\n")
-        assert bundler.is_binary(p) is False
+        assert nomnom.is_binary(p) is False
 
     def test_unknown_extension_falls_through_to_sniff(self, tmp_path):
         text = tmp_path / "data.xyz"
         text.write_text("some text content")
-        assert bundler.is_binary(text) is False
+        assert nomnom.is_binary(text) is False
 
         binary = tmp_path / "blob.xyz"
         binary.write_bytes(b"\x00\x01\x02")
-        assert bundler.is_binary(binary) is True
+        assert nomnom.is_binary(binary) is True
 
 
 # ---------- secret files ----------
@@ -482,7 +495,7 @@ class TestIsSecretFile:
         "keystore.pfx",
     ])
     def test_secret_names_match(self, name):
-        assert bundler.is_secret_file(name) is True
+        assert nomnom.is_secret_file(name) is True
 
     @pytest.mark.parametrize("name", [
         "env.example",
@@ -492,7 +505,7 @@ class TestIsSecretFile:
         "config.yaml",
     ])
     def test_safe_names_do_not_match(self, name):
-        assert bundler.is_secret_file(name) is False
+        assert nomnom.is_secret_file(name) is False
 
 
 class TestScanReposSkipSecrets:
@@ -507,8 +520,8 @@ class TestScanReposSkipSecrets:
 
     def test_secrets_skipped_by_default(self, tmp_path):
         make_repo(tmp_path, self._layout())
-        gi = bundler.load_gitignore(tmp_path)
-        paths = rels(bundler.scan_repo(tmp_path, gi))
+        gi = nomnom.load_gitignore(tmp_path)
+        paths = rels(nomnom.scan_repo(tmp_path, gi))
         assert ".env" not in paths
         assert "cert.pem" not in paths
         assert "id_rsa" not in paths
@@ -517,8 +530,8 @@ class TestScanReposSkipSecrets:
 
     def test_include_secrets_returns_them(self, tmp_path):
         make_repo(tmp_path, self._layout())
-        gi = bundler.load_gitignore(tmp_path)
-        paths = rels(bundler.scan_repo(tmp_path, gi, skip_secrets=False))
+        gi = nomnom.load_gitignore(tmp_path)
+        paths = rels(nomnom.scan_repo(tmp_path, gi, skip_secrets=False))
         assert ".env" in paths
         assert "cert.pem" in paths
         assert "id_rsa" in paths
@@ -532,37 +545,37 @@ class TestClipboardDetect:
     def test_pbcopy_wins_when_present(self, monkeypatch):
         monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
         monkeypatch.setattr(
-            bundler.shutil, "which",
+            nomnom.shutil, "which",
             lambda c: "/usr/bin/pbcopy" if c == "pbcopy" else None,
         )
-        assert bundler.detect_clipboard_cmd() == ["pbcopy"]
+        assert nomnom.detect_clipboard_cmd() == ["pbcopy"]
 
     def test_xclip_on_x11(self, monkeypatch):
         monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
         avail = {"xclip": "/usr/bin/xclip"}
-        monkeypatch.setattr(bundler.shutil, "which", lambda c: avail.get(c))
-        assert bundler.detect_clipboard_cmd() == [
+        monkeypatch.setattr(nomnom.shutil, "which", lambda c: avail.get(c))
+        assert nomnom.detect_clipboard_cmd() == [
             "xclip", "-selection", "clipboard"
         ]
 
     def test_wayland_prefers_wl_copy(self, monkeypatch):
         monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-0")
         avail = {"wl-copy": "/usr/bin/wl-copy", "xclip": "/usr/bin/xclip"}
-        monkeypatch.setattr(bundler.shutil, "which", lambda c: avail.get(c))
-        assert bundler.detect_clipboard_cmd() == ["wl-copy"]
+        monkeypatch.setattr(nomnom.shutil, "which", lambda c: avail.get(c))
+        assert nomnom.detect_clipboard_cmd() == ["wl-copy"]
 
     def test_xsel_fallback_when_only_xsel(self, monkeypatch):
         monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
         avail = {"xsel": "/usr/bin/xsel"}
-        monkeypatch.setattr(bundler.shutil, "which", lambda c: avail.get(c))
-        assert bundler.detect_clipboard_cmd() == [
+        monkeypatch.setattr(nomnom.shutil, "which", lambda c: avail.get(c))
+        assert nomnom.detect_clipboard_cmd() == [
             "xsel", "--clipboard", "--input"
         ]
 
     def test_returns_none_when_nothing_available(self, monkeypatch):
         monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
-        monkeypatch.setattr(bundler.shutil, "which", lambda c: None)
-        assert bundler.detect_clipboard_cmd() is None
+        monkeypatch.setattr(nomnom.shutil, "which", lambda c: None)
+        assert nomnom.detect_clipboard_cmd() is None
 
 
 class TestCopyToClipboard:
@@ -574,9 +587,9 @@ class TestCopyToClipboard:
             class R: pass
             return R()
 
-        monkeypatch.setattr(bundler, "detect_clipboard_cmd", lambda: ["pbcopy"])
-        monkeypatch.setattr(bundler.subprocess, "run", fake_run)
-        ok = bundler.copy_to_clipboard("hello world")
+        monkeypatch.setattr(nomnom, "detect_clipboard_cmd", lambda: ["pbcopy"])
+        monkeypatch.setattr(nomnom.subprocess, "run", fake_run)
+        ok = nomnom.copy_to_clipboard("hello world")
         assert ok is True
         assert captured["cmd"] == ["pbcopy"]
         assert captured["input"] == "hello world"
@@ -584,8 +597,8 @@ class TestCopyToClipboard:
         assert captured["check"] is True
 
     def test_returns_false_when_no_tool(self, monkeypatch):
-        monkeypatch.setattr(bundler, "detect_clipboard_cmd", lambda: None)
-        assert bundler.copy_to_clipboard("x") is False
+        monkeypatch.setattr(nomnom, "detect_clipboard_cmd", lambda: None)
+        assert nomnom.copy_to_clipboard("x") is False
 
     def test_returns_false_on_subprocess_error(self, monkeypatch):
         import subprocess as sp
@@ -593,9 +606,9 @@ class TestCopyToClipboard:
         def fake_run(*a, **kw):
             raise sp.CalledProcessError(1, ["pbcopy"])
 
-        monkeypatch.setattr(bundler, "detect_clipboard_cmd", lambda: ["pbcopy"])
-        monkeypatch.setattr(bundler.subprocess, "run", fake_run)
-        assert bundler.copy_to_clipboard("x") is False
+        monkeypatch.setattr(nomnom, "detect_clipboard_cmd", lambda: ["pbcopy"])
+        monkeypatch.setattr(nomnom.subprocess, "run", fake_run)
+        assert nomnom.copy_to_clipboard("x") is False
 
 
 # ---------- register / unregister ----------
@@ -620,7 +633,7 @@ def make_fixture(
         "KNOWN_TEXT_NAMES": names,
         "SECRET_PATTERNS": secrets,
     }
-    block = bundler._emit_block(parsed)
+    block = nomnom._emit_block(parsed)
     p = tmp_path / "fixture.py"
     p.write_text(
         f"{prefix}# --- nomnom:extensions ---\n{block}# --- end nomnom:extensions ---\n{suffix}",
@@ -632,7 +645,7 @@ def make_fixture(
 class TestRegister:
     def test_register_text_adds_and_sorts(self, tmp_path):
         p = make_fixture(tmp_path)
-        rc = bundler.cmd_register("text", [".zzz", ".aaa"], path=p)
+        rc = nomnom.cmd_register("text", [".zzz", ".aaa"], path=p)
         assert rc == 0
         content = p.read_text()
         assert "'.aaa'," in content
@@ -643,7 +656,7 @@ class TestRegister:
     def test_idempotent_no_rewrite(self, tmp_path, capsys):
         p = make_fixture(tmp_path)
         before = p.read_bytes()
-        rc = bundler.cmd_register("text", [".py"], path=p)
+        rc = nomnom.cmd_register("text", [".py"], path=p)
         assert rc == 0
         out = capsys.readouterr().out
         assert "already in TEXT_EXTENSIONS" in out
@@ -651,7 +664,7 @@ class TestRegister:
 
     def test_unregister_removes(self, tmp_path):
         p = make_fixture(tmp_path, text={".py", ".rs"})
-        rc = bundler.cmd_register("text", [".rs"], remove=True, path=p)
+        rc = nomnom.cmd_register("text", [".rs"], remove=True, path=p)
         assert rc == 0
         content = p.read_text()
         assert "'.rs'," not in content
@@ -660,7 +673,7 @@ class TestRegister:
     def test_unregister_missing_is_noop(self, tmp_path, capsys):
         p = make_fixture(tmp_path)
         before = p.read_bytes()
-        rc = bundler.cmd_register("text", [".never"], remove=True, path=p)
+        rc = nomnom.cmd_register("text", [".never"], remove=True, path=p)
         assert rc == 0
         out = capsys.readouterr().out
         assert "not in TEXT_EXTENSIONS" in out
@@ -669,7 +682,7 @@ class TestRegister:
     def test_conflict_refuses(self, tmp_path, capsys):
         p = make_fixture(tmp_path, text={".py"}, binary={".png"})
         before = p.read_bytes()
-        rc = bundler.cmd_register("text", [".png"], path=p)
+        rc = nomnom.cmd_register("text", [".png"], path=p)
         assert rc == 1
         err = capsys.readouterr().err
         assert "already in BINARY_EXTENSIONS" in err
@@ -678,7 +691,7 @@ class TestRegister:
 
     def test_register_secret_preserves_list_order(self, tmp_path):
         p = make_fixture(tmp_path, secrets=[".env", "*.pem"])
-        rc = bundler.cmd_register("secret", ["*.creds"], path=p)
+        rc = nomnom.cmd_register("secret", ["*.creds"], path=p)
         assert rc == 0
         content = p.read_text()
         # New entry appended; existing order kept
@@ -688,11 +701,11 @@ class TestRegister:
         p = tmp_path / "no_markers.py"
         p.write_text("TEXT_EXTENSIONS = {'.py'}\n")
         with pytest.raises(RuntimeError, match="marker block"):
-            bundler.cmd_register("text", [".x"], path=p)
+            nomnom.cmd_register("text", [".x"], path=p)
 
     def test_multi_value_call(self, tmp_path):
         p = make_fixture(tmp_path)
-        rc = bundler.cmd_register("text", [".a", ".b", ".c"], path=p)
+        rc = nomnom.cmd_register("text", [".a", ".b", ".c"], path=p)
         assert rc == 0
         content = p.read_text()
         for ext in (".a", ".b", ".c"):
@@ -700,15 +713,15 @@ class TestRegister:
 
     def test_register_name_with_dot(self, tmp_path):
         p = make_fixture(tmp_path)
-        rc = bundler.cmd_register("name", ["MODULE.bazel"], path=p)
+        rc = nomnom.cmd_register("name", ["MODULE.bazel"], path=p)
         assert rc == 0
         assert "'MODULE.bazel'," in p.read_text()
 
     def test_round_trip_byte_equal(self, tmp_path):
         p = make_fixture(tmp_path)
         original = p.read_bytes()
-        bundler.cmd_register("text", [".new"], path=p)
-        bundler.cmd_register("text", [".new"], remove=True, path=p)
+        nomnom.cmd_register("text", [".new"], path=p)
+        nomnom.cmd_register("text", [".new"], remove=True, path=p)
         assert p.read_bytes() == original
 
     def test_only_marker_block_modified(self, tmp_path):
@@ -717,7 +730,7 @@ class TestRegister:
             prefix="import os\nFOO = 1\ndef untouched():\n    return 42\n\n",
             suffix="\nBAR = 2\nclass Other:\n    pass\n",
         )
-        bundler.cmd_register("text", [".new"], path=p)
+        nomnom.cmd_register("text", [".new"], path=p)
         content = p.read_text()
         assert "import os" in content
         assert "FOO = 1" in content
@@ -729,8 +742,8 @@ class TestRegister:
     def test_real_nomnom_py_has_marker_block(self):
         # Smoke test: the actual shipping nomnom.py must be parseable by our
         # tooling, otherwise running `nomnom register` against it would fail.
-        src_lines, start, end = bundler._read_block(bundler.SELF_PATH)
-        parsed = bundler._parse_block(src_lines, start, end)
+        src_lines, start, end = nomnom._read_block(nomnom.SELF_PATH)
+        parsed = nomnom._parse_block(src_lines, start, end)
         assert "TEXT_EXTENSIONS" in parsed
         assert "BINARY_EXTENSIONS" in parsed
         assert "KNOWN_TEXT_NAMES" in parsed
