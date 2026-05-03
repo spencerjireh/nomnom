@@ -434,3 +434,165 @@ class TestLastSelection:
             (tmp_path / bundler.LAST_SELECTION_FILE).read_text()
         )
         assert data["selected"] == ["a.py", "m.py", "z.py"]
+
+
+# ---------- is_binary extension shortcuts ----------
+
+class TestIsBinaryExtensions:
+    def test_known_text_extension_skips_byte_sniff(self, tmp_path):
+        p = tmp_path / "trick.py"
+        p.write_bytes(b"print('hi')\x00")
+        assert bundler.is_binary(p) is False
+
+    def test_known_binary_extension_skipped_without_reading(self, tmp_path):
+        assert bundler.is_binary(tmp_path / "missing.png") is True
+
+    def test_known_text_name_no_extension(self, tmp_path):
+        p = tmp_path / "Makefile"
+        p.write_text("all:\n\techo hi\n")
+        assert bundler.is_binary(p) is False
+
+    def test_unknown_extension_falls_through_to_sniff(self, tmp_path):
+        text = tmp_path / "data.xyz"
+        text.write_text("some text content")
+        assert bundler.is_binary(text) is False
+
+        binary = tmp_path / "blob.xyz"
+        binary.write_bytes(b"\x00\x01\x02")
+        assert bundler.is_binary(binary) is True
+
+
+# ---------- secret files ----------
+
+class TestIsSecretFile:
+    @pytest.mark.parametrize("name", [
+        ".env",
+        ".env.production",
+        ".env.local",
+        "cert.pem",
+        "private.key",
+        "id_rsa",
+        "id_ed25519",
+        ".netrc",
+        ".npmrc",
+        ".pypirc",
+        "secrets.yaml",
+        "credentials",
+        "credentials.json",
+        "keystore.pfx",
+    ])
+    def test_secret_names_match(self, name):
+        assert bundler.is_secret_file(name) is True
+
+    @pytest.mark.parametrize("name", [
+        "env.example",
+        "keys.txt",
+        "id_rsa.pub",
+        "README.md",
+        "config.yaml",
+    ])
+    def test_safe_names_do_not_match(self, name):
+        assert bundler.is_secret_file(name) is False
+
+
+class TestScanReposSkipSecrets:
+    def _layout(self):
+        return {
+            ".env": "DB_PASS=hunter2",
+            "cert.pem": "-----BEGIN-----\n",
+            "id_rsa": "-----BEGIN OPENSSH-----\n",
+            "id_rsa.pub": "ssh-rsa AAAA...",
+            "app.py": "print('hi')",
+        }
+
+    def test_secrets_skipped_by_default(self, tmp_path):
+        make_repo(tmp_path, self._layout())
+        gi = bundler.load_gitignore(tmp_path)
+        paths = rels(bundler.scan_repo(tmp_path, gi))
+        assert ".env" not in paths
+        assert "cert.pem" not in paths
+        assert "id_rsa" not in paths
+        assert "id_rsa.pub" in paths
+        assert "app.py" in paths
+
+    def test_include_secrets_returns_them(self, tmp_path):
+        make_repo(tmp_path, self._layout())
+        gi = bundler.load_gitignore(tmp_path)
+        paths = rels(bundler.scan_repo(tmp_path, gi, skip_secrets=False))
+        assert ".env" in paths
+        assert "cert.pem" in paths
+        assert "id_rsa" in paths
+        assert "id_rsa.pub" in paths
+        assert "app.py" in paths
+
+
+# ---------- clipboard ----------
+
+class TestClipboardDetect:
+    def test_pbcopy_wins_when_present(self, monkeypatch):
+        monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+        monkeypatch.setattr(
+            bundler.shutil, "which",
+            lambda c: "/usr/bin/pbcopy" if c == "pbcopy" else None,
+        )
+        assert bundler.detect_clipboard_cmd() == ["pbcopy"]
+
+    def test_xclip_on_x11(self, monkeypatch):
+        monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+        avail = {"xclip": "/usr/bin/xclip"}
+        monkeypatch.setattr(bundler.shutil, "which", lambda c: avail.get(c))
+        assert bundler.detect_clipboard_cmd() == [
+            "xclip", "-selection", "clipboard"
+        ]
+
+    def test_wayland_prefers_wl_copy(self, monkeypatch):
+        monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-0")
+        avail = {"wl-copy": "/usr/bin/wl-copy", "xclip": "/usr/bin/xclip"}
+        monkeypatch.setattr(bundler.shutil, "which", lambda c: avail.get(c))
+        assert bundler.detect_clipboard_cmd() == ["wl-copy"]
+
+    def test_xsel_fallback_when_only_xsel(self, monkeypatch):
+        monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+        avail = {"xsel": "/usr/bin/xsel"}
+        monkeypatch.setattr(bundler.shutil, "which", lambda c: avail.get(c))
+        assert bundler.detect_clipboard_cmd() == [
+            "xsel", "--clipboard", "--input"
+        ]
+
+    def test_returns_none_when_nothing_available(self, monkeypatch):
+        monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+        monkeypatch.setattr(bundler.shutil, "which", lambda c: None)
+        assert bundler.detect_clipboard_cmd() is None
+
+
+class TestCopyToClipboard:
+    def test_passes_text_via_stdin(self, monkeypatch):
+        captured = {}
+
+        def fake_run(cmd, input, text, check):
+            captured.update(cmd=cmd, input=input, text=text, check=check)
+            class R: pass
+            return R()
+
+        monkeypatch.setattr(bundler, "detect_clipboard_cmd", lambda: ["pbcopy"])
+        monkeypatch.setattr(bundler.subprocess, "run", fake_run)
+        ok = bundler.copy_to_clipboard("hello world")
+        assert ok is True
+        assert captured["cmd"] == ["pbcopy"]
+        assert captured["input"] == "hello world"
+        assert captured["text"] is True
+        assert captured["check"] is True
+
+    def test_returns_false_when_no_tool(self, monkeypatch):
+        monkeypatch.setattr(bundler, "detect_clipboard_cmd", lambda: None)
+        assert bundler.copy_to_clipboard("x") is False
+
+    def test_returns_false_on_subprocess_error(self, monkeypatch):
+        import subprocess as sp
+
+        def fake_run(*a, **kw):
+            raise sp.CalledProcessError(1, ["pbcopy"])
+
+        monkeypatch.setattr(bundler, "detect_clipboard_cmd", lambda: ["pbcopy"])
+        monkeypatch.setattr(bundler.subprocess, "run", fake_run)
+        assert bundler.copy_to_clipboard("x") is False

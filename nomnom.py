@@ -9,14 +9,23 @@ from __future__ import annotations
 
 import argparse
 import curses
+import fnmatch
 import json
+import locale
 import os
 import re
+import shutil
+import subprocess
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+
+try:
+    locale.setlocale(locale.LC_ALL, "")
+except locale.Error:
+    pass
 
 
 JUNK_DIRS = {
@@ -28,6 +37,41 @@ JUNK_DIRS = {
 LARGE_FILE_BYTES = 1_000_000
 BINARY_SNIFF_BYTES = 8192
 LAST_SELECTION_FILE = ".nomnom-last.json"
+
+TEXT_EXTENSIONS = {
+    ".py", ".pyi", ".js", ".ts", ".tsx", ".jsx", ".mjs", ".cjs", ".vue",
+    ".svelte", ".html", ".htm", ".css", ".scss", ".sass", ".less",
+    ".md", ".markdown", ".rst", ".txt",
+    ".json", ".jsonc", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf",
+    ".env", ".sh", ".bash", ".zsh", ".fish",
+    ".rb", ".go", ".rs", ".java", ".kt", ".kts", ".scala", ".swift",
+    ".c", ".h", ".cpp", ".hpp", ".cc", ".hh", ".m", ".mm",
+    ".lua", ".pl", ".php", ".sql", ".r", ".jl", ".dart", ".ex", ".exs",
+    ".erl", ".clj", ".cljs", ".tex", ".bib", ".csv", ".tsv",
+    ".xml", ".svg", ".graphql", ".gql", ".proto",
+    ".tf", ".tfvars", ".hcl", ".nix", ".bzl", ".bazel", ".lock",
+}
+BINARY_EXTENSIONS = {
+    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tiff", ".ico", ".webp", ".avif",
+    ".pdf", ".zip", ".tar", ".gz", ".bz2", ".xz", ".7z", ".rar",
+    ".jar", ".war", ".ear", ".class",
+    ".so", ".dylib", ".dll", ".exe", ".o", ".a", ".pyc", ".pyo",
+    ".woff", ".woff2", ".ttf", ".otf", ".eot",
+    ".mp3", ".mp4", ".avi", ".mov", ".webm", ".wav", ".flac", ".ogg",
+    ".db", ".sqlite", ".sqlite3", ".bin", ".dat", ".pkl", ".npy", ".npz",
+    ".whl", ".egg", ".gem",
+}
+KNOWN_TEXT_NAMES = {
+    "Makefile", "Dockerfile", "Rakefile", "Gemfile", "Procfile", "LICENSE",
+    "README", "NOTICE", "CHANGELOG", "AUTHORS",
+}
+SECRET_PATTERNS = [
+    ".env", ".env.*", "*.pem", "*.key", "*.pfx", "*.p12",
+    "id_rsa*", "id_dsa*", "id_ecdsa*", "id_ed25519*",
+    ".netrc", ".npmrc", ".pypirc",
+    "secrets.yaml", "secrets.yml", "secrets.json",
+    "credentials", "credentials.json",
+]
 
 
 # ---------- gitignore ----------
@@ -151,6 +195,14 @@ class ScanItem:
 
 
 def is_binary(path: Path) -> bool:
+    name = path.name
+    if name in KNOWN_TEXT_NAMES:
+        return False
+    ext = path.suffix.lower()
+    if ext in BINARY_EXTENSIONS:
+        return True
+    if ext in TEXT_EXTENSIONS:
+        return False
     try:
         with open(path, "rb") as f:
             return b"\x00" in f.read(BINARY_SNIFF_BYTES)
@@ -158,7 +210,17 @@ def is_binary(path: Path) -> bool:
         return True
 
 
-def scan_repo(root: Path, gi: GitignoreMatcher) -> list:
+def is_secret_file(name: str) -> bool:
+    if name.endswith(".pub"):
+        return False
+    return any(fnmatch.fnmatchcase(name, pat) for pat in SECRET_PATTERNS)
+
+
+def scan_repo(
+    root: Path,
+    gi: GitignoreMatcher,
+    skip_secrets: bool = True,
+) -> list:
     items: list = []
 
     def walk(dir_abs: Path, rel_dir: str) -> None:
@@ -182,6 +244,8 @@ def scan_repo(root: Path, gi: GitignoreMatcher) -> list:
                 elif e.is_file(follow_symlinks=False):
                     if gi.is_ignored(rel, is_dir=False):
                         continue
+                    if skip_secrets and is_secret_file(e.name):
+                        continue
                     files.append((e.name, rel, Path(e.path)))
             except OSError:
                 continue
@@ -197,6 +261,33 @@ def scan_repo(root: Path, gi: GitignoreMatcher) -> list:
 
     walk(root, "")
     return items
+
+
+# ---------- clipboard ----------
+
+def detect_clipboard_cmd() -> Optional[list]:
+    if shutil.which("pbcopy"):
+        return ["pbcopy"]
+    if os.environ.get("WAYLAND_DISPLAY") and shutil.which("wl-copy"):
+        return ["wl-copy"]
+    if shutil.which("xclip"):
+        return ["xclip", "-selection", "clipboard"]
+    if shutil.which("wl-copy"):
+        return ["wl-copy"]
+    if shutil.which("xsel"):
+        return ["xsel", "--clipboard", "--input"]
+    return None
+
+
+def copy_to_clipboard(text: str) -> bool:
+    cmd = detect_clipboard_cmd()
+    if not cmd:
+        return False
+    try:
+        subprocess.run(cmd, input=text, text=True, check=True)
+        return True
+    except (subprocess.SubprocessError, OSError):
+        return False
 
 
 # ---------- tree model ----------
@@ -256,6 +347,42 @@ def cascade_check(nodes: list, idx: int, value: bool) -> None:
 
 # ---------- picker ----------
 
+def _setup_theme() -> dict:
+    """Build a curses-attribute theme dict, respecting NO_COLOR."""
+    plain = {
+        "dir": 0, "file": 0, "checked": curses.A_BOLD,
+        "dim": curses.A_DIM, "filter": curses.A_BOLD,
+        "cursor": curses.A_REVERSE,
+    }
+    if os.environ.get("NO_COLOR") is not None:
+        return plain
+    try:
+        if not curses.has_colors():
+            return plain
+        curses.start_color()
+    except curses.error:
+        return plain
+    try:
+        curses.use_default_colors()
+        bg = -1
+    except curses.error:
+        bg = curses.COLOR_BLACK
+    try:
+        curses.init_pair(1, curses.COLOR_CYAN, bg)
+        curses.init_pair(2, curses.COLOR_GREEN, bg)
+        curses.init_pair(3, curses.COLOR_YELLOW, bg)
+    except curses.error:
+        return plain
+    return {
+        "dir":     curses.color_pair(1),
+        "file":    0,
+        "checked": curses.color_pair(2) | curses.A_BOLD,
+        "dim":     curses.A_DIM,
+        "filter":  curses.color_pair(3) | curses.A_BOLD,
+        "cursor":  curses.A_REVERSE,
+    }
+
+
 def pick(nodes: list) -> Optional[set]:
     """Curses checkbox-tree picker. Returns set of checked file rels, or None on cancel."""
     if not nodes:
@@ -269,6 +396,13 @@ def pick(nodes: list) -> Optional[set]:
     def _picker(stdscr) -> None:
         curses.curs_set(0)
         stdscr.keypad(True)
+        try:
+            curses.mousemask(
+                curses.BUTTON1_CLICKED | curses.BUTTON1_DOUBLE_CLICKED
+            )
+        except curses.error:
+            pass
+        theme = _setup_theme()
         cursor_ni: int = 0
         viewport = 0
         filter_active = False
@@ -331,7 +465,14 @@ def pick(nodes: list) -> Optional[set]:
                 if n.is_dir and not label.endswith("/"):
                     label += "/"
                 line = f"{check} {indent}{glyph}{label}"[: w - 1]
-                attr = curses.A_REVERSE if vi == cursor_pos else curses.A_NORMAL
+                if n.checked:
+                    attr = theme["checked"]
+                elif n.is_dir:
+                    attr = theme["dir"]
+                else:
+                    attr = theme["file"]
+                if vi == cursor_pos:
+                    attr |= theme["cursor"]
                 try:
                     stdscr.addstr(row, 0, line, attr)
                 except curses.error:
@@ -339,24 +480,31 @@ def pick(nodes: list) -> Optional[set]:
 
             checked_count = sum(1 for n in nodes if n.checked and not n.is_dir)
             if filter_active or filter_buf:
-                info = f"/ {filter_buf}"
+                try:
+                    stdscr.addstr(h - 2, 0, "/ ", theme["filter"])
+                    stdscr.addstr(filter_buf[: max(0, w - 3)], theme["filter"])
+                except curses.error:
+                    pass
             else:
                 info = f"selected: {checked_count} files"
-            try:
-                stdscr.addstr(h - 2, 0, info[: w - 1], curses.A_DIM)
-            except curses.error:
-                pass
+                try:
+                    stdscr.addstr(h - 2, 0, info[: w - 1], theme["dim"])
+                except curses.error:
+                    pass
             status = (
                 "space:toggle  ->/<-:expand  /:filter  E/C:expand/collapse all  "
                 "a:toggle-visible  enter:done  q:quit"
             )
             try:
-                stdscr.addstr(h - 1, 0, status[: w - 1], curses.A_DIM)
+                stdscr.addstr(h - 1, 0, status[: w - 1], theme["dim"])
             except curses.error:
                 pass
             stdscr.refresh()
 
             ch = stdscr.getch()
+
+            if ch == curses.KEY_RESIZE:
+                continue
 
             if filter_active:
                 if ch in (10, 13):
@@ -368,6 +516,23 @@ def pick(nodes: list) -> Optional[set]:
                     filter_buf = filter_buf[:-1]
                 elif 32 <= ch < 127:
                     filter_buf += chr(ch)
+                continue
+
+            if ch == curses.KEY_MOUSE:
+                try:
+                    _, _mx, my, _mz, bstate = curses.getmouse()
+                except curses.error:
+                    continue
+                if 0 <= my < list_h:
+                    new_pos = viewport + my
+                    if 0 <= new_pos < len(visible):
+                        cursor_pos = new_pos
+                        cursor_ni = visible[cursor_pos]
+                        n = nodes[cursor_ni]
+                        if bstate & curses.BUTTON1_DOUBLE_CLICKED and n.is_dir:
+                            n.expanded = not n.expanded
+                        else:
+                            cascade(cursor_ni, not n.checked)
                 continue
 
             if ch in (curses.KEY_DOWN, ord("j")):
@@ -554,7 +719,22 @@ def main() -> int:
         "repo", nargs="?", default=".",
         help="Path to the project repo (default: current directory).",
     )
+    parser.add_argument(
+        "--copy", action="store_true",
+        help="Copy output to the system clipboard instead of writing a file.",
+    )
+    parser.add_argument(
+        "--include-secrets", action="store_true",
+        help="Disable the default skip of .env, *.pem, id_rsa*, etc.",
+    )
+    parser.add_argument(
+        "--no-color", action="store_true",
+        help="Disable colored output (also honors the NO_COLOR env var).",
+    )
     args = parser.parse_args()
+
+    if args.no_color:
+        os.environ["NO_COLOR"] = "1"
 
     root = Path(args.repo).expanduser().resolve()
     if not root.is_dir():
@@ -564,7 +744,7 @@ def main() -> int:
     repo_name = root.name or "repo"
     print(f"scanning {root} ...", file=sys.stderr)
     gi = load_gitignore(root)
-    items = scan_repo(root, gi)
+    items = scan_repo(root, gi, skip_secrets=not args.include_secrets)
     file_items = [it for it in items if not it.is_dir]
     if not file_items:
         print("no files found after applying excludes.", file=sys.stderr)
@@ -605,14 +785,21 @@ def main() -> int:
         if sz > LARGE_FILE_BYTES:
             large.append((rel, sz))
 
-    out_path = pick_output_path(repo_name)
+    out_path = pick_output_path(repo_name) if not args.copy else None
     approx_tokens = total_bytes // 4
 
     print()
     print(f"  files:   {len(selected)}")
     print(f"  size:    {total_bytes:,} bytes")
     print(f"  ~tokens: {approx_tokens:,} (rough chars/4 estimate)")
-    print(f"  output:  {out_path}")
+    if args.copy:
+        clip = detect_clipboard_cmd()
+        if clip:
+            print(f"  output:  clipboard via {clip[0]}")
+        else:
+            print("  output:  clipboard (no tool found; will fall back to file)")
+    else:
+        print(f"  output:  {out_path}")
     if large:
         print(f"  large:   {len(large)} file(s) over {LARGE_FILE_BYTES:,} bytes:")
         for rel, sz in large[:5]:
@@ -627,6 +814,19 @@ def main() -> int:
         return 130
 
     output = render_output(repo_name, root, selected, tree_str)
+
+    if args.copy:
+        if copy_to_clipboard(output):
+            save_last_selection(root, selected)
+            print(f"copied {len(output):,} bytes to clipboard.")
+            return 0
+        print(
+            "no clipboard tool found (pbcopy/wl-copy/xclip/xsel); "
+            "falling back to a file.",
+            file=sys.stderr,
+        )
+        out_path = pick_output_path(repo_name)
+
     try:
         out_path.write_text(output, encoding="utf-8")
     except OSError as e:
