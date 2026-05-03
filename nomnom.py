@@ -8,6 +8,7 @@ Stdlib only. macOS/Linux. Python 3.8+.
 from __future__ import annotations
 
 import argparse
+import ast
 import curses
 import fnmatch
 import json
@@ -38,40 +39,177 @@ LARGE_FILE_BYTES = 1_000_000
 BINARY_SNIFF_BYTES = 8192
 LAST_SELECTION_FILE = ".nomnom-last.json"
 
+# --- nomnom:extensions (auto-managed; edit with `nomnom register`) ---
 TEXT_EXTENSIONS = {
-    ".py", ".pyi", ".js", ".ts", ".tsx", ".jsx", ".mjs", ".cjs", ".vue",
-    ".svelte", ".html", ".htm", ".css", ".scss", ".sass", ".less",
-    ".md", ".markdown", ".rst", ".txt",
-    ".json", ".jsonc", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf",
-    ".env", ".sh", ".bash", ".zsh", ".fish",
-    ".rb", ".go", ".rs", ".java", ".kt", ".kts", ".scala", ".swift",
-    ".c", ".h", ".cpp", ".hpp", ".cc", ".hh", ".m", ".mm",
-    ".lua", ".pl", ".php", ".sql", ".r", ".jl", ".dart", ".ex", ".exs",
-    ".erl", ".clj", ".cljs", ".tex", ".bib", ".csv", ".tsv",
-    ".xml", ".svg", ".graphql", ".gql", ".proto",
-    ".tf", ".tfvars", ".hcl", ".nix", ".bzl", ".bazel", ".lock",
+    '.bash',
+    '.bazel',
+    '.bib',
+    '.bzl',
+    '.c',
+    '.cc',
+    '.cfg',
+    '.cjs',
+    '.clj',
+    '.cljs',
+    '.conf',
+    '.cpp',
+    '.csv',
+    '.css',
+    '.dart',
+    '.env',
+    '.erl',
+    '.ex',
+    '.exs',
+    '.fish',
+    '.go',
+    '.gql',
+    '.graphql',
+    '.h',
+    '.hcl',
+    '.hh',
+    '.hpp',
+    '.htm',
+    '.html',
+    '.ini',
+    '.java',
+    '.jl',
+    '.js',
+    '.json',
+    '.jsonc',
+    '.jsx',
+    '.kt',
+    '.kts',
+    '.less',
+    '.lock',
+    '.lua',
+    '.m',
+    '.markdown',
+    '.md',
+    '.mjs',
+    '.mm',
+    '.nix',
+    '.php',
+    '.pl',
+    '.proto',
+    '.py',
+    '.pyi',
+    '.r',
+    '.rb',
+    '.rs',
+    '.rst',
+    '.sass',
+    '.scala',
+    '.scss',
+    '.sh',
+    '.sql',
+    '.svelte',
+    '.svg',
+    '.swift',
+    '.tex',
+    '.tf',
+    '.tfvars',
+    '.toml',
+    '.ts',
+    '.tsv',
+    '.tsx',
+    '.txt',
+    '.vue',
+    '.xml',
+    '.yaml',
+    '.yml',
+    '.zsh',
 }
+
 BINARY_EXTENSIONS = {
-    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tiff", ".ico", ".webp", ".avif",
-    ".pdf", ".zip", ".tar", ".gz", ".bz2", ".xz", ".7z", ".rar",
-    ".jar", ".war", ".ear", ".class",
-    ".so", ".dylib", ".dll", ".exe", ".o", ".a", ".pyc", ".pyo",
-    ".woff", ".woff2", ".ttf", ".otf", ".eot",
-    ".mp3", ".mp4", ".avi", ".mov", ".webm", ".wav", ".flac", ".ogg",
-    ".db", ".sqlite", ".sqlite3", ".bin", ".dat", ".pkl", ".npy", ".npz",
-    ".whl", ".egg", ".gem",
+    '.7z',
+    '.a',
+    '.avi',
+    '.avif',
+    '.bin',
+    '.bmp',
+    '.bz2',
+    '.class',
+    '.dat',
+    '.db',
+    '.dll',
+    '.dylib',
+    '.ear',
+    '.egg',
+    '.eot',
+    '.exe',
+    '.flac',
+    '.gem',
+    '.gif',
+    '.gz',
+    '.ico',
+    '.jar',
+    '.jpeg',
+    '.jpg',
+    '.mov',
+    '.mp3',
+    '.mp4',
+    '.npy',
+    '.npz',
+    '.o',
+    '.ogg',
+    '.otf',
+    '.pdf',
+    '.pkl',
+    '.png',
+    '.pyc',
+    '.pyo',
+    '.rar',
+    '.so',
+    '.sqlite',
+    '.sqlite3',
+    '.tar',
+    '.tiff',
+    '.ttf',
+    '.war',
+    '.wav',
+    '.webm',
+    '.webp',
+    '.whl',
+    '.woff',
+    '.woff2',
+    '.xz',
+    '.zip',
 }
+
 KNOWN_TEXT_NAMES = {
-    "Makefile", "Dockerfile", "Rakefile", "Gemfile", "Procfile", "LICENSE",
-    "README", "NOTICE", "CHANGELOG", "AUTHORS",
+    'AUTHORS',
+    'CHANGELOG',
+    'Dockerfile',
+    'Gemfile',
+    'LICENSE',
+    'Makefile',
+    'NOTICE',
+    'Procfile',
+    'README',
+    'Rakefile',
 }
+
 SECRET_PATTERNS = [
-    ".env", ".env.*", "*.pem", "*.key", "*.pfx", "*.p12",
-    "id_rsa*", "id_dsa*", "id_ecdsa*", "id_ed25519*",
-    ".netrc", ".npmrc", ".pypirc",
-    "secrets.yaml", "secrets.yml", "secrets.json",
-    "credentials", "credentials.json",
+    '.env',
+    '.env.*',
+    '*.pem',
+    '*.key',
+    '*.pfx',
+    '*.p12',
+    'id_rsa*',
+    'id_dsa*',
+    'id_ecdsa*',
+    'id_ed25519*',
+    '.netrc',
+    '.npmrc',
+    '.pypirc',
+    'secrets.yaml',
+    'secrets.yml',
+    'secrets.json',
+    'credentials',
+    'credentials.json',
 ]
+# --- end nomnom:extensions ---
 
 
 # ---------- gitignore ----------
@@ -709,11 +847,167 @@ def confirm(prompt: str, default: bool = True) -> bool:
     return ans in ("y", "yes")
 
 
+# ---------- self-editing register / unregister ----------
+
+KIND_TO_NAME = {
+    "text":   "TEXT_EXTENSIONS",
+    "binary": "BINARY_EXTENSIONS",
+    "name":   "KNOWN_TEXT_NAMES",
+    "secret": "SECRET_PATTERNS",
+}
+KIND_IS_LIST = {"secret"}
+MARKER_START = "# --- nomnom:extensions"
+MARKER_END = "# --- end nomnom:extensions"
+SELF_PATH = Path(__file__).resolve()
+
+
+def _read_block(path: Path) -> tuple:
+    src_lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+    start = end = -1
+    for i, line in enumerate(src_lines):
+        if start == -1 and line.startswith(MARKER_START):
+            start = i
+        elif start != -1 and line.startswith(MARKER_END):
+            end = i
+            break
+    if start == -1 or end == -1:
+        raise RuntimeError(f"marker block not found in {path}")
+    return src_lines, start, end
+
+
+def _parse_block(src_lines: list, start: int, end: int) -> dict:
+    block = "".join(src_lines[start + 1:end])
+    tree = ast.parse(block)
+    out: dict = {}
+    for node in tree.body:
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        target = node.targets[0]
+        if not isinstance(target, ast.Name):
+            continue
+        out[target.id] = ast.literal_eval(node.value)
+    return out
+
+
+def _emit_block(values: dict) -> str:
+    parts: list = []
+    first = True
+    for kind, name in KIND_TO_NAME.items():
+        v = values.get(name)
+        if v is None:
+            continue
+        if not first:
+            parts.append("\n")
+        first = False
+        if kind in KIND_IS_LIST:
+            items = list(v)
+            opener, closer = "[", "]"
+        else:
+            items = sorted(v)
+            opener, closer = "{", "}"
+        parts.append(f"{name} = {opener}\n")
+        for item in items:
+            parts.append(f"    {item!r},\n")
+        parts.append(f"{closer}\n")
+    return "".join(parts)
+
+
+def _write_block(
+    path: Path, src_lines: list, start: int, end: int, new_block: str
+) -> None:
+    new_lines = src_lines[: start + 1] + [new_block] + src_lines[end:]
+    path.write_text("".join(new_lines), encoding="utf-8")
+
+
+def cmd_register(
+    kind: str,
+    values: list,
+    remove: bool = False,
+    path: Optional[Path] = None,
+) -> int:
+    p = path if path is not None else SELF_PATH
+    src_lines, start, end = _read_block(p)
+    parsed = _parse_block(src_lines, start, end)
+
+    target_name = KIND_TO_NAME[kind]
+    target = parsed[target_name]
+    is_list = kind in KIND_IS_LIST
+
+    changes: list = []
+    for value in values:
+        if not remove:
+            for other_kind, other_name in KIND_TO_NAME.items():
+                if other_name == target_name:
+                    continue
+                if value in parsed.get(other_name, ()):
+                    print(
+                        f"error: {value!r} is already in {other_name}. "
+                        f"run `nomnom unregister {other_kind} {value}` first.",
+                        file=sys.stderr,
+                    )
+                    return 1
+        if remove:
+            if value not in target:
+                print(f"! {value!r} not in {target_name} (no change)")
+                continue
+            if is_list:
+                target.remove(value)
+            else:
+                target.discard(value)
+            changes.append(("-", value))
+        else:
+            if value in target:
+                print(f"! {value!r} already in {target_name} (no change)")
+                continue
+            if is_list:
+                target.append(value)
+            else:
+                target.add(value)
+            changes.append(("+", value))
+
+    if not changes:
+        return 0
+
+    parsed[target_name] = target
+    new_block = _emit_block(parsed)
+    _write_block(p, src_lines, start, end, new_block)
+    for sign, value in changes:
+        verb = "registered" if sign == "+" else "unregistered"
+        print(f"{sign} {verb} {value!r} in {target_name}")
+    print(f"\ndone. review with: git diff {p.name}")
+    return 0
+
+
 # ---------- main ----------
 
 def main() -> int:
+    if len(sys.argv) >= 2 and sys.argv[1] in ("register", "unregister"):
+        verb = sys.argv[1]
+        sub = argparse.ArgumentParser(
+            prog=f"nomnom {verb}",
+            description=(
+                f"{verb.capitalize()} an entry in the auto-managed extension "
+                "lists in nomnom.py. After it runs, review with `git diff "
+                "nomnom.py` and commit when happy."
+            ),
+        )
+        sub.add_argument(
+            "kind", choices=list(KIND_TO_NAME.keys()),
+            help="which list to edit: text | binary | name | secret",
+        )
+        sub.add_argument(
+            "values", nargs="+",
+            help="one or more entries (e.g. .rmeta, MODULE.bazel, '*.creds')",
+        )
+        a = sub.parse_args(sys.argv[2:])
+        return cmd_register(a.kind, a.values, remove=(verb == "unregister"))
+
     parser = argparse.ArgumentParser(
-        description="nomnom: feed your repo to the LLM, one .txt snack at a time."
+        description="nomnom: feed your repo to the LLM, one .txt snack at a time.",
+        epilog=(
+            "subcommands: register / unregister - edit the auto-managed "
+            "extension lists. run `nomnom register --help` for details."
+        ),
     )
     parser.add_argument(
         "repo", nargs="?", default=".",

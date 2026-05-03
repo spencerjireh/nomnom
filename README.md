@@ -64,6 +64,28 @@ You'll get an interactive picker, a confirmation summary, then either a file lik
 
 By default nomnom won't bundle obvious secret files. Patterns: `.env`, `.env.*`, `*.pem`, `*.key`, `*.pfx`, `*.p12`, `id_rsa*`, `id_dsa*`, `id_ecdsa*`, `id_ed25519*` (but `.pub` files are fine), `.netrc`, `.npmrc`, `.pypirc`, `secrets.{json,yaml,yml}`, `credentials`, `credentials.json`. Pass `--include-secrets` if you really want them.
 
+## Contributing extensions
+
+The four classification lists (text extensions, binary extensions, known-text filenames, secret patterns) live inside a marker block in `nomnom.py`. nomnom can edit them itself:
+
+```sh
+nomnom register binary .lockb         # bun's lockfile
+nomnom register text .rmeta .pyx      # multiple at once
+nomnom register name MODULE.bazel     # extensionless filename
+nomnom register secret '*.creds'      # secret pattern
+nomnom unregister text .pyx           # take it back
+```
+
+Each call rewrites the marker block in `nomnom.py` (alphabetized, deduped), prints what it changed, and reminds you to review:
+
+```sh
+git diff nomnom.py
+git commit -am "register .lockb as binary (bun)"
+gh pr create --fill
+```
+
+Conflicts are refused: registering `.foo` as text when it's already in BINARY_EXTENSIONS errors out and tells you to unregister it first. Re-registering an existing entry is a harmless no-op. nomnom doesn't touch git itself — review and commit are yours.
+
 ## What you get
 
 ```text

@@ -596,3 +596,144 @@ class TestCopyToClipboard:
         monkeypatch.setattr(bundler, "detect_clipboard_cmd", lambda: ["pbcopy"])
         monkeypatch.setattr(bundler.subprocess, "run", fake_run)
         assert bundler.copy_to_clipboard("x") is False
+
+
+# ---------- register / unregister ----------
+
+def make_fixture(
+    tmp_path,
+    text=None,
+    binary=None,
+    names=None,
+    secrets=None,
+    prefix="# header\n",
+    suffix="# footer\n",
+):
+    """Build a fixture .py file with a canonical marker block."""
+    text = text if text is not None else {".py"}
+    binary = binary if binary is not None else {".png"}
+    names = names if names is not None else {"Makefile"}
+    secrets = secrets if secrets is not None else [".env"]
+    parsed = {
+        "TEXT_EXTENSIONS": text,
+        "BINARY_EXTENSIONS": binary,
+        "KNOWN_TEXT_NAMES": names,
+        "SECRET_PATTERNS": secrets,
+    }
+    block = bundler._emit_block(parsed)
+    p = tmp_path / "fixture.py"
+    p.write_text(
+        f"{prefix}# --- nomnom:extensions ---\n{block}# --- end nomnom:extensions ---\n{suffix}",
+        encoding="utf-8",
+    )
+    return p
+
+
+class TestRegister:
+    def test_register_text_adds_and_sorts(self, tmp_path):
+        p = make_fixture(tmp_path)
+        rc = bundler.cmd_register("text", [".zzz", ".aaa"], path=p)
+        assert rc == 0
+        content = p.read_text()
+        assert "'.aaa'," in content
+        assert "'.zzz'," in content
+        # sorted: .aaa before .py before .zzz
+        assert content.index("'.aaa',") < content.index("'.py',") < content.index("'.zzz',")
+
+    def test_idempotent_no_rewrite(self, tmp_path, capsys):
+        p = make_fixture(tmp_path)
+        before = p.read_bytes()
+        rc = bundler.cmd_register("text", [".py"], path=p)
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "already in TEXT_EXTENSIONS" in out
+        assert p.read_bytes() == before
+
+    def test_unregister_removes(self, tmp_path):
+        p = make_fixture(tmp_path, text={".py", ".rs"})
+        rc = bundler.cmd_register("text", [".rs"], remove=True, path=p)
+        assert rc == 0
+        content = p.read_text()
+        assert "'.rs'," not in content
+        assert "'.py'," in content
+
+    def test_unregister_missing_is_noop(self, tmp_path, capsys):
+        p = make_fixture(tmp_path)
+        before = p.read_bytes()
+        rc = bundler.cmd_register("text", [".never"], remove=True, path=p)
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "not in TEXT_EXTENSIONS" in out
+        assert p.read_bytes() == before
+
+    def test_conflict_refuses(self, tmp_path, capsys):
+        p = make_fixture(tmp_path, text={".py"}, binary={".png"})
+        before = p.read_bytes()
+        rc = bundler.cmd_register("text", [".png"], path=p)
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "already in BINARY_EXTENSIONS" in err
+        assert "unregister binary .png" in err
+        assert p.read_bytes() == before
+
+    def test_register_secret_preserves_list_order(self, tmp_path):
+        p = make_fixture(tmp_path, secrets=[".env", "*.pem"])
+        rc = bundler.cmd_register("secret", ["*.creds"], path=p)
+        assert rc == 0
+        content = p.read_text()
+        # New entry appended; existing order kept
+        assert content.index("'.env',") < content.index("'*.pem',") < content.index("'*.creds',")
+
+    def test_missing_marker_raises(self, tmp_path):
+        p = tmp_path / "no_markers.py"
+        p.write_text("TEXT_EXTENSIONS = {'.py'}\n")
+        with pytest.raises(RuntimeError, match="marker block"):
+            bundler.cmd_register("text", [".x"], path=p)
+
+    def test_multi_value_call(self, tmp_path):
+        p = make_fixture(tmp_path)
+        rc = bundler.cmd_register("text", [".a", ".b", ".c"], path=p)
+        assert rc == 0
+        content = p.read_text()
+        for ext in (".a", ".b", ".c"):
+            assert f"'{ext}'," in content
+
+    def test_register_name_with_dot(self, tmp_path):
+        p = make_fixture(tmp_path)
+        rc = bundler.cmd_register("name", ["MODULE.bazel"], path=p)
+        assert rc == 0
+        assert "'MODULE.bazel'," in p.read_text()
+
+    def test_round_trip_byte_equal(self, tmp_path):
+        p = make_fixture(tmp_path)
+        original = p.read_bytes()
+        bundler.cmd_register("text", [".new"], path=p)
+        bundler.cmd_register("text", [".new"], remove=True, path=p)
+        assert p.read_bytes() == original
+
+    def test_only_marker_block_modified(self, tmp_path):
+        p = make_fixture(
+            tmp_path,
+            prefix="import os\nFOO = 1\ndef untouched():\n    return 42\n\n",
+            suffix="\nBAR = 2\nclass Other:\n    pass\n",
+        )
+        bundler.cmd_register("text", [".new"], path=p)
+        content = p.read_text()
+        assert "import os" in content
+        assert "FOO = 1" in content
+        assert "def untouched():" in content
+        assert "BAR = 2" in content
+        assert "class Other:" in content
+        assert "'.new'," in content
+
+    def test_real_nomnom_py_has_marker_block(self):
+        # Smoke test: the actual shipping nomnom.py must be parseable by our
+        # tooling, otherwise running `nomnom register` against it would fail.
+        src_lines, start, end = bundler._read_block(bundler.SELF_PATH)
+        parsed = bundler._parse_block(src_lines, start, end)
+        assert "TEXT_EXTENSIONS" in parsed
+        assert "BINARY_EXTENSIONS" in parsed
+        assert "KNOWN_TEXT_NAMES" in parsed
+        assert "SECRET_PATTERNS" in parsed
+        assert ".py" in parsed["TEXT_EXTENSIONS"]
+        assert ".png" in parsed["BINARY_EXTENSIONS"]
