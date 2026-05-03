@@ -248,6 +248,12 @@ def visible_indices(nodes: list) -> list:
     return out
 
 
+def cascade_check(nodes: list, idx: int, value: bool) -> None:
+    nodes[idx].checked = value
+    for c in nodes[idx].children:
+        cascade_check(nodes, c, value)
+
+
 # ---------- picker ----------
 
 def pick(nodes: list) -> Optional[set]:
@@ -258,9 +264,7 @@ def pick(nodes: list) -> Optional[set]:
     state = {"cancelled": False}
 
     def cascade(idx: int, value: bool) -> None:
-        nodes[idx].checked = value
-        for c in nodes[idx].children:
-            cascade(c, value)
+        cascade_check(nodes, idx, value)
 
     def _picker(stdscr) -> None:
         curses.curs_set(0)

@@ -1,5 +1,7 @@
 # bundler
 
+[![tests](https://github.com/spencerjireh/python-file-copier/actions/workflows/test.yml/badge.svg)](https://github.com/spencerjireh/python-file-copier/actions/workflows/test.yml)
+
 A tiny single-file Python CLI that bundles selected files from any project into one `.txt` you can paste into a chat app. Like [repomix](https://github.com/yamadashy/repomix), but pocket-sized.
 
 - One file. **Stdlib only.** No `pip install`, no `uv`, no virtualenv.
@@ -61,6 +63,25 @@ Bundler also stashes your last selection in `.bundler-last.json` at the repo roo
 
 - Python 3.8+
 - macOS or Linux (no Windows; `curses` isn't in stock CPython there)
+
+## Development
+
+The runtime is stdlib-only, but the test suite uses pytest.
+
+```sh
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements-dev.txt
+pytest
+```
+
+Or with [uv](https://github.com/astral-sh/uv):
+
+```sh
+uv venv && uv pip install -r requirements-dev.txt
+uv run pytest
+```
+
+CI runs the tests on macOS and Linux against Python 3.8 – 3.12.
 
 ## License
 
