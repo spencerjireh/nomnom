@@ -21,7 +21,6 @@ import sys
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
 try:
     locale.setlocale(locale.LC_ALL, "")
@@ -262,7 +261,7 @@ def _glob_to_regex(pattern: str, anchored: bool) -> "re.Pattern[str]":
 
 
 class GitignoreMatcher:
-    def __init__(self, rules: list):
+    def __init__(self, rules: list[GitignoreRule]):
         self.rules = rules
 
     def is_ignored(self, rel_path: str, is_dir: bool) -> bool:
@@ -284,7 +283,7 @@ class GitignoreMatcher:
 
 
 def load_gitignore(root: Path) -> GitignoreMatcher:
-    rules: list = []
+    rules: list[GitignoreRule] = []
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
         dirnames[:] = [
             d for d in dirnames
@@ -358,16 +357,16 @@ def scan_repo(
     root: Path,
     gi: GitignoreMatcher,
     skip_secrets: bool = True,
-) -> list:
-    items: list = []
+) -> list[ScanItem]:
+    items: list[ScanItem] = []
 
     def walk(dir_abs: Path, rel_dir: str) -> None:
         try:
             entries = list(os.scandir(dir_abs))
         except OSError:
             return
-        dirs: list = []
-        files: list = []
+        dirs: list[tuple[str, str, Path]] = []
+        files: list[tuple[str, str, Path]] = []
         for e in entries:
             try:
                 if e.is_symlink():
@@ -403,7 +402,7 @@ def scan_repo(
 
 # ---------- clipboard ----------
 
-def detect_clipboard_cmd() -> Optional[list]:
+def detect_clipboard_cmd() -> list[str] | None:
     if shutil.which("pbcopy"):
         return ["pbcopy"]
     if os.environ.get("WAYLAND_DISPLAY") and shutil.which("wl-copy"):
@@ -436,15 +435,15 @@ class Node:
     name: str
     is_dir: bool
     depth: int
-    parent: Optional[int]
-    children: list = field(default_factory=list)
+    parent: int | None
+    children: list[int] = field(default_factory=list)
     expanded: bool = False
     checked: bool = False
 
 
-def build_tree(items: list) -> list:
-    nodes: list = []
-    by_rel: dict = {}
+def build_tree(items: list[ScanItem]) -> list[Node]:
+    nodes: list[Node] = []
+    by_rel: dict[str, int] = {}
     for it in items:
         parts = it.rel.split("/")
         depth = len(parts) - 1
@@ -462,7 +461,7 @@ def build_tree(items: list) -> list:
     return nodes
 
 
-def visible_indices(nodes: list) -> list:
+def visible_indices(nodes: list[Node]) -> list[int]:
     out = []
     for i, n in enumerate(nodes):
         cur = n.parent
@@ -477,7 +476,7 @@ def visible_indices(nodes: list) -> list:
     return out
 
 
-def cascade_check(nodes: list, idx: int, value: bool) -> None:
+def cascade_check(nodes: list[Node], idx: int, value: bool) -> None:
     nodes[idx].checked = value
     for c in nodes[idx].children:
         cascade_check(nodes, c, value)
@@ -485,7 +484,7 @@ def cascade_check(nodes: list, idx: int, value: bool) -> None:
 
 # ---------- picker ----------
 
-def _setup_theme() -> dict:
+def _setup_theme() -> dict[str, int]:
     """Build a curses-attribute theme dict, respecting NO_COLOR."""
     plain = {
         "dir": 0, "file": 0, "checked": curses.A_BOLD,
@@ -521,17 +520,28 @@ def _setup_theme() -> dict:
     }
 
 
-def pick(nodes: list) -> Optional[set]:
+def _apply_filter_key(ch: int, filter_active: bool, filter_buf: str) -> tuple[bool, str]:
+    """Update (filter_active, filter_buf) for a key pressed while filter input is open."""
+    if ch in (10, 13):
+        return False, filter_buf
+    if ch == 27:
+        return False, ""
+    if ch in (curses.KEY_BACKSPACE, 127, 8):
+        return filter_active, filter_buf[:-1]
+    if 32 <= ch < 127:
+        return filter_active, filter_buf + chr(ch)
+    return filter_active, filter_buf
+
+
+def pick(nodes: list[Node]) -> set[str] | None:
     """Curses checkbox-tree picker. Returns set of checked file rels, or None on cancel."""
     if not nodes:
         return set()
 
-    state = {"cancelled": False}
-
-    def cascade(idx: int, value: bool) -> None:
-        cascade_check(nodes, idx, value)
+    cancelled = False
 
     def _picker(stdscr) -> None:
+        nonlocal cancelled
         curses.curs_set(0)
         stdscr.keypad(True)
         try:
@@ -560,18 +570,12 @@ def pick(nodes: list) -> Optional[set]:
                 stdscr.refresh()
                 ch = stdscr.getch()
                 if filter_active or filter_buf:
-                    if ch == 27:
-                        filter_active = False
-                        filter_buf = ""
-                    elif ch in (10, 13):
-                        filter_active = False
-                    elif ch in (curses.KEY_BACKSPACE, 127, 8):
-                        filter_buf = filter_buf[:-1]
-                    elif 32 <= ch < 127:
-                        filter_buf += chr(ch)
+                    filter_active, filter_buf = _apply_filter_key(
+                        ch, filter_active, filter_buf
+                    )
                     continue
                 if ch in (ord("q"), 3):
-                    state["cancelled"] = True
+                    cancelled = True
                     return
                 continue
 
@@ -645,15 +649,9 @@ def pick(nodes: list) -> Optional[set]:
                 continue
 
             if filter_active:
-                if ch in (10, 13):
-                    filter_active = False
-                elif ch == 27:
-                    filter_active = False
-                    filter_buf = ""
-                elif ch in (curses.KEY_BACKSPACE, 127, 8):
-                    filter_buf = filter_buf[:-1]
-                elif 32 <= ch < 127:
-                    filter_buf += chr(ch)
+                filter_active, filter_buf = _apply_filter_key(
+                    ch, filter_active, filter_buf
+                )
                 continue
 
             if ch == curses.KEY_MOUSE:
@@ -670,7 +668,7 @@ def pick(nodes: list) -> Optional[set]:
                         if bstate & curses.BUTTON1_DOUBLE_CLICKED and n.is_dir:
                             n.expanded = not n.expanded
                         else:
-                            cascade(cursor_ni, not n.checked)
+                            cascade_check(nodes, cursor_ni, not n.checked)
                 continue
 
             if ch in (curses.KEY_DOWN, ord("j")):
@@ -692,7 +690,7 @@ def pick(nodes: list) -> Optional[set]:
                 cursor_pos = len(visible) - 1
                 cursor_ni = visible[cursor_pos]
             elif ch == ord(" "):
-                cascade(cursor_ni, not nodes[cursor_ni].checked)
+                cascade_check(nodes, cursor_ni, not nodes[cursor_ni].checked)
             elif ch in (curses.KEY_RIGHT, ord("l")):
                 if nodes[cursor_ni].is_dir:
                     nodes[cursor_ni].expanded = True
@@ -717,31 +715,29 @@ def pick(nodes: list) -> Optional[set]:
             elif ch == ord("a"):
                 any_unchecked = any(not nodes[v].checked for v in visible)
                 for v in visible:
-                    cascade(v, any_unchecked)
+                    cascade_check(nodes, v, any_unchecked)
             elif ch in (10, 13):
                 if nodes[cursor_ni].is_dir:
                     nodes[cursor_ni].expanded = not nodes[cursor_ni].expanded
                 else:
                     return
-            elif ch == ord("d"):
-                return
             elif ch in (ord("q"), 3):
-                state["cancelled"] = True
+                cancelled = True
                 return
 
     try:
         curses.wrapper(_picker)
     except KeyboardInterrupt:
-        state["cancelled"] = True
+        cancelled = True
 
-    if state["cancelled"]:
+    if cancelled:
         return None
     return {n.rel for n in nodes if n.checked and not n.is_dir}
 
 
 # ---------- last selection ----------
 
-def load_last_selection(root: Path) -> Optional[list]:
+def load_last_selection(root: Path) -> list[str] | None:
     p = root / LAST_SELECTION_FILE
     if not p.exists():
         return None
@@ -755,7 +751,7 @@ def load_last_selection(root: Path) -> Optional[list]:
     return None
 
 
-def save_last_selection(root: Path, selected: list) -> None:
+def save_last_selection(root: Path, selected: list[str]) -> None:
     try:
         (root / LAST_SELECTION_FILE).write_text(
             json.dumps({"selected": sorted(selected)}, indent=2),
@@ -767,7 +763,7 @@ def save_last_selection(root: Path, selected: list) -> None:
 
 # ---------- output ----------
 
-def render_ascii_tree(paths: list, repo_name: str) -> str:
+def render_ascii_tree(paths: list[str], repo_name: str) -> str:
     tree: dict = {}
     for p in paths:
         cur = tree
@@ -792,8 +788,8 @@ def render_ascii_tree(paths: list, repo_name: str) -> str:
 def render_output(
     repo_name: str,
     repo_root: Path,
-    files: list,
-    tree: Optional[str],
+    files: list[str],
+    tree: str | None,
 ) -> str:
     ts = datetime.now().isoformat(timespec="seconds")
     parts = [
@@ -861,7 +857,7 @@ MARKER_END = "# --- end nomnom:extensions"
 SELF_PATH = Path(__file__).resolve()
 
 
-def _read_block(path: Path) -> tuple:
+def _read_block(path: Path) -> tuple[list[str], int, int]:
     src_lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
     start = end = -1
     for i, line in enumerate(src_lines):
@@ -875,10 +871,10 @@ def _read_block(path: Path) -> tuple:
     return src_lines, start, end
 
 
-def _parse_block(src_lines: list, start: int, end: int) -> dict:
+def _parse_block(src_lines: list[str], start: int, end: int) -> dict[str, object]:
     block = "".join(src_lines[start + 1:end])
     tree = ast.parse(block)
-    out: dict = {}
+    out: dict[str, object] = {}
     for node in tree.body:
         if not isinstance(node, ast.Assign) or len(node.targets) != 1:
             continue
@@ -889,8 +885,8 @@ def _parse_block(src_lines: list, start: int, end: int) -> dict:
     return out
 
 
-def _emit_block(values: dict) -> str:
-    parts: list = []
+def _emit_block(values: dict[str, object]) -> str:
+    parts: list[str] = []
     first = True
     for kind, name in KIND_TO_NAME.items():
         v = values.get(name)
@@ -913,7 +909,7 @@ def _emit_block(values: dict) -> str:
 
 
 def _write_block(
-    path: Path, src_lines: list, start: int, end: int, new_block: str
+    path: Path, src_lines: list[str], start: int, end: int, new_block: str
 ) -> None:
     new_lines = src_lines[: start + 1] + [new_block] + src_lines[end:]
     path.write_text("".join(new_lines), encoding="utf-8")
@@ -921,9 +917,9 @@ def _write_block(
 
 def cmd_register(
     kind: str,
-    values: list,
+    values: list[str],
     remove: bool = False,
-    path: Optional[Path] = None,
+    path: Path | None = None,
 ) -> int:
     p = path if path is not None else SELF_PATH
     src_lines, start, end = _read_block(p)
@@ -934,7 +930,7 @@ def cmd_register(
     is_list = kind in KIND_IS_LIST
 
     if not remove:
-        conflicts: list = []
+        conflicts: list[tuple[str, str, str]] = []
         for value in values:
             for other_kind, other_name in KIND_TO_NAME.items():
                 if other_name == target_name:
@@ -950,7 +946,7 @@ def cmd_register(
                 )
             return 1
 
-    changes: list = []
+    changes: list[tuple[str, str]] = []
     for value in values:
         if remove:
             if value not in target:
@@ -986,27 +982,37 @@ def cmd_register(
 
 # ---------- main ----------
 
+def _build_subcommand_parser(verb: str) -> argparse.ArgumentParser:
+    sub = argparse.ArgumentParser(
+        prog=f"nomnom {verb}",
+        description=(
+            f"{verb.capitalize()} an entry in the auto-managed extension "
+            "lists in nomnom.py. After it runs, review with `git diff "
+            "nomnom.py` and commit when happy."
+        ),
+    )
+    sub.add_argument(
+        "kind", choices=list(KIND_TO_NAME),
+        help="which list to edit: text | binary | name | secret",
+    )
+    sub.add_argument(
+        "values", nargs="+",
+        help="one or more entries (e.g. .rmeta, MODULE.bazel, '*.creds')",
+    )
+    return sub
+
+
+def _dispatch_subcommand(argv: list[str]) -> int:
+    # Mixing argparse subparsers with the optional `repo` positional confuses
+    # argparse's positional matcher, so we sniff the verb and dispatch by hand.
+    verb = argv[0]
+    args = _build_subcommand_parser(verb).parse_args(argv[1:])
+    return cmd_register(args.kind, args.values, remove=(verb == "unregister"))
+
+
 def main() -> int:
     if len(sys.argv) >= 2 and sys.argv[1] in ("register", "unregister"):
-        verb = sys.argv[1]
-        sub = argparse.ArgumentParser(
-            prog=f"nomnom {verb}",
-            description=(
-                f"{verb.capitalize()} an entry in the auto-managed extension "
-                "lists in nomnom.py. After it runs, review with `git diff "
-                "nomnom.py` and commit when happy."
-            ),
-        )
-        sub.add_argument(
-            "kind", choices=list(KIND_TO_NAME.keys()),
-            help="which list to edit: text | binary | name | secret",
-        )
-        sub.add_argument(
-            "values", nargs="+",
-            help="one or more entries (e.g. .rmeta, MODULE.bazel, '*.creds')",
-        )
-        a = sub.parse_args(sys.argv[2:])
-        return cmd_register(a.kind, a.values, remove=(verb == "unregister"))
+        return _dispatch_subcommand(sys.argv[1:])
 
     parser = argparse.ArgumentParser(
         description="nomnom: feed your repo to the LLM, one .txt snack at a time.",
@@ -1052,10 +1058,11 @@ def main() -> int:
     print(f"  {len(file_items)} files, {sum(1 for it in items if it.is_dir)} dirs",
           file=sys.stderr)
 
-    selected: Optional[list] = None
+    selected: list[str] | None = None
     last = load_last_selection(root)
     if last:
-        present = [p for p in last if any(it.rel == p and not it.is_dir for it in items)]
+        file_rels = {it.rel for it in items if not it.is_dir}
+        present = [p for p in last if p in file_rels]
         if present and confirm(f"reuse last selection ({len(present)} files)?", default=True):
             selected = sorted(present)
 
@@ -1074,7 +1081,7 @@ def main() -> int:
     tree_str = render_ascii_tree(selected, repo_name) if include_tree else None
 
     total_bytes = 0
-    large: list = []
+    large: list[tuple[str, int]] = []
     for rel in selected:
         p = root / rel
         try:
