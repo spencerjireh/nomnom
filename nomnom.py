@@ -933,19 +933,25 @@ def cmd_register(
     target = parsed[target_name]
     is_list = kind in KIND_IS_LIST
 
-    changes: list = []
-    for value in values:
-        if not remove:
+    if not remove:
+        conflicts: list = []
+        for value in values:
             for other_kind, other_name in KIND_TO_NAME.items():
                 if other_name == target_name:
                     continue
                 if value in parsed.get(other_name, ()):
-                    print(
-                        f"error: {value!r} is already in {other_name}. "
-                        f"run `nomnom unregister {other_kind} {value}` first.",
-                        file=sys.stderr,
-                    )
-                    return 1
+                    conflicts.append((value, other_kind, other_name))
+        if conflicts:
+            for value, other_kind, other_name in conflicts:
+                print(
+                    f"error: {value!r} is already in {other_name}. "
+                    f"run `nomnom unregister {other_kind} {value}` first.",
+                    file=sys.stderr,
+                )
+            return 1
+
+    changes: list = []
+    for value in values:
         if remove:
             if value not in target:
                 print(f"! {value!r} not in {target_name} (no change)")

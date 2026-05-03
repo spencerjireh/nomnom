@@ -689,6 +689,27 @@ class TestRegister:
         assert "unregister binary .png" in err
         assert p.read_bytes() == before
 
+    def test_conflict_with_trailing_valid_writes_nothing(self, tmp_path, capsys):
+        # A conflicting value followed by a valid one must not write a partial
+        # change. After the failure, registering the valid value alone should
+        # still succeed.
+        p = make_fixture(tmp_path, text={".py"}, binary={".png"})
+        before = p.read_bytes()
+        rc = nomnom.cmd_register("text", [".png", ".new"], path=p)
+        assert rc == 1
+        assert p.read_bytes() == before
+        rc = nomnom.cmd_register("text", [".new"], path=p)
+        assert rc == 0
+        assert "'.new'," in p.read_text()
+
+    def test_multi_conflict_reports_all(self, tmp_path, capsys):
+        p = make_fixture(tmp_path, text={".py"}, binary={".png", ".jpg"})
+        rc = nomnom.cmd_register("text", [".png", ".jpg"], path=p)
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "'.png'" in err
+        assert "'.jpg'" in err
+
     def test_register_secret_preserves_list_order(self, tmp_path):
         p = make_fixture(tmp_path, secrets=[".env", "*.pem"])
         rc = nomnom.cmd_register("secret", ["*.creds"], path=p)
