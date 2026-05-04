@@ -11,6 +11,7 @@ import argparse
 import ast
 import curses
 import fnmatch
+import hashlib
 import json
 import locale
 import os
@@ -36,7 +37,7 @@ JUNK_DIRS = {
 }
 LARGE_FILE_BYTES = 1_000_000
 BINARY_SNIFF_BYTES = 8192
-LAST_SELECTION_FILE = ".nomnom-last.json"
+CACHE_DIR_NAME = "nomnom"
 
 # --- nomnom:extensions (auto-managed; edit with `nomnom register`) ---
 TEXT_EXTENSIONS = {
@@ -717,10 +718,7 @@ def pick(nodes: list[Node]) -> set[str] | None:
                 for v in visible:
                     cascade_check(nodes, v, any_unchecked)
             elif ch in (10, 13):
-                if nodes[cursor_ni].is_dir:
-                    nodes[cursor_ni].expanded = not nodes[cursor_ni].expanded
-                else:
-                    return
+                return
             elif ch in (ord("q"), 3):
                 cancelled = True
                 return
@@ -737,12 +735,20 @@ def pick(nodes: list[Node]) -> set[str] | None:
 
 # ---------- last selection ----------
 
+def _cache_path_for(root: Path) -> Path:
+    abs_root = str(root.resolve())
+    digest = hashlib.sha1(abs_root.encode("utf-8")).hexdigest()
+    return Path.home() / ".cache" / CACHE_DIR_NAME / f"{digest}.json"
+
+
 def load_last_selection(root: Path) -> list[str] | None:
-    p = root / LAST_SELECTION_FILE
+    p = _cache_path_for(root)
     if not p.exists():
         return None
     try:
         data = json.loads(p.read_text(encoding="utf-8"))
+        if data.get("repo_path") != str(root.resolve()):
+            return None
         sel = data.get("selected")
         if isinstance(sel, list) and all(isinstance(x, str) for x in sel):
             return sel
@@ -753,8 +759,13 @@ def load_last_selection(root: Path) -> list[str] | None:
 
 def save_last_selection(root: Path, selected: list[str]) -> None:
     try:
-        (root / LAST_SELECTION_FILE).write_text(
-            json.dumps({"selected": sorted(selected)}, indent=2),
+        p = _cache_path_for(root)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(
+            json.dumps(
+                {"repo_path": str(root.resolve()), "selected": sorted(selected)},
+                indent=2,
+            ),
             encoding="utf-8",
         )
     except OSError:

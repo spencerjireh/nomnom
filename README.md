@@ -36,7 +36,7 @@ python3 nomnom.py --copy .       # straight to your clipboard, no file
 
 You'll get an interactive picker, a confirmation summary, then either a file like `foo-20260503-101415.txt` in your current dir or the bundle on your clipboard. Drag it into your favourite chat app and watch the model graze.
 
-nomnom writes `.nomnom-last.json` at the target repo root to remember the last selection — a second run on the same repo offers to reuse it.
+nomnom remembers the last selection per-repo in `~/.cache/nomnom/` — a second run on the same repo offers to reuse it.
 
 ## What you get
 
@@ -75,7 +75,7 @@ foo/
 | `E` / `C` | expand all / collapse all |
 | `/` | filter (Esc to clear) |
 | `a` | toggle all currently visible |
-| `Enter` on a file | done |
+| `Enter` | confirm selection and exit |
 | Click | toggle a row |
 | Double-click on folder | expand / collapse |
 | `q` / `Ctrl-C` | cancel |

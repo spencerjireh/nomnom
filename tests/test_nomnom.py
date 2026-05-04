@@ -423,30 +423,69 @@ class TestPickOutputPath:
 # ---------- last selection ----------
 
 class TestLastSelection:
-    def test_save_and_load_roundtrip(self, tmp_path):
-        nomnom.save_last_selection(tmp_path, ["a.py", "src/b.py"])
-        out = nomnom.load_last_selection(tmp_path)
+    @pytest.fixture(autouse=True)
+    def _fake_home(self, tmp_path, monkeypatch):
+        home = tmp_path / "_home"
+        home.mkdir()
+        monkeypatch.setenv("HOME", str(home))
+
+    @pytest.fixture
+    def repo(self, tmp_path):
+        r = tmp_path / "repo"
+        r.mkdir()
+        return r
+
+    def test_save_writes_outside_target_repo(self, repo):
+        nomnom.save_last_selection(repo, ["a.py"])
+        assert not (repo / ".nomnom-last.json").exists()
+        assert nomnom._cache_path_for(repo).exists()
+
+    def test_save_and_load_roundtrip(self, repo):
+        nomnom.save_last_selection(repo, ["a.py", "src/b.py"])
+        out = nomnom.load_last_selection(repo)
         assert out == ["a.py", "src/b.py"]
 
-    def test_load_missing_returns_none(self, tmp_path):
-        assert nomnom.load_last_selection(tmp_path) is None
+    def test_load_missing_returns_none(self, repo):
+        assert nomnom.load_last_selection(repo) is None
 
-    def test_load_invalid_json_returns_none(self, tmp_path):
-        (tmp_path / nomnom.LAST_SELECTION_FILE).write_text("{not json")
-        assert nomnom.load_last_selection(tmp_path) is None
+    def test_load_invalid_json_returns_none(self, repo):
+        p = nomnom._cache_path_for(repo)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("{not json")
+        assert nomnom.load_last_selection(repo) is None
 
-    def test_load_wrong_shape_returns_none(self, tmp_path):
-        (tmp_path / nomnom.LAST_SELECTION_FILE).write_text(
-            json.dumps({"selected": [1, 2, 3]})
+    def test_load_wrong_shape_returns_none(self, repo):
+        p = nomnom._cache_path_for(repo)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(
+            json.dumps(
+                {"repo_path": str(repo.resolve()), "selected": [1, 2, 3]}
+            )
         )
-        assert nomnom.load_last_selection(tmp_path) is None
+        assert nomnom.load_last_selection(repo) is None
 
-    def test_save_is_deterministically_sorted(self, tmp_path):
-        nomnom.save_last_selection(tmp_path, ["z.py", "a.py", "m.py"])
-        data = json.loads(
-            (tmp_path / nomnom.LAST_SELECTION_FILE).read_text()
+    def test_load_repo_path_mismatch_returns_none(self, repo):
+        p = nomnom._cache_path_for(repo)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(
+            json.dumps(
+                {"repo_path": "/some/other/path", "selected": ["a.py"]}
+            )
         )
+        assert nomnom.load_last_selection(repo) is None
+
+    def test_save_is_deterministically_sorted(self, repo):
+        nomnom.save_last_selection(repo, ["z.py", "a.py", "m.py"])
+        data = json.loads(nomnom._cache_path_for(repo).read_text())
         assert data["selected"] == ["a.py", "m.py", "z.py"]
+        assert data["repo_path"] == str(repo.resolve())
+
+    def test_save_silently_skips_when_unwritable(self, repo, monkeypatch):
+        monkeypatch.setattr(
+            nomnom, "_cache_path_for",
+            lambda _root: Path("/dev/null/nope.json"),
+        )
+        nomnom.save_last_selection(repo, ["a.py"])
 
 
 # ---------- is_binary extension shortcuts ----------
