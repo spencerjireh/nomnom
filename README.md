@@ -106,6 +106,21 @@ gh pr create --fill
 
 Conflicts are refused: registering `.foo` as text when it's already in BINARY_EXTENSIONS errors out and tells you to unregister it first. Re-registering an existing entry is a harmless no-op. nomnom doesn't touch git itself — review and commit are yours.
 
+## Git workflow helpers
+
+Two extra subcommands dump git/gh context into a `.txt` for an LLM that's drafting a commit message or PR body:
+
+```sh
+nomnom commit                  # status, diffs, recent commits
+nomnom pr                      # commits since base, full diff, existing PR body
+nomnom pr --base develop       # PR against a non-default base
+nomnom commit --copy           # straight to clipboard
+```
+
+Each section is wrapped in a `<section name="...">` block (mirroring the file bundle's `<file path="...">` shape) and prefixed with a `<file_tree>` of the changed files.
+
+`commit` errors out if there are no staged or unstaged changes. `pr` requires the [`gh`](https://cli.github.com) CLI; it auto-detects the default base branch via `gh repo view` and looks up an existing PR for the current branch via `gh pr view` (the section is `none` if there isn't one yet). Output filenames look like `<repo>-<branch>-commit-<ts>.txt` and `<repo>-<branch>-pr-<ts>.txt` (detached HEAD substitutes a short SHA for the branch name).
+
 ## Environment
 
 - `NO_COLOR=1` — disable color in the picker.

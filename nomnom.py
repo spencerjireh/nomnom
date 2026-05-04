@@ -841,6 +841,176 @@ def pick_output_path(repo_name: str) -> Path:
         n += 1
 
 
+def _slug(s: str) -> str:
+    """Make a branch name safe for use in a filename."""
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", s).strip("-") or "branch"
+
+
+def pick_git_output_path(repo_name: str, branch_label: str, kind: str) -> Path:
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    stem = f"{_slug(repo_name)}-{_slug(branch_label)}-{kind}-{ts}"
+    base = Path.cwd() / f"{stem}.txt"
+    if not base.exists():
+        return base
+    n = 2
+    while True:
+        candidate = base.with_name(f"{stem}-{n}.txt")
+        if not candidate.exists():
+            return candidate
+        n += 1
+
+
+# ---------- git/gh helpers ----------
+
+GIT_BUNDLE_WARN_BYTES = 200_000
+
+
+def _run(cmd: list[str], cwd: Path) -> tuple[int, str, str]:
+    try:
+        proc = subprocess.run(
+            cmd, cwd=str(cwd), capture_output=True, text=True, check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        return 1, "", str(e)
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+def _require_git_repo(root: Path) -> None:
+    rc, _, _ = _run(["git", "rev-parse", "--show-toplevel"], root)
+    if rc != 0:
+        print(f"error: not a git repository: {root}", file=sys.stderr)
+        sys.exit(1)
+
+
+def _current_branch(root: Path) -> str | None:
+    rc, out, _ = _run(["git", "symbolic-ref", "--short", "HEAD"], root)
+    if rc != 0:
+        return None
+    return out.strip() or None
+
+
+def _short_sha(root: Path) -> str:
+    rc, out, _ = _run(["git", "rev-parse", "--short", "HEAD"], root)
+    if rc != 0:
+        return "nohead"
+    return out.strip() or "nohead"
+
+
+def _changed_files(root: Path, base: str | None) -> list[str]:
+    seen: set[str] = set()
+    if base is None:
+        for cmd in (
+            ["git", "diff", "--name-only", "HEAD"],
+            ["git", "diff", "--staged", "--name-only"],
+            ["git", "ls-files", "--others", "--exclude-standard"],
+        ):
+            rc, out, _ = _run(cmd, root)
+            if rc == 0:
+                seen.update(line for line in out.splitlines() if line)
+    else:
+        rc, out, _ = _run(["git", "diff", "--name-only", f"{base}...HEAD"], root)
+        if rc == 0:
+            seen.update(line for line in out.splitlines() if line)
+    return sorted(seen)
+
+
+def _require_gh() -> None:
+    if shutil.which("gh") is None:
+        print(
+            "error: pr requires gh (https://cli.github.com). "
+            "install it and retry.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
+def _default_base_branch(root: Path) -> str:
+    rc, out, _ = _run(
+        ["gh", "repo", "view", "--json", "defaultBranchRef",
+         "-q", ".defaultBranchRef.name"],
+        root,
+    )
+    if rc == 0 and out.strip():
+        return out.strip()
+    return "main"
+
+
+def render_git_bundle(
+    repo_name: str,
+    kind: str,
+    branch_label: str,
+    sections: list[tuple[str, str]],
+    tree: str | None,
+) -> str:
+    ts = datetime.now().isoformat(timespec="seconds")
+    parts = [
+        f"This is a packed representation of git context for {repo_name} "
+        f"({kind}) on {branch_label}, bundled on {ts}. "
+        f"Each piece is wrapped in <section name=\"...\"> tags.",
+        "",
+    ]
+    if tree:
+        parts.append("<file_tree>")
+        parts.append(tree)
+        parts.append("</file_tree>")
+        parts.append("")
+    for name, body in sections:
+        parts.append(f'<section name="{name}">')
+        parts.append(body)
+        if not body.endswith("\n"):
+            parts.append("")
+        parts.append("</section>")
+        parts.append("")
+    return "\n".join(parts)
+
+
+def _emit_git_bundle(
+    repo_name: str,
+    kind: str,
+    branch_label: str,
+    sections: list[tuple[str, str]],
+    tree: str | None,
+    copy: bool,
+) -> int:
+    output = render_git_bundle(repo_name, kind, branch_label, sections, tree)
+    size = len(output)
+    print()
+    print(f"  sections: {len(sections)}")
+    print(f"  size:     {size:,} bytes")
+
+    if copy:
+        clip = detect_clipboard_cmd()
+        if clip:
+            print(f"  output:   clipboard via {clip[0]}")
+        else:
+            print("  output:   clipboard (no tool found; will fall back to file)")
+    else:
+        out_path = pick_git_output_path(repo_name, branch_label, kind)
+        print(f"  output:   {out_path}")
+    if size > GIT_BUNDLE_WARN_BYTES:
+        print(f"  warn:     bundle exceeds {GIT_BUNDLE_WARN_BYTES:,} bytes")
+    print()
+
+    if copy:
+        if copy_to_clipboard(output):
+            print(f"copied {size:,} bytes to clipboard.")
+            return 0
+        print(
+            "no clipboard tool found (pbcopy/wl-copy/xclip/xsel); "
+            "falling back to a file.",
+            file=sys.stderr,
+        )
+        out_path = pick_git_output_path(repo_name, branch_label, kind)
+
+    try:
+        out_path.write_text(output, encoding="utf-8")
+    except OSError as e:
+        print(f"error writing output: {e}", file=sys.stderr)
+        return 1
+    print(f"wrote {out_path}")
+    return 0
+
+
 # ---------- prompts ----------
 
 def confirm(prompt: str, default: bool = True) -> bool:
@@ -991,6 +1161,160 @@ def cmd_register(
     return 0
 
 
+def cmd_commit(repo: str, copy: bool) -> int:
+    root = Path(repo).expanduser().resolve()
+    if not root.is_dir():
+        print(f"error: not a directory: {root}", file=sys.stderr)
+        return 1
+    repo_name = root.name or "repo"
+    _require_git_repo(root)
+
+    _, staged_diff, _ = _run(["git", "diff", "--staged"], root)
+    _, unstaged_diff, _ = _run(["git", "diff"], root)
+    if not staged_diff.strip() and not unstaged_diff.strip():
+        print(
+            "error: nothing to commit (no staged or unstaged changes).",
+            file=sys.stderr,
+        )
+        return 1
+
+    branch = _current_branch(root)
+    branch_label = branch if branch else _short_sha(root)
+
+    _, status, _ = _run(["git", "status", "--porcelain=v1"], root)
+    _, staged_stat, _ = _run(["git", "diff", "--staged", "--stat"], root)
+    _, unstaged_stat, _ = _run(["git", "diff", "--stat"], root)
+    _, untracked, _ = _run(
+        ["git", "ls-files", "--others", "--exclude-standard"], root,
+    )
+    _, recent_commits, _ = _run(["git", "log", "-n", "20"], root)
+
+    diff_summary_parts: list[str] = []
+    if staged_stat.strip():
+        diff_summary_parts.append("# staged\n" + staged_stat.rstrip())
+    if unstaged_stat.strip():
+        diff_summary_parts.append("# unstaged\n" + unstaged_stat.rstrip())
+    diff_summary = "\n\n".join(diff_summary_parts)
+
+    sections: list[tuple[str, str]] = []
+    sections.append(("git_status", status.rstrip() or "(clean)"))
+    if diff_summary:
+        sections.append(("diff_summary", diff_summary))
+    if staged_diff.strip():
+        sections.append(("staged_diff", staged_diff.rstrip()))
+    if unstaged_diff.strip():
+        sections.append(("unstaged_diff", unstaged_diff.rstrip()))
+    if untracked.strip():
+        sections.append(("untracked", untracked.rstrip()))
+    if recent_commits.strip():
+        sections.append(("recent_commits", recent_commits.rstrip()))
+
+    changed = _changed_files(root, base=None)
+    tree = render_ascii_tree(changed, repo_name) if changed else None
+
+    return _emit_git_bundle(
+        repo_name, "commit", branch_label, sections, tree, copy,
+    )
+
+
+def cmd_pr(repo: str, copy: bool, base: str | None) -> int:
+    _require_gh()
+    root = Path(repo).expanduser().resolve()
+    if not root.is_dir():
+        print(f"error: not a directory: {root}", file=sys.stderr)
+        return 1
+    repo_name = root.name or "repo"
+    _require_git_repo(root)
+
+    branch = _current_branch(root)
+    if branch is None:
+        print(
+            "error: HEAD is detached; check out a branch before running pr.",
+            file=sys.stderr,
+        )
+        return 1
+
+    if base is None:
+        base = _default_base_branch(root)
+
+    rc, log_out, log_err = _run(["git", "log", f"{base}...HEAD"], root)
+    if rc != 0:
+        print(
+            f"error: git log {base}...HEAD failed: {log_err.strip()}",
+            file=sys.stderr,
+        )
+        return 1
+    _, diff_stat, _ = _run(["git", "diff", f"{base}...HEAD", "--stat"], root)
+    _, diff_full, _ = _run(["git", "diff", f"{base}...HEAD"], root)
+
+    pr_rc, pr_view, _ = _run(
+        ["gh", "pr", "view", "--json",
+         "number,url,title,body,headRefName,baseRefName"],
+        root,
+    )
+    existing_pr_section: str
+    pr_url: str | None = None
+    if pr_rc == 0 and pr_view.strip():
+        try:
+            data = json.loads(pr_view)
+        except json.JSONDecodeError:
+            data = None
+        if isinstance(data, dict):
+            pr_url = data.get("url")
+            existing_pr_section = (
+                f"#{data.get('number', '?')}: {data.get('title', '')}\n"
+                f"url:  {data.get('url', '')}\n"
+                f"head: {data.get('headRefName', '')}\n"
+                f"base: {data.get('baseRefName', '')}\n\n"
+                f"{(data.get('body') or '').rstrip()}"
+            )
+        else:
+            existing_pr_section = "none"
+    else:
+        existing_pr_section = "none"
+
+    _, merged_json, _ = _run(
+        ["gh", "pr", "list", "--state", "merged", "--limit", "10",
+         "--json", "title,body"],
+        root,
+    )
+    merged_lines: list[str] = []
+    if merged_json.strip():
+        try:
+            merged = json.loads(merged_json)
+        except json.JSONDecodeError:
+            merged = []
+        for item in merged or []:
+            title = (item.get("title") or "").strip()
+            body = (item.get("body") or "").strip()
+            if len(body) > 500:
+                body = body[:500] + "…"
+            merged_lines.append(f"## {title}\n{body}".rstrip())
+    recent_merged = "\n\n".join(merged_lines) if merged_lines else "(none)"
+
+    branch_info = f"branch: {branch}\nbase:   {base}"
+    if pr_url:
+        branch_info += f"\npr:     {pr_url}"
+
+    sections: list[tuple[str, str]] = [
+        ("branch_info", branch_info),
+        ("commits_since_base", log_out.rstrip() or "(none)"),
+    ]
+    if diff_stat.strip():
+        sections.append(("diff_summary", diff_stat.rstrip()))
+    if diff_full.strip():
+        sections.append(("diff", diff_full.rstrip()))
+    sections.append(("existing_pr", existing_pr_section))
+    sections.append(("recent_merged_prs", recent_merged))
+
+    changed = _changed_files(root, base=base)
+    tree = render_ascii_tree(changed, repo_name) if changed else None
+
+    return _emit_git_bundle(
+        repo_name, "pr", branch, sections, tree, copy,
+    )
+
+
 # ---------- main ----------
 
 def _build_subcommand_parser(verb: str) -> argparse.ArgumentParser:
@@ -1013,23 +1337,78 @@ def _build_subcommand_parser(verb: str) -> argparse.ArgumentParser:
     return sub
 
 
+def _build_commit_parser() -> argparse.ArgumentParser:
+    sub = argparse.ArgumentParser(
+        prog="nomnom commit",
+        description=(
+            "Bundle git context (status, diffs, recent commits) into a .txt "
+            "for an LLM to draft a commit message."
+        ),
+    )
+    sub.add_argument(
+        "repo", nargs="?", default=".",
+        help="Path to the project repo (default: current directory).",
+    )
+    sub.add_argument(
+        "--copy", action="store_true",
+        help="Copy output to the system clipboard instead of writing a file.",
+    )
+    return sub
+
+
+def _build_pr_parser() -> argparse.ArgumentParser:
+    sub = argparse.ArgumentParser(
+        prog="nomnom pr",
+        description=(
+            "Bundle git + gh context (commits since base, full diff, "
+            "existing PR body) into a .txt for an LLM to draft a PR body."
+        ),
+    )
+    sub.add_argument(
+        "repo", nargs="?", default=".",
+        help="Path to the project repo (default: current directory).",
+    )
+    sub.add_argument(
+        "--copy", action="store_true",
+        help="Copy output to the system clipboard instead of writing a file.",
+    )
+    sub.add_argument(
+        "--base", default=None,
+        help="Base branch to diff against (default: gh repo default branch).",
+    )
+    return sub
+
+
 def _dispatch_subcommand(argv: list[str]) -> int:
     # Mixing argparse subparsers with the optional `repo` positional confuses
     # argparse's positional matcher, so we sniff the verb and dispatch by hand.
     verb = argv[0]
-    args = _build_subcommand_parser(verb).parse_args(argv[1:])
-    return cmd_register(args.kind, args.values, remove=(verb == "unregister"))
+    if verb in ("register", "unregister"):
+        args = _build_subcommand_parser(verb).parse_args(argv[1:])
+        return cmd_register(args.kind, args.values, remove=(verb == "unregister"))
+    if verb == "commit":
+        args = _build_commit_parser().parse_args(argv[1:])
+        return cmd_commit(args.repo, args.copy)
+    if verb == "pr":
+        args = _build_pr_parser().parse_args(argv[1:])
+        return cmd_pr(args.repo, args.copy, args.base)
+    print(f"error: unknown subcommand: {verb}", file=sys.stderr)
+    return 2
+
+
+SUBCOMMANDS = ("register", "unregister", "commit", "pr")
 
 
 def main() -> int:
-    if len(sys.argv) >= 2 and sys.argv[1] in ("register", "unregister"):
+    if len(sys.argv) >= 2 and sys.argv[1] in SUBCOMMANDS:
         return _dispatch_subcommand(sys.argv[1:])
 
     parser = argparse.ArgumentParser(
         description="nomnom: feed your repo to the LLM, one .txt snack at a time.",
         epilog=(
-            "subcommands: register / unregister - edit the auto-managed "
-            "extension lists. run `nomnom register --help` for details."
+            "subcommands: register / unregister edit the auto-managed "
+            "extension lists; commit / pr bundle git context for an LLM. "
+            "run `nomnom <subcommand> --help` for details."
         ),
     )
     parser.add_argument(

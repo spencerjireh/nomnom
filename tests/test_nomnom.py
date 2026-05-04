@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -810,3 +811,330 @@ class TestRegister:
         assert "SECRET_PATTERNS" in parsed
         assert ".py" in parsed["TEXT_EXTENSIONS"]
         assert ".png" in parsed["BINARY_EXTENSIONS"]
+
+
+# ---------- git/gh bundle helpers ----------
+
+def _git(args: list[str], cwd: Path) -> None:
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "nomnom-test",
+        "GIT_AUTHOR_EMAIL": "test@nomnom.local",
+        "GIT_COMMITTER_NAME": "nomnom-test",
+        "GIT_COMMITTER_EMAIL": "test@nomnom.local",
+    }
+    subprocess.run(
+        ["git", *args], cwd=str(cwd), env=env,
+        check=True, capture_output=True, text=True,
+    )
+
+
+def make_git_repo(
+    root: Path, *, initial: dict | None = None, message: str = "init",
+) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    _git(["init", "-q", "-b", "main"], root)
+    _git(["config", "user.email", "test@nomnom.local"], root)
+    _git(["config", "user.name", "nomnom-test"], root)
+    _git(["config", "commit.gpgsign", "false"], root)
+    if initial:
+        make_repo(root, initial)
+        _git(["add", "."], root)
+        _git(["commit", "-q", "-m", message], root)
+
+
+def _make_run_stub(table: dict[tuple[str, ...], tuple[int, str, str]]):
+    """Return a stub for nomnom._run that matches by command tuple prefix.
+
+    Captures the original _run at call time so installing the stub via
+    monkeypatch doesn't make the fallback recurse.
+    """
+    original = nomnom._run
+
+    def stub(cmd: list[str], cwd: Path) -> tuple[int, str, str]:
+        for k, v in table.items():
+            if tuple(cmd[: len(k)]) == k:
+                return v
+        return original(cmd, cwd)
+    return stub
+
+
+# ---------- cmd_commit ----------
+
+class TestCommitBundle:
+    def test_happy_path_writes_bundle(self, tmp_path, monkeypatch, capsys):
+        repo = tmp_path / "myrepo"
+        make_git_repo(repo, initial={"a.txt": "one\n", "b.txt": "two\n"})
+        # Stage one change, leave another unstaged.
+        (repo / "a.txt").write_text("one-edited\n")
+        _git(["add", "a.txt"], repo)
+        (repo / "b.txt").write_text("two-edited\n")
+
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        monkeypatch.chdir(out_dir)
+        rc = nomnom.cmd_commit(str(repo), copy=False)
+        assert rc == 0
+
+        bundles = list(out_dir.glob("myrepo-main-commit-*.txt"))
+        assert len(bundles) == 1
+        text = bundles[0].read_text()
+        assert "<section name=\"git_status\">" in text
+        assert "<section name=\"diff_summary\">" in text
+        assert "<section name=\"staged_diff\">" in text
+        assert "<section name=\"unstaged_diff\">" in text
+        assert "<section name=\"recent_commits\">" in text
+        assert "<file_tree>" in text
+        assert "a.txt" in text and "b.txt" in text
+
+    def test_no_changes_errors(self, tmp_path, monkeypatch, capsys):
+        repo = tmp_path / "clean"
+        make_git_repo(repo, initial={"a.txt": "hi\n"})
+        monkeypatch.chdir(tmp_path)
+        rc = nomnom.cmd_commit(str(repo), copy=False)
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "nothing to commit" in err
+
+    def test_untracked_only_errors(self, tmp_path, monkeypatch, capsys):
+        # Per spec: untracked-only doesn't qualify as "something to commit".
+        repo = tmp_path / "ut"
+        make_git_repo(repo, initial={"a.txt": "hi\n"})
+        (repo / "new.txt").write_text("new\n")
+        monkeypatch.chdir(tmp_path)
+        rc = nomnom.cmd_commit(str(repo), copy=False)
+        assert rc == 1
+
+    def test_detached_head_uses_sha_in_filename(
+        self, tmp_path, monkeypatch,
+    ):
+        repo = tmp_path / "dh"
+        make_git_repo(repo, initial={"a.txt": "1\n"})
+        (repo / "a.txt").write_text("2\n")
+        _git(["add", "a.txt"], repo)
+        _git(["commit", "-q", "-m", "second"], repo)
+        # Detach.
+        _git(["checkout", "-q", "--detach", "HEAD"], repo)
+        (repo / "a.txt").write_text("3\n")
+        _git(["add", "a.txt"], repo)
+
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        monkeypatch.chdir(out_dir)
+        rc = nomnom.cmd_commit(str(repo), copy=False)
+        assert rc == 0
+        bundles = list(out_dir.glob("dh-*-commit-*.txt"))
+        assert len(bundles) == 1
+        # Short SHA is 7 hex chars; filename infix should not be "main".
+        assert "main-commit" not in bundles[0].name
+
+    def test_not_a_git_repo_errors(self, tmp_path, monkeypatch, capsys):
+        plain = tmp_path / "plain"
+        plain.mkdir()
+        monkeypatch.chdir(tmp_path)
+        with pytest.raises(SystemExit) as exc:
+            nomnom.cmd_commit(str(plain), copy=False)
+        assert exc.value.code == 1
+        assert "not a git repository" in capsys.readouterr().err
+
+
+# ---------- cmd_pr ----------
+
+class TestPrBundle:
+    def test_missing_gh_errors(self, tmp_path, monkeypatch, capsys):
+        repo = tmp_path / "p"
+        make_git_repo(repo, initial={"a.txt": "1\n"})
+        monkeypatch.setattr(nomnom.shutil, "which",
+                            lambda name: None if name == "gh" else "/bin/git")
+        monkeypatch.chdir(tmp_path)
+        with pytest.raises(SystemExit) as exc:
+            nomnom.cmd_pr(str(repo), copy=False, base=None)
+        assert exc.value.code == 1
+        assert "requires gh" in capsys.readouterr().err
+
+    def test_happy_path_no_existing_pr(self, tmp_path, monkeypatch):
+        repo = tmp_path / "p"
+        make_git_repo(repo, initial={"a.txt": "1\n"})
+        _git(["checkout", "-q", "-b", "feature"], repo)
+        (repo / "a.txt").write_text("2\n")
+        _git(["add", "a.txt"], repo)
+        _git(["commit", "-q", "-m", "feature change"], repo)
+
+        # Pretend gh exists.
+        monkeypatch.setattr(nomnom.shutil, "which",
+                            lambda name: f"/usr/bin/{name}")
+        # Stub gh calls; let git calls fall through.
+        stub = _make_run_stub({
+            ("gh", "repo", "view"): (0, "main\n", ""),
+            ("gh", "pr", "view"): (1, "", "no pull requests found"),
+            ("gh", "pr", "list"): (0, "[]", ""),
+        })
+        monkeypatch.setattr(nomnom, "_run", stub)
+
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        monkeypatch.chdir(out_dir)
+        rc = nomnom.cmd_pr(str(repo), copy=False, base=None)
+        assert rc == 0
+        bundles = list(out_dir.glob("p-feature-pr-*.txt"))
+        assert len(bundles) == 1
+        text = bundles[0].read_text()
+        assert "<section name=\"existing_pr\">\nnone\n\n</section>" in text
+        assert "<section name=\"branch_info\">" in text
+        assert "base:   main" in text
+        assert "<section name=\"diff\">" in text
+
+    def test_existing_pr_renders_body(self, tmp_path, monkeypatch):
+        repo = tmp_path / "p"
+        make_git_repo(repo, initial={"a.txt": "1\n"})
+        _git(["checkout", "-q", "-b", "feature"], repo)
+        (repo / "a.txt").write_text("2\n")
+        _git(["add", "a.txt"], repo)
+        _git(["commit", "-q", "-m", "feature change"], repo)
+
+        monkeypatch.setattr(nomnom.shutil, "which",
+                            lambda name: f"/usr/bin/{name}")
+        pr_payload = json.dumps({
+            "number": 42,
+            "url": "https://github.com/x/y/pull/42",
+            "title": "Add feature",
+            "body": "describe the feature here",
+            "headRefName": "feature",
+            "baseRefName": "main",
+        })
+        stub = _make_run_stub({
+            ("gh", "repo", "view"): (0, "main\n", ""),
+            ("gh", "pr", "view"): (0, pr_payload, ""),
+            ("gh", "pr", "list"): (0, "[]", ""),
+        })
+        monkeypatch.setattr(nomnom, "_run", stub)
+
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        monkeypatch.chdir(out_dir)
+        rc = nomnom.cmd_pr(str(repo), copy=False, base=None)
+        assert rc == 0
+        text = next(out_dir.glob("p-feature-pr-*.txt")).read_text()
+        assert "#42: Add feature" in text
+        assert "describe the feature here" in text
+        assert "https://github.com/x/y/pull/42" in text
+
+    def test_base_override_skips_default_lookup(self, tmp_path, monkeypatch):
+        repo = tmp_path / "p"
+        make_git_repo(repo, initial={"a.txt": "1\n"})
+        _git(["checkout", "-q", "-b", "develop"], repo)
+        _git(["checkout", "-q", "-b", "feature"], repo)
+        (repo / "a.txt").write_text("2\n")
+        _git(["add", "a.txt"], repo)
+        _git(["commit", "-q", "-m", "x"], repo)
+
+        monkeypatch.setattr(nomnom.shutil, "which",
+                            lambda name: f"/usr/bin/{name}")
+        calls: list[list[str]] = []
+        real_run = nomnom._run
+
+        def tracking(cmd: list[str], cwd: Path):
+            calls.append(list(cmd))
+            if cmd[:3] == ["gh", "repo", "view"]:
+                pytest.fail("default base lookup should be skipped when --base given")
+            if cmd[:3] == ["gh", "pr", "view"]:
+                return 1, "", "no pr"
+            if cmd[:3] == ["gh", "pr", "list"]:
+                return 0, "[]", ""
+            return real_run(cmd, cwd)
+
+        monkeypatch.setattr(nomnom, "_run", tracking)
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        monkeypatch.chdir(out_dir)
+        rc = nomnom.cmd_pr(str(repo), copy=False, base="develop")
+        assert rc == 0
+        text = next(out_dir.glob("p-feature-pr-*.txt")).read_text()
+        assert "base:   develop" in text
+
+    def test_detached_head_errors(self, tmp_path, monkeypatch, capsys):
+        repo = tmp_path / "p"
+        make_git_repo(repo, initial={"a.txt": "1\n"})
+        (repo / "a.txt").write_text("2\n")
+        _git(["add", "a.txt"], repo)
+        _git(["commit", "-q", "-m", "second"], repo)
+        _git(["checkout", "-q", "--detach", "HEAD"], repo)
+
+        monkeypatch.setattr(nomnom.shutil, "which",
+                            lambda name: f"/usr/bin/{name}")
+        monkeypatch.chdir(tmp_path)
+        rc = nomnom.cmd_pr(str(repo), copy=False, base="main")
+        assert rc == 1
+        assert "detached" in capsys.readouterr().err
+
+    def test_recent_merged_pr_body_truncation(self, tmp_path, monkeypatch):
+        repo = tmp_path / "p"
+        make_git_repo(repo, initial={"a.txt": "1\n"})
+        _git(["checkout", "-q", "-b", "feature"], repo)
+        (repo / "a.txt").write_text("2\n")
+        _git(["add", "a.txt"], repo)
+        _git(["commit", "-q", "-m", "x"], repo)
+
+        long_body = "x" * 800
+        merged_payload = json.dumps([
+            {"title": "Old PR", "body": long_body},
+        ])
+        monkeypatch.setattr(nomnom.shutil, "which",
+                            lambda name: f"/usr/bin/{name}")
+        stub = _make_run_stub({
+            ("gh", "repo", "view"): (0, "main\n", ""),
+            ("gh", "pr", "view"): (1, "", "no pr"),
+            ("gh", "pr", "list"): (0, merged_payload, ""),
+        })
+        monkeypatch.setattr(nomnom, "_run", stub)
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        monkeypatch.chdir(out_dir)
+        rc = nomnom.cmd_pr(str(repo), copy=False, base=None)
+        assert rc == 0
+        text = next(out_dir.glob("p-feature-pr-*.txt")).read_text()
+        # First 500 chars of body kept, rest replaced with ellipsis.
+        assert ("x" * 500 + "…") in text
+        assert ("x" * 501) not in text
+
+
+# ---------- pick_git_output_path ----------
+
+class TestPickGitOutputPath:
+    def test_includes_branch_kind_and_ts(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        p = nomnom.pick_git_output_path("repo", "feature/x", "pr")
+        assert p.parent == tmp_path
+        # `/` in branch is sanitized so the path stays in cwd.
+        assert p.name.startswith("repo-feature-x-pr-")
+        assert p.suffix == ".txt"
+
+    def test_collision_handling(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        first = nomnom.pick_git_output_path("r", "main", "commit")
+        first.write_text("x")
+        second = nomnom.pick_git_output_path("r", "main", "commit")
+        assert second != first
+        assert second.name.endswith("-2.txt")
+
+
+# ---------- render_git_bundle ----------
+
+class TestRenderGitBundle:
+    def test_preamble_and_sections(self):
+        out = nomnom.render_git_bundle(
+            "repo", "commit", "main",
+            [("a", "alpha"), ("b", "beta\n")], tree=None,
+        )
+        assert "git context for repo (commit) on main" in out
+        assert '<section name="a">\nalpha\n\n</section>' in out
+        assert '<section name="b">\nbeta\n\n</section>' in out
+        assert "<file_tree>" not in out
+
+    def test_tree_inclusion(self):
+        tree = nomnom.render_ascii_tree(["a.txt"], "repo")
+        out = nomnom.render_git_bundle(
+            "repo", "pr", "feature", [("x", "y")], tree=tree,
+        )
+        assert "<file_tree>" in out
+        assert "</file_tree>" in out
