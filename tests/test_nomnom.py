@@ -1105,8 +1105,9 @@ class TestPickGitOutputPath:
         monkeypatch.chdir(tmp_path)
         p = nomnom.pick_git_output_path("repo", "feature/x", "pr")
         assert p.parent == tmp_path
-        # `/` in branch is sanitized so the path stays in cwd.
-        assert p.name.startswith("repo-feature-x-pr-")
+        # `/` in branch becomes `__` so the path stays in cwd while
+        # preserving distinctness from a literal `feature-x` branch.
+        assert p.name.startswith("repo-feature__x-pr-")
         assert p.suffix == ".txt"
 
     def test_collision_handling(self, tmp_path, monkeypatch):

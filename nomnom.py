@@ -842,7 +842,9 @@ def pick_output_path(repo_name: str) -> Path:
 
 
 def _slug(s: str) -> str:
-    """Make a branch name safe for use in a filename."""
+    """Make a branch name safe for use in a filename. `/` becomes `__` so
+    `feat/foo` stays distinguishable from a literal `feat-foo` branch."""
+    s = s.replace("/", "__")
     return re.sub(r"[^A-Za-z0-9._-]+", "-", s).strip("-") or "branch"
 
 
@@ -1166,7 +1168,10 @@ def cmd_commit(repo: str, copy: bool) -> int:
     if not root.is_dir():
         print(f"error: not a directory: {root}", file=sys.stderr)
         return 1
-    repo_name = root.name or "repo"
+    if not root.name:
+        print(f"error: cannot derive a repo name from {root}", file=sys.stderr)
+        return 1
+    repo_name = root.name
     _require_git_repo(root)
 
     _, staged_diff, _ = _run(["git", "diff", "--staged"], root)
@@ -1223,7 +1228,10 @@ def cmd_pr(repo: str, copy: bool, base: str | None) -> int:
     if not root.is_dir():
         print(f"error: not a directory: {root}", file=sys.stderr)
         return 1
-    repo_name = root.name or "repo"
+    if not root.name:
+        print(f"error: cannot derive a repo name from {root}", file=sys.stderr)
+        return 1
+    repo_name = root.name
     _require_git_repo(root)
 
     branch = _current_branch(root)
@@ -1436,8 +1444,11 @@ def main() -> int:
     if not root.is_dir():
         print(f"error: not a directory: {root}", file=sys.stderr)
         return 1
+    if not root.name:
+        print(f"error: cannot derive a repo name from {root}", file=sys.stderr)
+        return 1
 
-    repo_name = root.name or "repo"
+    repo_name = root.name
     print(f"scanning {root} ...", file=sys.stderr)
     gi = load_gitignore(root)
     items = scan_repo(root, gi, skip_secrets=not args.include_secrets)
