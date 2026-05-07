@@ -1323,6 +1323,371 @@ def cmd_pr(repo: str, copy: bool, base: str | None) -> int:
     )
 
 
+# ---------- review ----------
+
+_REVIEW_TIMELINE_KEEP = {
+    "review_requested",
+    "assigned",
+    "unassigned",
+    "ready_for_review",
+    "convert_to_draft",
+    "merged",
+    "closed",
+    "reopened",
+    "head_ref_force_pushed",
+}
+
+_REVIEW_THREADS_QUERY = """\
+query($owner: String!, $repo: String!, $number: Int!) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) {
+      reviewThreads(first: 100) {
+        nodes {
+          isResolved
+          isOutdated
+          path
+          line
+          comments(first: 50) {
+            nodes {
+              author { login }
+              body
+              createdAt
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"""
+
+
+def _format_pr_meta(pr: dict) -> str:
+    author = ((pr.get("author") or {}).get("login")) or "?"
+    labels = ", ".join(
+        l.get("name", "") for l in (pr.get("labels") or []) if l
+    ) or "(none)"
+    milestone = ((pr.get("milestone") or {}).get("title")) or "(none)"
+    return "\n".join([
+        f"number:    #{pr.get('number', '?')}",
+        f"title:     {pr.get('title', '')}",
+        f"url:       {pr.get('url', '')}",
+        f"author:    @{author}",
+        f"state:     {pr.get('state', '?')}",
+        f"draft:     {'true' if pr.get('isDraft') else 'false'}",
+        f"head:      {pr.get('headRefName', '')}",
+        f"base:      {pr.get('baseRefName', '')}",
+        f"labels:    {labels}",
+        f"milestone: {milestone}",
+        f"created:   {pr.get('createdAt', '')}",
+        f"updated:   {pr.get('updatedAt', '')}",
+    ])
+
+
+def _format_linked_issues(issues: list) -> str:
+    if not issues:
+        return ""
+    lines: list[str] = []
+    for it in issues:
+        num = it.get("number", "?")
+        title = (it.get("title") or "").strip()
+        url = it.get("url") or ""
+        state = it.get("state")
+        head = f"#{num}"
+        if state:
+            head += f" [{state}]"
+        line = f"{head}: {title}".rstrip()
+        if url:
+            line += f"  {url}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _format_commits(commits: list) -> str:
+    if not commits:
+        return ""
+    lines: list[str] = []
+    for c in commits:
+        sha = (c.get("oid") or "")[:7]
+        head = (c.get("messageHeadline") or "").strip()
+        lines.append(f"{sha}  {head}".rstrip())
+    return "\n".join(lines)
+
+
+def _format_diff_summary(files: list) -> str:
+    if not files:
+        return ""
+    width = max((len(f.get("path", "")) for f in files), default=0)
+    lines: list[str] = []
+    total_add = total_del = 0
+    for f in files:
+        path = f.get("path", "")
+        add = int(f.get("additions") or 0)
+        rem = int(f.get("deletions") or 0)
+        total_add += add
+        total_del += rem
+        lines.append(f"{path:<{width}}  +{add}  -{rem}")
+    lines.append(f"total: {len(files)} files, +{total_add} -{total_del}")
+    return "\n".join(lines)
+
+
+def _format_reviews(reviews: list) -> str:
+    if not reviews:
+        return ""
+    parts: list[str] = []
+    for r in reviews:
+        login = ((r.get("user") or {}).get("login")) or "?"
+        state = r.get("state") or ""
+        when = r.get("submitted_at") or ""
+        body = (r.get("body") or "").rstrip()
+        head = f"## @{login} [{state}] {when}".rstrip()
+        parts.append(head + "\n" + (body if body else "(no body)"))
+    return "\n\n".join(parts)
+
+
+def _format_issue_comments(comments: list) -> str:
+    if not comments:
+        return ""
+    parts: list[str] = []
+    for c in comments:
+        login = ((c.get("user") or {}).get("login")) or "?"
+        when = c.get("created_at") or ""
+        body = (c.get("body") or "").rstrip()
+        head = f"## @{login} {when}".rstrip()
+        parts.append(head + "\n" + (body if body else "(no body)"))
+    return "\n\n".join(parts)
+
+
+def _format_review_threads(graphql_result: dict) -> str:
+    try:
+        threads = (
+            graphql_result["data"]["repository"]["pullRequest"]
+            ["reviewThreads"]["nodes"]
+        )
+    except (KeyError, TypeError):
+        return ""
+    if not threads:
+        return ""
+
+    def sort_key(t: dict) -> tuple[str, int]:
+        return (t.get("path") or "", t.get("line") or 0)
+
+    parts: list[str] = []
+    for t in sorted(threads, key=sort_key):
+        path = t.get("path") or "?"
+        line = t.get("line")
+        line_label = str(line) if line is not None else "?"
+        tags: list[str] = []
+        if t.get("isResolved"):
+            tags.append("[resolved]")
+        if t.get("isOutdated"):
+            tags.append("[outdated]")
+        head = f"## {path}:{line_label}"
+        if tags:
+            head += "  " + " ".join(tags)
+        comments = ((t.get("comments") or {}).get("nodes")) or []
+        comment_lines: list[str] = []
+        for c in comments:
+            login = ((c.get("author") or {}).get("login")) or "?"
+            when = c.get("createdAt") or ""
+            body = (c.get("body") or "").rstrip()
+            if body:
+                first, *rest = body.split("\n")
+                comment_lines.append(f"- @{login} {when}: {first}")
+                for line_b in rest:
+                    comment_lines.append(f"  {line_b}")
+            else:
+                comment_lines.append(f"- @{login} {when}: (no body)")
+        parts.append(head + "\n" + "\n".join(comment_lines))
+    return "\n\n".join(parts)
+
+
+def _format_timeline(events: list) -> str:
+    if not events:
+        return ""
+    lines: list[str] = []
+    for ev in events:
+        kind = ev.get("event")
+        if kind not in _REVIEW_TIMELINE_KEEP:
+            continue
+        actor = ((ev.get("actor") or {}).get("login")) or "?"
+        when = ev.get("created_at") or ""
+        suffix = ""
+        if kind == "review_requested":
+            req = ev.get("requested_reviewer") or ev.get("requested_team") or {}
+            who = req.get("login") or req.get("name") or "?"
+            suffix = f": requested @{who}"
+        elif kind in ("assigned", "unassigned"):
+            who = ((ev.get("assignee") or {}).get("login")) or "?"
+            suffix = f": @{who}"
+        elif kind == "head_ref_force_pushed":
+            before = (ev.get("before") or "")[:7]
+            after = (ev.get("after") or "")[:7]
+            if before or after:
+                suffix = f": {before} -> {after}"
+        lines.append(f"{when}  {kind} by @{actor}{suffix}")
+    return "\n".join(lines)
+
+
+def _format_checks(checks: list) -> str:
+    if not checks:
+        return ""
+    width = max((len(c.get("name", "")) for c in checks), default=0)
+    lines: list[str] = []
+    for c in checks:
+        name = c.get("name", "")
+        state = c.get("state") or c.get("bucket") or "?"
+        wf = c.get("workflow") or ""
+        link = c.get("link") or ""
+        lines.append(f"{state:<10} {name:<{width}}  {wf}  {link}".rstrip())
+    return "\n".join(lines)
+
+
+def _section(name: str, body: str) -> tuple[str, str]:
+    return name, body if body else "(none)"
+
+
+def cmd_review(
+    repo: str, pr_number: int, copy: bool, include_diff: bool,
+) -> int:
+    _require_gh()
+    root = Path(repo).expanduser().resolve()
+    if not root.is_dir():
+        print(f"error: not a directory: {root}", file=sys.stderr)
+        return 1
+    if not root.name:
+        print(f"error: cannot derive a repo name from {root}", file=sys.stderr)
+        return 1
+    repo_name = root.name
+    _require_git_repo(root)
+
+    if pr_number <= 0:
+        print(
+            f"error: pr number must be positive, got {pr_number}",
+            file=sys.stderr,
+        )
+        return 1
+
+    rc, owner_repo, err = _run(
+        ["gh", "repo", "view", "--json", "nameWithOwner",
+         "-q", ".nameWithOwner"],
+        root,
+    )
+    owner_repo = owner_repo.strip()
+    if rc != 0 or "/" not in owner_repo:
+        print(
+            f"error: could not resolve gh repo: "
+            f"{err.strip() or owner_repo or 'unknown error'}",
+            file=sys.stderr,
+        )
+        return 1
+    owner, name = owner_repo.split("/", 1)
+
+    fields = (
+        "number,url,title,body,author,state,headRefName,baseRefName,"
+        "labels,milestone,isDraft,createdAt,updatedAt,commits,files,"
+        "closingIssuesReferences"
+    )
+    rc, pr_view, err = _run(
+        ["gh", "pr", "view", str(pr_number), "--json", fields], root,
+    )
+    if rc != 0:
+        print(
+            f"error: gh pr view #{pr_number} failed: "
+            f"{err.strip() or 'unknown error'}",
+            file=sys.stderr,
+        )
+        return 1
+    try:
+        pr = json.loads(pr_view) if pr_view.strip() else {}
+    except json.JSONDecodeError as e:
+        print(f"error: gh pr view returned invalid json: {e}", file=sys.stderr)
+        return 1
+
+    def _api_json(args: list[str]) -> object:
+        rc, out, _ = _run(args, root)
+        if rc != 0 or not out.strip():
+            return None
+        try:
+            return json.loads(out)
+        except json.JSONDecodeError:
+            return None
+
+    issue_comments = _api_json([
+        "gh", "api",
+        f"repos/{owner}/{name}/issues/{pr_number}/comments",
+        "--paginate",
+    ]) or []
+
+    reviews = _api_json([
+        "gh", "api",
+        f"repos/{owner}/{name}/pulls/{pr_number}/reviews",
+        "--paginate",
+    ]) or []
+
+    threads_result = _api_json([
+        "gh", "api", "graphql",
+        "-F", f"owner={owner}",
+        "-F", f"repo={name}",
+        "-F", f"number={pr_number}",
+        "-f", f"query={_REVIEW_THREADS_QUERY}",
+    ]) or {}
+
+    timeline = _api_json([
+        "gh", "api",
+        f"repos/{owner}/{name}/issues/{pr_number}/timeline",
+        "--paginate",
+    ]) or []
+
+    _, checks_json, _ = _run(
+        ["gh", "pr", "checks", str(pr_number),
+         "--json", "bucket,name,state,workflow,link"],
+        root,
+    )
+    try:
+        checks = json.loads(checks_json) if checks_json.strip() else []
+    except json.JSONDecodeError:
+        checks = []
+
+    diff_full = ""
+    if include_diff:
+        _, diff_full, _ = _run(
+            ["gh", "pr", "diff", str(pr_number)], root,
+        )
+
+    sections: list[tuple[str, str]] = [
+        _section("pr_meta", _format_pr_meta(pr)),
+        _section("pr_body", (pr.get("body") or "").rstrip()),
+        _section(
+            "linked_issues",
+            _format_linked_issues(pr.get("closingIssuesReferences") or []),
+        ),
+        _section("commits", _format_commits(pr.get("commits") or [])),
+        _section("diff_summary", _format_diff_summary(pr.get("files") or [])),
+    ]
+    if include_diff:
+        sections.append(_section("diff", diff_full.rstrip()))
+    sections.extend([
+        _section("reviews", _format_reviews(reviews)),
+        _section("issue_comments", _format_issue_comments(issue_comments)),
+        _section("review_comments", _format_review_threads(threads_result)),
+        _section("timeline", _format_timeline(timeline)),
+        _section("checks", _format_checks(checks)),
+    ])
+
+    changed = sorted({
+        f.get("path") or ""
+        for f in (pr.get("files") or [])
+        if f.get("path")
+    })
+    tree = render_ascii_tree(changed, repo_name) if changed else None
+
+    branch_label = f"pr-{pr_number}"
+    return _emit_git_bundle(
+        repo_name, "review", branch_label, sections, tree, copy,
+    )
+
+
 # ---------- main ----------
 
 def _build_subcommand_parser(verb: str) -> argparse.ArgumentParser:
@@ -1387,6 +1752,37 @@ def _build_pr_parser() -> argparse.ArgumentParser:
     return sub
 
 
+def _build_review_parser() -> argparse.ArgumentParser:
+    sub = argparse.ArgumentParser(
+        prog="nomnom review",
+        description=(
+            "Bundle gh context for an existing PR (title, body, comments, "
+            "reviews, inline review threads, checks) into a .txt for an LLM "
+            "to reason about the review."
+        ),
+    )
+    sub.add_argument(
+        "pr_number", type=int,
+        help="PR number to fetch (resolves against the current repo's gh remote).",
+    )
+    sub.add_argument(
+        "repo", nargs="?", default=".",
+        help="Path to the project repo (default: current directory).",
+    )
+    sub.add_argument(
+        "--copy", action="store_true",
+        help="Copy output to the system clipboard instead of writing a file.",
+    )
+    sub.add_argument(
+        "--diff", action="store_true",
+        help=(
+            "Include the full diff (off by default; inline review comments "
+            "carry their own diff hunks)."
+        ),
+    )
+    return sub
+
+
 def _dispatch_subcommand(argv: list[str]) -> int:
     # Mixing argparse subparsers with the optional `repo` positional confuses
     # argparse's positional matcher, so we sniff the verb and dispatch by hand.
@@ -1400,11 +1796,14 @@ def _dispatch_subcommand(argv: list[str]) -> int:
     if verb == "pr":
         args = _build_pr_parser().parse_args(argv[1:])
         return cmd_pr(args.repo, args.copy, args.base)
+    if verb == "review":
+        args = _build_review_parser().parse_args(argv[1:])
+        return cmd_review(args.repo, args.pr_number, args.copy, args.diff)
     print(f"error: unknown subcommand: {verb}", file=sys.stderr)
     return 2
 
 
-SUBCOMMANDS = ("register", "unregister", "commit", "pr")
+SUBCOMMANDS = ("register", "unregister", "commit", "pr", "review")
 
 
 def main() -> int:
@@ -1415,8 +1814,8 @@ def main() -> int:
         description="nomnom: feed your repo to the LLM, one .txt snack at a time.",
         epilog=(
             "subcommands: register / unregister edit the auto-managed "
-            "extension lists; commit / pr bundle git context for an LLM. "
-            "run `nomnom <subcommand> --help` for details."
+            "extension lists; commit / pr / review bundle git context for "
+            "an LLM. run `nomnom <subcommand> --help` for details."
         ),
     )
     parser.add_argument(

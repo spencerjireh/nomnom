@@ -1098,6 +1098,478 @@ class TestPrBundle:
         assert ("x" * 501) not in text
 
 
+# ---------- cmd_review ----------
+
+def _review_stub(payloads: dict, original_run, diff_called: list | None = None):
+    """Stub for nomnom._run that routes review-mode gh calls.
+
+    `payloads` keys (each value is `(rc, stdout, stderr)`):
+      "repo_view", "pr_view", "comments", "reviews", "graphql",
+      "timeline", "checks", "diff" (optional).
+    Anything else falls through to the captured original `_run`.
+    """
+    def stub(cmd, cwd):
+        t = tuple(cmd)
+        if t[:3] == ("gh", "repo", "view"):
+            return payloads["repo_view"]
+        if t[:3] == ("gh", "pr", "view"):
+            return payloads["pr_view"]
+        if t[:3] == ("gh", "pr", "checks"):
+            return payloads.get("checks", (0, "[]", ""))
+        if t[:3] == ("gh", "pr", "diff"):
+            if diff_called is not None:
+                diff_called.append(list(cmd))
+            return payloads.get("diff", (0, "", ""))
+        if t[:3] == ("gh", "api", "graphql"):
+            return payloads.get("graphql", (0, "{}", ""))
+        if len(t) >= 3 and t[0] == "gh" and t[1] == "api":
+            url = t[2]
+            if url.endswith("/comments"):
+                return payloads.get("comments", (0, "[]", ""))
+            if url.endswith("/reviews"):
+                return payloads.get("reviews", (0, "[]", ""))
+            if url.endswith("/timeline"):
+                return payloads.get("timeline", (0, "[]", ""))
+        return original_run(cmd, cwd)
+    return stub
+
+
+def _minimal_pr_payload(number: int = 1) -> str:
+    return json.dumps({
+        "number": number, "url": f"https://github.com/owner/name/pull/{number}",
+        "title": "t", "body": "",
+        "author": {"login": "a"}, "state": "OPEN",
+        "headRefName": "f", "baseRefName": "main",
+        "labels": [], "milestone": None, "isDraft": False,
+        "createdAt": "2026-01-01T00:00:00Z",
+        "updatedAt": "2026-01-01T00:00:00Z",
+        "commits": [], "files": [], "closingIssuesReferences": [],
+    })
+
+
+class TestReviewBundle:
+    def test_missing_gh_errors(self, tmp_path, monkeypatch, capsys):
+        repo = tmp_path / "p"
+        make_git_repo(repo, initial={"a.txt": "1\n"})
+        monkeypatch.setattr(
+            nomnom.shutil, "which",
+            lambda name: None if name == "gh" else "/bin/git",
+        )
+        monkeypatch.chdir(tmp_path)
+        with pytest.raises(SystemExit) as exc:
+            nomnom.cmd_review(
+                str(repo), pr_number=1, copy=False, include_diff=False,
+            )
+        assert exc.value.code == 1
+        assert "requires gh" in capsys.readouterr().err
+
+    def test_invalid_pr_number_errors(self, tmp_path, monkeypatch, capsys):
+        repo = tmp_path / "p"
+        make_git_repo(repo, initial={"a.txt": "1\n"})
+        monkeypatch.setattr(nomnom.shutil, "which",
+                            lambda name: f"/usr/bin/{name}")
+        monkeypatch.chdir(tmp_path)
+        rc = nomnom.cmd_review(
+            str(repo), pr_number=0, copy=False, include_diff=False,
+        )
+        assert rc == 1
+        assert "must be positive" in capsys.readouterr().err
+
+    def test_pr_not_found_surfaces_gh_stderr(
+        self, tmp_path, monkeypatch, capsys,
+    ):
+        repo = tmp_path / "p"
+        make_git_repo(repo, initial={"a.txt": "1\n"})
+        monkeypatch.setattr(nomnom.shutil, "which",
+                            lambda name: f"/usr/bin/{name}")
+        original_run = nomnom._run
+        stub = _review_stub(
+            {
+                "repo_view": (0, "owner/name\n", ""),
+                "pr_view": (1, "", "no pull request with this number"),
+            },
+            original_run,
+        )
+        monkeypatch.setattr(nomnom, "_run", stub)
+        monkeypatch.chdir(tmp_path)
+        rc = nomnom.cmd_review(
+            str(repo), pr_number=42, copy=False, include_diff=False,
+        )
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "no pull request" in err
+        assert "#42" in err
+
+    def test_repo_view_failure_surfaces_error(
+        self, tmp_path, monkeypatch, capsys,
+    ):
+        repo = tmp_path / "p"
+        make_git_repo(repo, initial={"a.txt": "1\n"})
+        monkeypatch.setattr(nomnom.shutil, "which",
+                            lambda name: f"/usr/bin/{name}")
+        original_run = nomnom._run
+        stub = _review_stub(
+            {
+                "repo_view": (1, "", "no remote configured"),
+                "pr_view": (0, "{}", ""),
+            },
+            original_run,
+        )
+        monkeypatch.setattr(nomnom, "_run", stub)
+        monkeypatch.chdir(tmp_path)
+        rc = nomnom.cmd_review(
+            str(repo), pr_number=1, copy=False, include_diff=False,
+        )
+        assert rc == 1
+        assert "no remote configured" in capsys.readouterr().err
+
+    def test_happy_path_minimal_pr(self, tmp_path, monkeypatch):
+        repo = tmp_path / "p"
+        make_git_repo(repo, initial={"a.txt": "1\n"})
+        monkeypatch.setattr(nomnom.shutil, "which",
+                            lambda name: f"/usr/bin/{name}")
+        original_run = nomnom._run
+        stub = _review_stub(
+            {
+                "repo_view": (0, "owner/name\n", ""),
+                "pr_view": (0, _minimal_pr_payload(7), ""),
+            },
+            original_run,
+        )
+        monkeypatch.setattr(nomnom, "_run", stub)
+
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        monkeypatch.chdir(out_dir)
+        rc = nomnom.cmd_review(
+            str(repo), pr_number=7, copy=False, include_diff=False,
+        )
+        assert rc == 0
+        bundles = list(out_dir.glob("p-pr-7-review-*.txt"))
+        assert len(bundles) == 1
+        text = bundles[0].read_text()
+        for sec in (
+            "pr_meta", "pr_body", "linked_issues", "commits",
+            "diff_summary", "reviews", "issue_comments",
+            "review_comments", "timeline", "checks",
+        ):
+            assert f'<section name="{sec}">' in text
+        # All optional sections fall back to (none).
+        assert '<section name="linked_issues">\n(none)\n\n</section>' in text
+        assert '<section name="diff">' not in text
+        # File tree omitted when there are no changed files.
+        assert "<file_tree>" not in text
+
+    def test_full_pr_renders_all_sections(self, tmp_path, monkeypatch):
+        repo = tmp_path / "p"
+        make_git_repo(repo, initial={"a.txt": "1\n"})
+        monkeypatch.setattr(nomnom.shutil, "which",
+                            lambda name: f"/usr/bin/{name}")
+        pr_payload = json.dumps({
+            "number": 99,
+            "url": "https://github.com/owner/name/pull/99",
+            "title": "Big change", "body": "describe the change",
+            "author": {"login": "alice"}, "state": "OPEN",
+            "headRefName": "feat", "baseRefName": "main",
+            "labels": [{"name": "bug"}, {"name": "ui"}],
+            "milestone": {"title": "v1.0"},
+            "isDraft": False,
+            "createdAt": "2026-01-01T00:00:00Z",
+            "updatedAt": "2026-01-02T00:00:00Z",
+            "commits": [
+                {"oid": "abc1234deadbeef", "messageHeadline": "first commit"},
+                {"oid": "def5678cafebabe", "messageHeadline": "second commit"},
+            ],
+            "files": [
+                {"path": "src/a.py", "additions": 5, "deletions": 1},
+                {"path": "src/b.py", "additions": 3, "deletions": 0},
+            ],
+            "closingIssuesReferences": [
+                {"number": 12, "title": "old bug",
+                 "url": "https://github.com/owner/name/issues/12",
+                 "state": "OPEN"},
+            ],
+        })
+        comments_payload = json.dumps([
+            {"user": {"login": "bob"}, "body": "lgtm",
+             "created_at": "2026-01-01T01:00:00Z"},
+        ])
+        reviews_payload = json.dumps([
+            {"user": {"login": "carol"}, "state": "APPROVED",
+             "submitted_at": "2026-01-01T02:00:00Z", "body": "ship it"},
+        ])
+        threads_payload = json.dumps({
+            "data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": [
+                {
+                    "isResolved": True, "isOutdated": False,
+                    "path": "src/a.py", "line": 42,
+                    "comments": {"nodes": [
+                        {"author": {"login": "carol"},
+                         "body": "rename this",
+                         "createdAt": "2026-01-01T02:30:00Z"},
+                    ]},
+                },
+                {
+                    "isResolved": False, "isOutdated": True,
+                    "path": "src/b.py", "line": 7,
+                    "comments": {"nodes": [
+                        {"author": {"login": "dave"},
+                         "body": "old context",
+                         "createdAt": "2026-01-01T03:00:00Z"},
+                    ]},
+                },
+            ]}}}}
+        })
+        timeline_payload = json.dumps([
+            {"event": "labeled", "actor": {"login": "alice"},
+             "created_at": "2026-01-01T00:30:00Z",
+             "label": {"name": "ui"}},
+            {"event": "review_requested", "actor": {"login": "alice"},
+             "created_at": "2026-01-01T01:30:00Z",
+             "requested_reviewer": {"login": "carol"}},
+        ])
+        checks_payload = json.dumps([
+            {"name": "build", "state": "SUCCESS",
+             "workflow": "CI", "link": "https://ci.example/build"},
+        ])
+        original_run = nomnom._run
+        stub = _review_stub(
+            {
+                "repo_view": (0, "owner/name\n", ""),
+                "pr_view": (0, pr_payload, ""),
+                "comments": (0, comments_payload, ""),
+                "reviews": (0, reviews_payload, ""),
+                "graphql": (0, threads_payload, ""),
+                "timeline": (0, timeline_payload, ""),
+                "checks": (0, checks_payload, ""),
+            },
+            original_run,
+        )
+        monkeypatch.setattr(nomnom, "_run", stub)
+
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        monkeypatch.chdir(out_dir)
+        rc = nomnom.cmd_review(
+            str(repo), pr_number=99, copy=False, include_diff=False,
+        )
+        assert rc == 0
+        text = next(out_dir.glob("p-pr-99-review-*.txt")).read_text()
+        # Meta fields
+        assert "Big change" in text
+        assert "@alice" in text
+        assert "bug, ui" in text
+        assert "v1.0" in text
+        # Body
+        assert "describe the change" in text
+        # Linked issues
+        assert "#12" in text and "old bug" in text
+        # Commits (short sha + message)
+        assert "abc1234" in text and "first commit" in text
+        # Diff summary
+        assert "src/a.py" in text and "+5" in text
+        assert "total: 2 files" in text
+        # Reviews
+        assert "@carol" in text and "[APPROVED]" in text and "ship it" in text
+        # Issue comments
+        assert "@bob" in text and "lgtm" in text
+        # Review threads (grouped, tagged)
+        assert "## src/a.py:42" in text
+        assert "[resolved]" in text
+        assert "## src/b.py:7" in text
+        assert "[outdated]" in text
+        # Timeline filtered: review_requested kept, labeled dropped
+        assert "review_requested by @alice" in text
+        assert "requested @carol" in text
+        assert "labeled" not in text
+        # Checks
+        assert "build" in text and "SUCCESS" in text
+        # File tree built from changed files
+        assert "<file_tree>" in text
+        assert "src/" in text
+
+    def test_review_comments_grouped_by_file_then_line(
+        self, tmp_path, monkeypatch,
+    ):
+        repo = tmp_path / "p"
+        make_git_repo(repo, initial={"a.txt": "1\n"})
+        monkeypatch.setattr(nomnom.shutil, "which",
+                            lambda name: f"/usr/bin/{name}")
+        threads_payload = json.dumps({
+            "data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": [
+                {"isResolved": False, "isOutdated": False,
+                 "path": "src/b.py", "line": 5,
+                 "comments": {"nodes": [
+                     {"author": {"login": "x"}, "body": "b5",
+                      "createdAt": "t"}]}},
+                {"isResolved": False, "isOutdated": False,
+                 "path": "src/a.py", "line": 20,
+                 "comments": {"nodes": [
+                     {"author": {"login": "x"}, "body": "a20",
+                      "createdAt": "t"}]}},
+                {"isResolved": False, "isOutdated": False,
+                 "path": "src/a.py", "line": 10,
+                 "comments": {"nodes": [
+                     {"author": {"login": "x"}, "body": "a10",
+                      "createdAt": "t"}]}},
+            ]}}}}
+        })
+        original_run = nomnom._run
+        stub = _review_stub(
+            {
+                "repo_view": (0, "owner/name\n", ""),
+                "pr_view": (0, _minimal_pr_payload(5), ""),
+                "graphql": (0, threads_payload, ""),
+            },
+            original_run,
+        )
+        monkeypatch.setattr(nomnom, "_run", stub)
+
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        monkeypatch.chdir(out_dir)
+        nomnom.cmd_review(
+            str(repo), pr_number=5, copy=False, include_diff=False,
+        )
+        text = next(out_dir.glob("p-pr-5-review-*.txt")).read_text()
+        i_a10 = text.index("## src/a.py:10")
+        i_a20 = text.index("## src/a.py:20")
+        i_b5 = text.index("## src/b.py:5")
+        assert i_a10 < i_a20 < i_b5
+
+    def test_timeline_filters_noise(self, tmp_path, monkeypatch):
+        repo = tmp_path / "p"
+        make_git_repo(repo, initial={"a.txt": "1\n"})
+        monkeypatch.setattr(nomnom.shutil, "which",
+                            lambda name: f"/usr/bin/{name}")
+        timeline_payload = json.dumps([
+            {"event": "labeled", "actor": {"login": "a"},
+             "created_at": "t1"},
+            {"event": "subscribed", "actor": {"login": "a"},
+             "created_at": "t2"},
+            {"event": "mentioned", "actor": {"login": "a"},
+             "created_at": "t3"},
+            {"event": "ready_for_review", "actor": {"login": "a"},
+             "created_at": "t4"},
+            {"event": "head_ref_force_pushed", "actor": {"login": "a"},
+             "created_at": "t5",
+             "before": "abcdef0aaaaaaaa", "after": "1234567bbbbbbbb"},
+        ])
+        original_run = nomnom._run
+        stub = _review_stub(
+            {
+                "repo_view": (0, "owner/name\n", ""),
+                "pr_view": (0, _minimal_pr_payload(8), ""),
+                "timeline": (0, timeline_payload, ""),
+            },
+            original_run,
+        )
+        monkeypatch.setattr(nomnom, "_run", stub)
+
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        monkeypatch.chdir(out_dir)
+        nomnom.cmd_review(
+            str(repo), pr_number=8, copy=False, include_diff=False,
+        )
+        text = next(out_dir.glob("p-pr-8-review-*.txt")).read_text()
+        assert "ready_for_review" in text
+        assert "head_ref_force_pushed" in text
+        assert "abcdef0 -> 1234567" in text
+        assert "labeled" not in text
+        assert "subscribed" not in text
+        assert "mentioned" not in text
+
+    def test_diff_off_by_default(self, tmp_path, monkeypatch):
+        repo = tmp_path / "p"
+        make_git_repo(repo, initial={"a.txt": "1\n"})
+        monkeypatch.setattr(nomnom.shutil, "which",
+                            lambda name: f"/usr/bin/{name}")
+        original_run = nomnom._run
+        diff_called: list = []
+        stub = _review_stub(
+            {
+                "repo_view": (0, "owner/name\n", ""),
+                "pr_view": (0, _minimal_pr_payload(1), ""),
+                "diff": (0, "diff content", ""),
+            },
+            original_run,
+            diff_called=diff_called,
+        )
+        monkeypatch.setattr(nomnom, "_run", stub)
+
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        monkeypatch.chdir(out_dir)
+        nomnom.cmd_review(
+            str(repo), pr_number=1, copy=False, include_diff=False,
+        )
+        assert diff_called == []
+        text = next(out_dir.glob("p-pr-1-review-*.txt")).read_text()
+        assert '<section name="diff">' not in text
+
+    def test_diff_flag_includes_diff(self, tmp_path, monkeypatch):
+        repo = tmp_path / "p"
+        make_git_repo(repo, initial={"a.txt": "1\n"})
+        monkeypatch.setattr(nomnom.shutil, "which",
+                            lambda name: f"/usr/bin/{name}")
+        original_run = nomnom._run
+        diff_called: list = []
+        stub = _review_stub(
+            {
+                "repo_view": (0, "owner/name\n", ""),
+                "pr_view": (0, _minimal_pr_payload(2), ""),
+                "diff": (0, "diff --git a b\n+x\n", ""),
+            },
+            original_run,
+            diff_called=diff_called,
+        )
+        monkeypatch.setattr(nomnom, "_run", stub)
+
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        monkeypatch.chdir(out_dir)
+        nomnom.cmd_review(
+            str(repo), pr_number=2, copy=False, include_diff=True,
+        )
+        assert len(diff_called) == 1
+        text = next(out_dir.glob("p-pr-2-review-*.txt")).read_text()
+        assert '<section name="diff">' in text
+        assert "diff --git" in text
+
+    def test_copy_flag_writes_to_clipboard(self, tmp_path, monkeypatch):
+        repo = tmp_path / "p"
+        make_git_repo(repo, initial={"a.txt": "1\n"})
+        monkeypatch.setattr(nomnom.shutil, "which",
+                            lambda name: f"/usr/bin/{name}")
+        original_run = nomnom._run
+        stub = _review_stub(
+            {
+                "repo_view": (0, "owner/name\n", ""),
+                "pr_view": (0, _minimal_pr_payload(3), ""),
+            },
+            original_run,
+        )
+        monkeypatch.setattr(nomnom, "_run", stub)
+
+        captured: list[str] = []
+        monkeypatch.setattr(
+            nomnom, "copy_to_clipboard",
+            lambda text: (captured.append(text), True)[1],
+        )
+
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        monkeypatch.chdir(out_dir)
+        rc = nomnom.cmd_review(
+            str(repo), pr_number=3, copy=True, include_diff=False,
+        )
+        assert rc == 0
+        assert list(out_dir.glob("p-pr-3-review-*.txt")) == []
+        assert len(captured) == 1
+        assert '<section name="pr_meta">' in captured[0]
+
+
 # ---------- pick_git_output_path ----------
 
 class TestPickGitOutputPath:

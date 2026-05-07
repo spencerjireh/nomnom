@@ -108,18 +108,20 @@ Conflicts are refused: registering `.foo` as text when it's already in BINARY_EX
 
 ## Git workflow helpers
 
-Two extra subcommands dump git/gh context into a `.txt` for an LLM that's drafting a commit message or PR body:
+Three extra subcommands dump git/gh context into a `.txt` for an LLM. `commit` and `pr` help you *draft* a message; `review` helps you *read* an existing PR.
 
 ```sh
 nomnom commit                  # status, diffs, recent commits
 nomnom pr                      # commits since base, full diff, existing PR body
 nomnom pr --base develop       # PR against a non-default base
 nomnom commit --copy           # straight to clipboard
+nomnom review 123              # title, body, comments, reviews, threads, checks
+nomnom review 123 --diff       # also include the full diff
 ```
 
 Each section is wrapped in a `<section name="...">` block (mirroring the file bundle's `<file path="...">` shape) and prefixed with a `<file_tree>` of the changed files.
 
-`commit` errors out if there are no staged or unstaged changes. `pr` requires the [`gh`](https://cli.github.com) CLI; it auto-detects the default base branch via `gh repo view` and looks up an existing PR for the current branch via `gh pr view` (the section is `none` if there isn't one yet). Output filenames look like `<repo>-<branch>-commit-<ts>.txt` and `<repo>-<branch>-pr-<ts>.txt` (detached HEAD substitutes a short SHA for the branch name).
+`commit` errors out if there are no staged or unstaged changes. `pr` and `review` require the [`gh`](https://cli.github.com) CLI. `pr` auto-detects the default base branch via `gh repo view` and looks up an existing PR for the current branch via `gh pr view` (the section is `none` if there isn't one yet). `review` pulls a specific PR by number — meta, body, linked issues, commits, diff summary, reviews, top-level comments, inline review threads (grouped by file then line, tagged `[resolved]` / `[outdated]`), curated timeline events, and CI checks. The full diff is opt-in (`--diff`) since inline review comments already carry their own diff hunks. Output filenames look like `<repo>-<branch>-commit-<ts>.txt`, `<repo>-<branch>-pr-<ts>.txt`, and `<repo>-pr-<n>-review-<ts>.txt` (detached HEAD substitutes a short SHA for the branch name).
 
 ## Environment
 
