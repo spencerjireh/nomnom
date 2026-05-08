@@ -19,6 +19,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -332,6 +333,30 @@ class ScanItem:
     is_dir: bool
 
 
+def _fmt_count(n: int) -> str:
+    """999 / 1.0K / 12K / 1.2M / 12M (decimal, one decimal under 10)."""
+    if n < 1000:
+        return str(n)
+    for unit in ("K", "M", "G", "T"):
+        n_unit = n / 1000
+        if n_unit < 1000 or unit == "T":
+            return f"{n_unit:.1f}{unit}" if n_unit < 10 else f"{n_unit:.0f}{unit}"
+        n = int(n_unit)
+    return str(n)
+
+
+def _fmt_size(n: int) -> str:
+    return _fmt_count(n)
+
+
+def _fmt_loc(n: int) -> str:
+    return _fmt_count(n) + "L"
+
+
+def _fmt_tokens(n: int) -> str:
+    return "~" + _fmt_count(n) + "T"
+
+
 def is_binary(path: Path) -> bool:
     name = path.name
     if name in KNOWN_TEXT_NAMES:
@@ -401,6 +426,29 @@ def scan_repo(
     return items
 
 
+def collect_stats(
+    root: Path, items: list[ScanItem]
+) -> dict[str, tuple[int, int, int] | None]:
+    """One read pass per file. Returns rel -> (bytes, loc, tokens), or None on read error."""
+    out: dict[str, tuple[int, int, int] | None] = {}
+    for it in items:
+        if it.is_dir:
+            continue
+        p = root / it.rel
+        try:
+            size = p.stat().st_size
+            content = p.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            out[it.rel] = None
+            continue
+        loc = content.count("\n")
+        if content and not content.endswith("\n"):
+            loc += 1
+        tokens = len(content) // 4
+        out[it.rel] = (size, loc, tokens)
+    return out
+
+
 # ---------- clipboard ----------
 
 def detect_clipboard_cmd() -> list[str] | None:
@@ -440,9 +488,16 @@ class Node:
     children: list[int] = field(default_factory=list)
     expanded: bool = False
     checked: bool = False
+    size: int = 0
+    loc: int = 0
+    tokens: int = 0
+    read_error: bool = False
 
 
-def build_tree(items: list[ScanItem]) -> list[Node]:
+def build_tree(
+    items: list[ScanItem],
+    stats: dict[str, tuple[int, int, int] | None] | None = None,
+) -> list[Node]:
     nodes: list[Node] = []
     by_rel: dict[str, int] = {}
     for it in items:
@@ -459,21 +514,62 @@ def build_tree(items: list[ScanItem]) -> list[Node]:
         if parent_idx is not None:
             nodes[parent_idx].children.append(idx)
         by_rel[it.rel] = idx
+
+    if stats is not None:
+        for n in nodes:
+            if n.is_dir:
+                continue
+            s = stats.get(n.rel)
+            if s is None:
+                n.read_error = True
+            else:
+                n.size, n.loc, n.tokens = s
+        # Post-order aggregate: children precede parents in nodes (parent_idx
+        # is set only after the parent is appended), so reverse iteration is
+        # safe for summing.
+        for n in reversed(nodes):
+            if n.is_dir:
+                for ci in n.children:
+                    c = nodes[ci]
+                    n.size += c.size
+                    n.loc += c.loc
+                    n.tokens += c.tokens
     return nodes
 
 
-def visible_indices(nodes: list[Node]) -> list[int]:
-    out = []
-    for i, n in enumerate(nodes):
-        cur = n.parent
-        ok = True
-        while cur is not None:
-            if not nodes[cur].expanded:
-                ok = False
-                break
-            cur = nodes[cur].parent
-        if ok:
-            out.append(i)
+def visible_indices(nodes: list[Node], sort_key=None) -> list[int]:
+    """Indices of nodes whose ancestors are all expanded.
+
+    sort_key=None preserves insertion order (alpha, dirs-first within parent).
+    Otherwise it's applied within each parent group, mixing dirs and files."""
+    out: list[int] = []
+    if sort_key is None:
+        for i, n in enumerate(nodes):
+            cur = n.parent
+            ok = True
+            while cur is not None:
+                if not nodes[cur].expanded:
+                    ok = False
+                    break
+                cur = nodes[cur].parent
+            if ok:
+                out.append(i)
+        return out
+    roots = sorted(
+        (i for i, n in enumerate(nodes) if n.parent is None),
+        key=lambda i: sort_key(nodes[i]),
+    )
+
+    def walk(idx: int) -> None:
+        out.append(idx)
+        n = nodes[idx]
+        if not n.expanded:
+            return
+        for ci in sorted(n.children, key=lambda c: sort_key(nodes[c])):
+            walk(ci)
+
+    for r in roots:
+        walk(r)
     return out
 
 
@@ -556,13 +652,21 @@ def pick(nodes: list[Node]) -> set[str] | None:
         viewport = 0
         filter_active = False
         filter_buf = ""
+        sort_mode = "alpha"
+
+        def _sort_key(n: Node):
+            return (-n.size, n.name)
 
         while True:
+            sk = _sort_key if sort_mode == "size" else None
             if filter_buf:
                 q = filter_buf.lower()
-                visible = [i for i, n in enumerate(nodes) if q in n.rel.lower()]
+                matches = [i for i, n in enumerate(nodes) if q in n.rel.lower()]
+                if sk is not None:
+                    matches.sort(key=lambda i: sk(nodes[i]))
+                visible = matches
             else:
-                visible = visible_indices(nodes)
+                visible = visible_indices(nodes, sort_key=sk)
 
             if not visible:
                 stdscr.erase()
@@ -607,17 +711,44 @@ def pick(nodes: list[Node]) -> set[str] | None:
                 label = n.rel if filter_buf else n.name
                 if n.is_dir and not label.endswith("/"):
                     label += "/"
-                line = f"{check} {indent}{glyph}{label}"[: w - 1]
+                prefix = f"{check} {indent}{glyph}{label}"
+                if n.read_error:
+                    stat_variants = ("?  ?  ?", "?  ?", "?")
+                else:
+                    s_size = _fmt_size(n.size)
+                    s_loc = _fmt_loc(n.loc)
+                    s_tok = _fmt_tokens(n.tokens)
+                    stat_variants = (
+                        f"{s_size}  {s_loc}  {s_tok}",
+                        f"{s_size}  {s_loc}",
+                        s_size,
+                    )
+                chosen_suffix = ""
+                gap = 2
+                avail = w - 1
+                for cand in stat_variants:
+                    if len(prefix) + gap + len(cand) <= avail:
+                        chosen_suffix = cand
+                        break
+                if chosen_suffix:
+                    pad_len = avail - len(prefix) - len(chosen_suffix)
+                    main = prefix + " " * pad_len
+                else:
+                    main = prefix[:avail]
                 if n.checked:
                     attr = theme["checked"]
                 elif n.is_dir:
                     attr = theme["dir"]
                 else:
                     attr = theme["file"]
+                suffix_attr = theme["dim"]
                 if vi == cursor_pos:
                     attr |= theme["cursor"]
+                    suffix_attr |= theme["cursor"]
                 try:
-                    stdscr.addstr(row, 0, line, attr)
+                    stdscr.addstr(row, 0, main, attr)
+                    if chosen_suffix:
+                        stdscr.addstr(row, len(main), chosen_suffix, suffix_attr)
                 except curses.error:
                     pass
 
@@ -636,7 +767,7 @@ def pick(nodes: list[Node]) -> set[str] | None:
                     pass
             status = (
                 "space:toggle  ->/<-:expand  /:filter  E/C:expand/collapse all  "
-                "a:toggle-visible  enter:done  q:quit"
+                "a:toggle-visible  s:sort  enter:done  q:quit"
             )
             try:
                 stdscr.addstr(h - 1, 0, status[: w - 1], theme["dim"])
@@ -717,6 +848,8 @@ def pick(nodes: list[Node]) -> set[str] | None:
                 any_unchecked = any(not nodes[v].checked for v in visible)
                 for v in visible:
                     cascade_check(nodes, v, any_unchecked)
+            elif ch == ord("s"):
+                sort_mode = "size" if sort_mode == "alpha" else "alpha"
             elif ch in (10, 13):
                 return
             elif ch in (ord("q"), 3):
@@ -1867,7 +2000,11 @@ def main() -> int:
             selected = sorted(present)
 
     if selected is None:
-        nodes = build_tree(items)
+        print("reading file stats...", file=sys.stderr)
+        t0 = time.monotonic()
+        stats = collect_stats(root, items)
+        print(f"  done ({time.monotonic() - t0:.1f}s).", file=sys.stderr)
+        nodes = build_tree(items, stats=stats)
         result = pick(nodes)
         if result is None:
             print("cancelled.", file=sys.stderr)
@@ -1897,8 +2034,8 @@ def main() -> int:
 
     print()
     print(f"  files:   {len(selected)}")
-    print(f"  size:    {total_bytes:,} bytes")
-    print(f"  ~tokens: {approx_tokens:,} (rough chars/4 estimate)")
+    print(f"  size:    {_fmt_size(total_bytes)}")
+    print(f"  ~tokens: {_fmt_tokens(approx_tokens)} (rough chars/4 estimate)")
     if args.copy:
         clip = detect_clipboard_cmd()
         if clip:
@@ -1908,9 +2045,9 @@ def main() -> int:
     else:
         print(f"  output:  {out_path}")
     if large:
-        print(f"  large:   {len(large)} file(s) over {LARGE_FILE_BYTES:,} bytes:")
+        print(f"  large:   {len(large)} file(s) over {_fmt_size(LARGE_FILE_BYTES)}:")
         for rel, sz in large[:5]:
-            print(f"           - {rel} ({sz:,})")
+            print(f"           - {rel} ({_fmt_size(sz)})")
         if len(large) > 5:
             print(f"           ... and {len(large) - 5} more")
     print()
