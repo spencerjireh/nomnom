@@ -995,6 +995,108 @@ def pick_git_output_path(repo_name: str, branch_label: str, kind: str) -> Path:
         n += 1
 
 
+_REBUILD_FILE_HEADER_RE = re.compile(
+    r"^This is a packed representation of selected files from (.+?), bundled on "
+)
+_REBUILD_GIT_HEADER_RE = re.compile(
+    r"^This is a packed representation of git context for "
+)
+_REBUILD_FILE_OPEN_RE = re.compile(r'^<file path="(.+)">$')
+
+
+def parse_bundle(text: str) -> tuple[str, list[tuple[str, str]]]:
+    """Parse a nomnom file bundle into (repo_name, [(rel_path, content), ...]).
+
+    Raises ValueError on a malformed bundle, a git-context bundle, or any path
+    that would escape the target folder (absolute, leading slash, `..` segment).
+    Known limitation: file contents containing a literal `</file>` line on its
+    own line will end the block early — the bundle format itself has no escape.
+    """
+    if not text.strip():
+        raise ValueError("input is empty")
+    first_line = text.splitlines()[0] if text else ""
+    if _REBUILD_GIT_HEADER_RE.match(first_line):
+        raise ValueError(
+            "git-context bundles are not file bundles; nothing to rebuild"
+        )
+    m = _REBUILD_FILE_HEADER_RE.match(first_line)
+    if not m:
+        raise ValueError("input does not look like a nomnom bundle")
+    repo_name = m.group(1).strip()
+    if not repo_name:
+        raise ValueError("bundle header has an empty repo name")
+
+    files: list[tuple[str, str]] = []
+    lines = text.splitlines()
+    i = 0
+    n = len(lines)
+    in_tree = False
+    while i < n:
+        line = lines[i]
+        if line == "<file_tree>":
+            in_tree = True
+            i += 1
+            continue
+        if line == "</file_tree>":
+            in_tree = False
+            i += 1
+            continue
+        if in_tree:
+            i += 1
+            continue
+        om = _REBUILD_FILE_OPEN_RE.match(line)
+        if not om:
+            i += 1
+            continue
+        rel = om.group(1)
+        _validate_rebuild_path(rel)
+        i += 1
+        body: list[str] = []
+        closed = False
+        while i < n:
+            if lines[i] == "</file>":
+                closed = True
+                i += 1
+                break
+            body.append(lines[i])
+            i += 1
+        if not closed:
+            raise ValueError(f"unterminated <file> block for {rel!r}")
+        # render_output always emits exactly one blank line before </file>,
+        # whether or not the source content ended with a newline — the format
+        # is lossy at that boundary. We default to a trailing newline (the
+        # common source-file convention); files that originally lacked one
+        # will gain one on rebuild.
+        content = "\n".join(body)
+        files.append((rel, content))
+
+    if not files:
+        raise ValueError("bundle contains no <file> blocks")
+    return repo_name, files
+
+
+def _validate_rebuild_path(rel: str) -> None:
+    if not rel:
+        raise ValueError("empty file path in bundle")
+    if rel.startswith("/") or (len(rel) >= 2 and rel[1] == ":"):
+        raise ValueError(f"refusing absolute path in bundle: {rel!r}")
+    parts = rel.replace("\\", "/").split("/")
+    if any(p in ("", "..") for p in parts):
+        raise ValueError(f"refusing unsafe path in bundle: {rel!r}")
+
+
+def pick_target_dir(cwd: Path, name: str) -> Path:
+    base = cwd / name
+    if not base.exists():
+        return base
+    n = 1
+    while True:
+        candidate = cwd / f"{name}-{n}"
+        if not candidate.exists():
+            return candidate
+        n += 1
+
+
 # ---------- git/gh helpers ----------
 
 GIT_BUNDLE_WARN_BYTES = 200_000
@@ -1821,6 +1923,70 @@ def cmd_review(
     )
 
 
+def cmd_rebuild(bundle_path: str | None, name: str | None) -> int:
+    if bundle_path is None:
+        text = sys.stdin.read()
+        source_label = "<stdin>"
+    else:
+        p = Path(bundle_path).expanduser()
+        if not p.is_file():
+            print(f"error: not a file: {p}", file=sys.stderr)
+            return 1
+        try:
+            text = p.read_text(encoding="utf-8", errors="replace")
+        except OSError as e:
+            print(f"error: cannot read {p}: {e}", file=sys.stderr)
+            return 1
+        source_label = str(p)
+
+    try:
+        repo_name, files = parse_bundle(text)
+    except ValueError as e:
+        print(f"error: {e} (from {source_label})", file=sys.stderr)
+        return 1
+
+    folder_name = (name or repo_name).strip()
+    if not folder_name:
+        print("error: empty target folder name", file=sys.stderr)
+        return 1
+    # Sanitize: collapse path separators so --name foo/bar can't escape cwd.
+    if "/" in folder_name or "\\" in folder_name:
+        print(
+            f"error: --name must not contain path separators: {folder_name!r}",
+            file=sys.stderr,
+        )
+        return 1
+
+    cwd = Path.cwd()
+    target = pick_target_dir(cwd, folder_name)
+    target_resolved = target.resolve()
+    target.mkdir(parents=True)
+
+    written = 0
+    for rel, content in files:
+        dest = (target / rel).resolve()
+        # Belt-and-braces: even after _validate_rebuild_path, confirm the
+        # resolved write target is inside the freshly created folder.
+        try:
+            dest.relative_to(target_resolved)
+        except ValueError:
+            print(
+                f"error: refusing to write outside target: {rel!r}",
+                file=sys.stderr,
+            )
+            return 1
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(content, encoding="utf-8")
+        written += 1
+
+    try:
+        rel_target: Path | str = target.relative_to(cwd)
+    except ValueError:
+        rel_target = target
+    print(f"rebuilt {written} files in {rel_target}/", file=sys.stderr)
+    return 0
+
+
 # ---------- main ----------
 
 def _build_subcommand_parser(verb: str) -> argparse.ArgumentParser:
@@ -1916,6 +2082,29 @@ def _build_review_parser() -> argparse.ArgumentParser:
     return sub
 
 
+def _build_rebuild_parser() -> argparse.ArgumentParser:
+    sub = argparse.ArgumentParser(
+        prog="nomnom rebuild",
+        description=(
+            "Reconstruct a file tree from a nomnom bundle (the .txt output of "
+            "the main `nomnom` command). Creates a new folder under the "
+            "current directory; auto-suffixes -1, -2, ... on name collisions."
+        ),
+    )
+    sub.add_argument(
+        "bundle", nargs="?", default=None,
+        help="Path to a bundle .txt (default: read from stdin).",
+    )
+    sub.add_argument(
+        "--name", default=None,
+        help=(
+            "Override the target folder name (default: the repo name from "
+            "the bundle's header)."
+        ),
+    )
+    return sub
+
+
 def _dispatch_subcommand(argv: list[str]) -> int:
     # Mixing argparse subparsers with the optional `repo` positional confuses
     # argparse's positional matcher, so we sniff the verb and dispatch by hand.
@@ -1932,11 +2121,14 @@ def _dispatch_subcommand(argv: list[str]) -> int:
     if verb == "review":
         args = _build_review_parser().parse_args(argv[1:])
         return cmd_review(args.repo, args.pr_number, args.copy, args.diff)
+    if verb == "rebuild":
+        args = _build_rebuild_parser().parse_args(argv[1:])
+        return cmd_rebuild(args.bundle, args.name)
     print(f"error: unknown subcommand: {verb}", file=sys.stderr)
     return 2
 
 
-SUBCOMMANDS = ("register", "unregister", "commit", "pr", "review")
+SUBCOMMANDS = ("register", "unregister", "commit", "pr", "review", "rebuild")
 
 
 def main() -> int:
@@ -1948,7 +2140,8 @@ def main() -> int:
         epilog=(
             "subcommands: register / unregister edit the auto-managed "
             "extension lists; commit / pr / review bundle git context for "
-            "an LLM. run `nomnom <subcommand> --help` for details."
+            "an LLM; rebuild reconstructs a file tree from a bundle .txt. "
+            "run `nomnom <subcommand> --help` for details."
         ),
     )
     parser.add_argument(

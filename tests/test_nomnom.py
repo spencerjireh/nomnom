@@ -1611,3 +1611,224 @@ class TestRenderGitBundle:
         )
         assert "<file_tree>" in out
         assert "</file_tree>" in out
+
+
+# ---------- parse_bundle / pick_target_dir / cmd_rebuild ----------
+
+class TestParseBundle:
+    def test_round_trip_simple(self, tmp_path):
+        make_repo(tmp_path, {
+            "README.md": "# hi\n",
+            "src": {"a.py": "print('a')\n"},
+        })
+        out = nomnom.render_output(
+            "myrepo", tmp_path, ["README.md", "src/a.py"], None,
+        )
+        repo_name, files = nomnom.parse_bundle(out)
+        assert repo_name == "myrepo"
+        as_dict = dict(files)
+        assert as_dict == {
+            "README.md": "# hi\n",
+            "src/a.py": "print('a')\n",
+        }
+
+    def test_round_trip_with_tree(self, tmp_path):
+        make_repo(tmp_path, {"a.py": "x\n"})
+        tree = nomnom.render_ascii_tree(["a.py"], "myrepo")
+        out = nomnom.render_output("myrepo", tmp_path, ["a.py"], tree)
+        repo_name, files = nomnom.parse_bundle(out)
+        assert repo_name == "myrepo"
+        assert files == [("a.py", "x\n")]
+
+    def test_no_trailing_newline_gains_one(self, tmp_path):
+        # render_output's output is lossy at the trailing-newline boundary:
+        # "x" and "x\n" produce identical bundle bytes. parse_bundle defaults
+        # to keeping a trailing newline, so a file written without one will
+        # gain one on rebuild. Documented limitation.
+        (tmp_path / "a.py").write_text("no-newline")
+        out = nomnom.render_output("r", tmp_path, ["a.py"], None)
+        _, files = nomnom.parse_bundle(out)
+        assert files == [("a.py", "no-newline\n")]
+
+    def test_rejects_git_bundle(self):
+        out = nomnom.render_git_bundle(
+            "repo", "commit", "main", [("status", "clean")], tree=None,
+        )
+        with pytest.raises(ValueError, match="git-context"):
+            nomnom.parse_bundle(out)
+
+    def test_rejects_unknown_header(self):
+        with pytest.raises(ValueError, match="does not look like"):
+            nomnom.parse_bundle("just some random text\n")
+
+    def test_rejects_empty(self):
+        with pytest.raises(ValueError, match="empty"):
+            nomnom.parse_bundle("")
+
+    def test_rejects_no_files(self):
+        # Valid preamble but no <file> blocks.
+        text = (
+            "This is a packed representation of selected files from repo, "
+            "bundled on 2026-05-11T12:00:00. Each file is wrapped in "
+            '<file path="..."> tags.\n\n'
+        )
+        with pytest.raises(ValueError, match="no <file> blocks"):
+            nomnom.parse_bundle(text)
+
+    def test_rejects_absolute_path(self):
+        text = (
+            "This is a packed representation of selected files from repo, "
+            "bundled on 2026-05-11T12:00:00. Each file is wrapped in "
+            '<file path="..."> tags.\n\n'
+            '<file path="/etc/passwd">\nx\n</file>\n'
+        )
+        with pytest.raises(ValueError, match="absolute path"):
+            nomnom.parse_bundle(text)
+
+    def test_rejects_parent_traversal(self):
+        text = (
+            "This is a packed representation of selected files from repo, "
+            "bundled on 2026-05-11T12:00:00. Each file is wrapped in "
+            '<file path="..."> tags.\n\n'
+            '<file path="../evil">\nx\n</file>\n'
+        )
+        with pytest.raises(ValueError, match="unsafe path"):
+            nomnom.parse_bundle(text)
+
+    def test_unterminated_file_block(self):
+        text = (
+            "This is a packed representation of selected files from repo, "
+            "bundled on 2026-05-11T12:00:00. Each file is wrapped in "
+            '<file path="..."> tags.\n\n'
+            '<file path="a.py">\nprint(1)\n'
+        )
+        with pytest.raises(ValueError, match="unterminated"):
+            nomnom.parse_bundle(text)
+
+
+class TestPickTargetDir:
+    def test_returns_base_when_free(self, tmp_path):
+        assert nomnom.pick_target_dir(tmp_path, "repo") == tmp_path / "repo"
+
+    def test_suffixes_on_collision(self, tmp_path):
+        (tmp_path / "repo").mkdir()
+        assert nomnom.pick_target_dir(tmp_path, "repo") == tmp_path / "repo-1"
+        (tmp_path / "repo-1").mkdir()
+        assert nomnom.pick_target_dir(tmp_path, "repo") == tmp_path / "repo-2"
+
+
+class TestCmdRebuild:
+    def _bundle(self, tmp_path, layout, repo="myrepo"):
+        for rel, content in layout.items():
+            p = tmp_path / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(content, encoding="utf-8")
+        return nomnom.render_output(repo, tmp_path, list(layout), None)
+
+    def test_writes_files_under_named_folder(self, tmp_path, monkeypatch, capsys):
+        src = tmp_path / "src"
+        src.mkdir()
+        bundle = self._bundle(src, {
+            "README.md": "# hi\n",
+            "pkg/a.py": "print('a')\n",
+        })
+        bundle_file = tmp_path / "bundle.txt"
+        bundle_file.write_text(bundle, encoding="utf-8")
+
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        monkeypatch.chdir(out_dir)
+
+        rc = nomnom.cmd_rebuild(str(bundle_file), None)
+        assert rc == 0
+        assert (out_dir / "myrepo" / "README.md").read_text() == "# hi\n"
+        assert (out_dir / "myrepo" / "pkg" / "a.py").read_text() == "print('a')\n"
+        err = capsys.readouterr().err
+        assert "rebuilt 2 files in myrepo/" in err
+
+    def test_name_override(self, tmp_path, monkeypatch):
+        src = tmp_path / "src"
+        src.mkdir()
+        bundle = self._bundle(src, {"a.py": "x\n"})
+        bundle_file = tmp_path / "bundle.txt"
+        bundle_file.write_text(bundle, encoding="utf-8")
+
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        monkeypatch.chdir(out_dir)
+
+        rc = nomnom.cmd_rebuild(str(bundle_file), "custom")
+        assert rc == 0
+        assert (out_dir / "custom" / "a.py").read_text() == "x\n"
+        assert not (out_dir / "myrepo").exists()
+
+    def test_conflict_suffixes(self, tmp_path, monkeypatch):
+        src = tmp_path / "src"
+        src.mkdir()
+        bundle = self._bundle(src, {"a.py": "x\n"})
+        bundle_file = tmp_path / "bundle.txt"
+        bundle_file.write_text(bundle, encoding="utf-8")
+
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        (out_dir / "myrepo").mkdir()  # pre-existing collision
+        monkeypatch.chdir(out_dir)
+
+        rc = nomnom.cmd_rebuild(str(bundle_file), None)
+        assert rc == 0
+        assert (out_dir / "myrepo-1" / "a.py").read_text() == "x\n"
+        # Original folder untouched.
+        assert list((out_dir / "myrepo").iterdir()) == []
+
+    def test_stdin_fallback(self, tmp_path, monkeypatch):
+        src = tmp_path / "src"
+        src.mkdir()
+        bundle = self._bundle(src, {"a.py": "x\n"})
+
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        monkeypatch.chdir(out_dir)
+
+        import io
+        monkeypatch.setattr("sys.stdin", io.StringIO(bundle))
+        rc = nomnom.cmd_rebuild(None, None)
+        assert rc == 0
+        assert (out_dir / "myrepo" / "a.py").read_text() == "x\n"
+
+    def test_rejects_git_bundle(self, tmp_path, monkeypatch, capsys):
+        git_out = nomnom.render_git_bundle(
+            "repo", "commit", "main", [("status", "clean")], tree=None,
+        )
+        bundle_file = tmp_path / "git.txt"
+        bundle_file.write_text(git_out, encoding="utf-8")
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        monkeypatch.chdir(out_dir)
+
+        rc = nomnom.cmd_rebuild(str(bundle_file), None)
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "git-context" in err
+        # Nothing should have been created.
+        assert list(out_dir.iterdir()) == []
+
+    def test_missing_file_arg(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.chdir(tmp_path)
+        rc = nomnom.cmd_rebuild(str(tmp_path / "nope.txt"), None)
+        assert rc == 1
+        assert "not a file" in capsys.readouterr().err
+
+    def test_name_with_separator_rejected(self, tmp_path, monkeypatch, capsys):
+        src = tmp_path / "src"
+        src.mkdir()
+        bundle = self._bundle(src, {"a.py": "x\n"})
+        bundle_file = tmp_path / "bundle.txt"
+        bundle_file.write_text(bundle, encoding="utf-8")
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        monkeypatch.chdir(out_dir)
+
+        rc = nomnom.cmd_rebuild(str(bundle_file), "foo/bar")
+        assert rc == 1
+        assert "path separator" in capsys.readouterr().err
+        assert list(out_dir.iterdir()) == []
