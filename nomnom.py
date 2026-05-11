@@ -1987,6 +1987,242 @@ def cmd_rebuild(bundle_path: str | None, name: str | None) -> int:
     return 0
 
 
+# ---------- encryption ----------
+#
+# Self-contained passphrase-based encryption for nomnom bundle .txt files
+# (or any file). Stdlib-only by design: scrypt for key derivation, an
+# HMAC-SHA256 keystream for the stream cipher (HMAC-SHA256 is a PRF under
+# its key, so HMAC(key, nonce || counter) is a sound stream construction),
+# and encrypt-then-HMAC for authentication. Wrong-passphrase / tamper /
+# truncation all surface as a single `ValueError("authentication failed")`
+# raised before any output file is written.
+
+_NMNM_MAGIC = b"NMNM\x01"  # 4-byte tag + 1-byte format version
+_NMNM_SALT_LEN = 16
+_NMNM_NONCE_LEN = 12
+_NMNM_MAC_LEN = 32
+_NMNM_HEADER_LEN = len(_NMNM_MAGIC) + _NMNM_SALT_LEN + _NMNM_NONCE_LEN + _NMNM_MAC_LEN
+
+# scrypt parameters: ~100ms on a modern laptop; fine for interactive use.
+_NMNM_SCRYPT_N = 2 ** 16
+_NMNM_SCRYPT_R = 8
+_NMNM_SCRYPT_P = 1
+_NMNM_KEY_LEN = 64  # 32 bytes enc_key + 32 bytes mac_key
+
+_NMNM_TS_RE = re.compile(r"\d{8}-\d{6}")
+
+
+def _extract_timestamp(name: str) -> str | None:
+    m = _NMNM_TS_RE.search(name)
+    return m.group(0) if m else None
+
+
+def _derive_keys(passphrase: str, salt: bytes) -> tuple[bytes, bytes]:
+    dk = hashlib.scrypt(
+        passphrase.encode("utf-8"),
+        salt=salt,
+        n=_NMNM_SCRYPT_N,
+        r=_NMNM_SCRYPT_R,
+        p=_NMNM_SCRYPT_P,
+        maxmem=128 * 1024 * 1024,
+        dklen=_NMNM_KEY_LEN,
+    )
+    return dk[:32], dk[32:]
+
+
+def _stream_xor(enc_key: bytes, nonce: bytes, data: bytes) -> bytes:
+    import hmac
+    out = bytearray(len(data))
+    block_size = 32  # HMAC-SHA256 output
+    counter = 0
+    for off in range(0, len(data), block_size):
+        ks = hmac.new(
+            enc_key,
+            nonce + counter.to_bytes(4, "big"),
+            hashlib.sha256,
+        ).digest()
+        chunk = data[off:off + block_size]
+        for i, b in enumerate(chunk):
+            out[off + i] = b ^ ks[i]
+        counter += 1
+    return bytes(out)
+
+
+def _pack_payload(name: str, body: bytes) -> bytes:
+    header = json.dumps({"name": name, "v": 1}, ensure_ascii=False).encode("utf-8")
+    if len(header) > 0xFFFF:
+        raise ValueError("payload header too large")
+    return len(header).to_bytes(2, "big") + header + body
+
+
+def _unpack_payload(payload: bytes) -> tuple[str, bytes]:
+    if len(payload) < 2:
+        raise ValueError("payload truncated")
+    header_len = int.from_bytes(payload[:2], "big")
+    if len(payload) < 2 + header_len:
+        raise ValueError("payload truncated")
+    try:
+        header = json.loads(payload[2:2 + header_len].decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as e:
+        raise ValueError(f"payload header is not valid JSON: {e}") from e
+    name = header.get("name")
+    if not isinstance(name, str) or not name:
+        raise ValueError("payload header missing 'name'")
+    # Defense in depth: the embedded name is supposed to be a basename.
+    if "/" in name or "\\" in name or name in (".", ".."):
+        raise ValueError(f"refusing unsafe name in payload: {name!r}")
+    return name, payload[2 + header_len:]
+
+
+def encrypt_bytes(
+    data: bytes,
+    name: str,
+    passphrase: str,
+    *,
+    _salt: bytes | None = None,
+    _nonce: bytes | None = None,
+) -> bytes:
+    """Encrypt `data` under `passphrase`, embedding `name` in the payload.
+
+    `_salt` and `_nonce` are test hooks; production callers leave them None
+    so they're freshly random per call.
+    """
+    import hmac
+    import secrets as _secrets
+    if not passphrase:
+        raise ValueError("passphrase must not be empty")
+    salt = _salt if _salt is not None else _secrets.token_bytes(_NMNM_SALT_LEN)
+    nonce = _nonce if _nonce is not None else _secrets.token_bytes(_NMNM_NONCE_LEN)
+    enc_key, mac_key = _derive_keys(passphrase, salt)
+    payload = _pack_payload(name, data)
+    ciphertext = _stream_xor(enc_key, nonce, payload)
+    mac_input = _NMNM_MAGIC + salt + nonce + ciphertext
+    mac = hmac.new(mac_key, mac_input, hashlib.sha256).digest()
+    return _NMNM_MAGIC + salt + nonce + mac + ciphertext
+
+
+def decrypt_bytes(blob: bytes, passphrase: str) -> tuple[str, bytes]:
+    """Verify and decrypt `blob` produced by `encrypt_bytes`.
+
+    Returns (original_name, original_bytes). Raises ValueError on any
+    structural problem, wrong passphrase, or tampering.
+    """
+    import hmac
+    if len(blob) < _NMNM_HEADER_LEN:
+        raise ValueError("ciphertext too short")
+    if blob[:len(_NMNM_MAGIC)] != _NMNM_MAGIC:
+        raise ValueError("not a nomnom-encrypted file (bad magic)")
+    off = len(_NMNM_MAGIC)
+    salt = blob[off:off + _NMNM_SALT_LEN]; off += _NMNM_SALT_LEN
+    nonce = blob[off:off + _NMNM_NONCE_LEN]; off += _NMNM_NONCE_LEN
+    mac = blob[off:off + _NMNM_MAC_LEN]; off += _NMNM_MAC_LEN
+    ciphertext = blob[off:]
+    enc_key, mac_key = _derive_keys(passphrase, salt)
+    expected = hmac.new(
+        mac_key, _NMNM_MAGIC + salt + nonce + ciphertext, hashlib.sha256,
+    ).digest()
+    if not hmac.compare_digest(expected, mac):
+        raise ValueError("authentication failed")
+    payload = _stream_xor(enc_key, nonce, ciphertext)
+    name, body = _unpack_payload(payload)
+    return name, body
+
+
+def _read_passphrase(confirm: bool) -> str:
+    env = os.environ.get("NOMNOM_PASSPHRASE")
+    if env is not None:
+        if not env:
+            raise ValueError("NOMNOM_PASSPHRASE is set but empty")
+        return env
+    if not sys.stdin.isatty():
+        raise ValueError(
+            "no passphrase: set NOMNOM_PASSPHRASE or run interactively"
+        )
+    import getpass
+    p1 = getpass.getpass("passphrase: ")
+    if not p1:
+        raise ValueError("empty passphrase")
+    if confirm:
+        p2 = getpass.getpass("confirm passphrase: ")
+        if p1 != p2:
+            raise ValueError("passphrases do not match")
+    return p1
+
+
+def _pick_encrypted_path(parent: Path, ts: str | None) -> Path:
+    import secrets as _secrets
+    while True:
+        hex8 = _secrets.token_hex(4)
+        stem = f"{hex8}-{ts}" if ts else hex8
+        candidate = parent / f"{stem}.nomnom-enc"
+        if not candidate.exists():
+            return candidate
+        # token_hex collisions are astronomically unlikely; loop just in case.
+
+
+def _pick_decrypted_path(parent: Path, name: str) -> Path:
+    base = parent / name
+    if not base.exists():
+        return base
+    stem = base.stem
+    suffix = base.suffix
+    n = 1
+    while True:
+        candidate = parent / f"{stem}-{n}{suffix}"
+        if not candidate.exists():
+            return candidate
+        n += 1
+
+
+def cmd_encrypt(path: str) -> int:
+    p = Path(path).expanduser()
+    if not p.is_file():
+        print(f"error: not a file: {p}", file=sys.stderr)
+        return 1
+    try:
+        data = p.read_bytes()
+    except OSError as e:
+        print(f"error: cannot read {p}: {e}", file=sys.stderr)
+        return 1
+    try:
+        passphrase = _read_passphrase(confirm=True)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    blob = encrypt_bytes(data, p.name, passphrase)
+    ts = _extract_timestamp(p.name)
+    out = _pick_encrypted_path(p.parent, ts)
+    out.write_bytes(blob)
+    print(f"encrypted {p.name} -> {out.name}", file=sys.stderr)
+    return 0
+
+
+def cmd_decrypt(path: str) -> int:
+    p = Path(path).expanduser()
+    if not p.is_file():
+        print(f"error: not a file: {p}", file=sys.stderr)
+        return 1
+    try:
+        blob = p.read_bytes()
+    except OSError as e:
+        print(f"error: cannot read {p}: {e}", file=sys.stderr)
+        return 1
+    try:
+        passphrase = _read_passphrase(confirm=False)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    try:
+        name, data = decrypt_bytes(blob, passphrase)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    out = _pick_decrypted_path(p.parent, name)
+    out.write_bytes(data)
+    print(f"decrypted {p.name} -> {out.name}", file=sys.stderr)
+    return 0
+
+
 # ---------- main ----------
 
 def _build_subcommand_parser(verb: str) -> argparse.ArgumentParser:
@@ -2105,6 +2341,35 @@ def _build_rebuild_parser() -> argparse.ArgumentParser:
     return sub
 
 
+def _build_encrypt_parser() -> argparse.ArgumentParser:
+    sub = argparse.ArgumentParser(
+        prog="nomnom encrypt",
+        description=(
+            "Encrypt a file (typically a nomnom bundle .txt) under a "
+            "passphrase. The encrypted filename omits the original name but "
+            "keeps the timestamp segment when present (e.g. "
+            "`<hex>-20260511-120000.nomnom-enc`). Passphrase comes from the "
+            "NOMNOM_PASSPHRASE env var, or an interactive getpass prompt."
+        ),
+    )
+    sub.add_argument("file", help="Path to the file to encrypt.")
+    return sub
+
+
+def _build_decrypt_parser() -> argparse.ArgumentParser:
+    sub = argparse.ArgumentParser(
+        prog="nomnom decrypt",
+        description=(
+            "Decrypt a `.nomnom-enc` file produced by `nomnom encrypt`. "
+            "Restores the original filename next to the encrypted file. "
+            "Wrong passphrase or any tampering is rejected with a clear "
+            "error before anything is written."
+        ),
+    )
+    sub.add_argument("file", help="Path to the .nomnom-enc file to decrypt.")
+    return sub
+
+
 def _dispatch_subcommand(argv: list[str]) -> int:
     # Mixing argparse subparsers with the optional `repo` positional confuses
     # argparse's positional matcher, so we sniff the verb and dispatch by hand.
@@ -2124,11 +2389,20 @@ def _dispatch_subcommand(argv: list[str]) -> int:
     if verb == "rebuild":
         args = _build_rebuild_parser().parse_args(argv[1:])
         return cmd_rebuild(args.bundle, args.name)
+    if verb == "encrypt":
+        args = _build_encrypt_parser().parse_args(argv[1:])
+        return cmd_encrypt(args.file)
+    if verb == "decrypt":
+        args = _build_decrypt_parser().parse_args(argv[1:])
+        return cmd_decrypt(args.file)
     print(f"error: unknown subcommand: {verb}", file=sys.stderr)
     return 2
 
 
-SUBCOMMANDS = ("register", "unregister", "commit", "pr", "review", "rebuild")
+SUBCOMMANDS = (
+    "register", "unregister", "commit", "pr", "review", "rebuild",
+    "encrypt", "decrypt",
+)
 
 
 def main() -> int:
@@ -2140,7 +2414,8 @@ def main() -> int:
         epilog=(
             "subcommands: register / unregister edit the auto-managed "
             "extension lists; commit / pr / review bundle git context for "
-            "an LLM; rebuild reconstructs a file tree from a bundle .txt. "
+            "an LLM; rebuild reconstructs a file tree from a bundle .txt; "
+            "encrypt / decrypt lock a file under a passphrase. "
             "run `nomnom <subcommand> --help` for details."
         ),
     )

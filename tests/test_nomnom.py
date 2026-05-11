@@ -1832,3 +1832,231 @@ class TestCmdRebuild:
         assert rc == 1
         assert "path separator" in capsys.readouterr().err
         assert list(out_dir.iterdir()) == []
+
+
+# ---------- encryption ----------
+
+class TestExtractTimestamp:
+    @pytest.mark.parametrize("name,expected", [
+        ("myrepo-20260511-120000.txt", "20260511-120000"),
+        ("myrepo-main-commit-20260511-120000.txt", "20260511-120000"),
+        ("README.md", None),
+        ("notes-2026-05-11.txt", None),  # not the nomnom format
+        ("20260511-120000-extra-20270101-010101.txt", "20260511-120000"),
+    ])
+    def test_extraction(self, name, expected):
+        assert nomnom._extract_timestamp(name) == expected
+
+
+class TestPayloadPackUnpack:
+    def test_round_trip_text(self):
+        blob = nomnom._pack_payload("hi.txt", b"hello\n")
+        name, body = nomnom._unpack_payload(blob)
+        assert name == "hi.txt"
+        assert body == b"hello\n"
+
+    def test_round_trip_binary(self):
+        body = bytes(range(256))
+        blob = nomnom._pack_payload("weird.bin", body)
+        n, b = nomnom._unpack_payload(blob)
+        assert n == "weird.bin"
+        assert b == body
+
+    def test_truncated_payload_rejected(self):
+        with pytest.raises(ValueError, match="truncated"):
+            nomnom._unpack_payload(b"\x00")
+        # Claims 1000-byte header but supplies none.
+        with pytest.raises(ValueError, match="truncated"):
+            nomnom._unpack_payload((1000).to_bytes(2, "big") + b"")
+
+    def test_unsafe_name_rejected(self):
+        bad = nomnom._pack_payload("../evil", b"x")
+        with pytest.raises(ValueError, match="unsafe name"):
+            nomnom._unpack_payload(bad)
+
+    def test_missing_name_rejected(self):
+        # Hand-craft a header without a "name" field.
+        import json as _json
+        header = _json.dumps({"v": 1}).encode()
+        blob = len(header).to_bytes(2, "big") + header + b"body"
+        with pytest.raises(ValueError, match="missing 'name'"):
+            nomnom._unpack_payload(blob)
+
+
+class TestEncryptBytes:
+    def test_round_trip_random(self):
+        data = bytes(range(256)) * 5
+        blob = nomnom.encrypt_bytes(data, "thing.bin", "pw")
+        name, body = nomnom.decrypt_bytes(blob, "pw")
+        assert name == "thing.bin"
+        assert body == data
+
+    def test_empty_body(self):
+        blob = nomnom.encrypt_bytes(b"", "empty.txt", "pw")
+        assert nomnom.decrypt_bytes(blob, "pw") == ("empty.txt", b"")
+
+    def test_two_encrypts_differ(self):
+        # Fresh salt + nonce per call means two encrypts of the same input
+        # must produce different ciphertexts.
+        a = nomnom.encrypt_bytes(b"same", "n", "pw")
+        b = nomnom.encrypt_bytes(b"same", "n", "pw")
+        assert a != b
+
+    def test_deterministic_with_pinned_salt_and_nonce(self):
+        a = nomnom.encrypt_bytes(
+            b"same", "n", "pw",
+            _salt=b"\x00" * 16, _nonce=b"\x01" * 12,
+        )
+        b = nomnom.encrypt_bytes(
+            b"same", "n", "pw",
+            _salt=b"\x00" * 16, _nonce=b"\x01" * 12,
+        )
+        assert a == b
+
+    def test_wrong_passphrase_fails_auth(self):
+        blob = nomnom.encrypt_bytes(b"secret", "f.txt", "right")
+        with pytest.raises(ValueError, match="authentication failed"):
+            nomnom.decrypt_bytes(blob, "wrong")
+
+    def test_tampered_ciphertext_fails_auth(self):
+        blob = bytearray(nomnom.encrypt_bytes(b"secret bytes", "f.txt", "pw"))
+        # Flip a bit deep in the ciphertext region (well past the 65-byte header).
+        blob[100] ^= 0x01
+        with pytest.raises(ValueError, match="authentication failed"):
+            nomnom.decrypt_bytes(bytes(blob), "pw")
+
+    def test_tampered_mac_fails_auth(self):
+        blob = bytearray(nomnom.encrypt_bytes(b"secret", "f.txt", "pw"))
+        # MAC sits at offset 33..65.
+        blob[40] ^= 0x80
+        with pytest.raises(ValueError, match="authentication failed"):
+            nomnom.decrypt_bytes(bytes(blob), "pw")
+
+    def test_truncated_blob_rejected(self):
+        blob = nomnom.encrypt_bytes(b"x", "f.txt", "pw")
+        with pytest.raises(ValueError, match="too short"):
+            nomnom.decrypt_bytes(blob[:30], "pw")
+
+    def test_wrong_magic_rejected(self):
+        blob = nomnom.encrypt_bytes(b"x", "f.txt", "pw")
+        bad = b"WRONG" + blob[5:]
+        with pytest.raises(ValueError, match="bad magic"):
+            nomnom.decrypt_bytes(bad, "pw")
+
+    def test_empty_passphrase_rejected(self):
+        with pytest.raises(ValueError, match="passphrase"):
+            nomnom.encrypt_bytes(b"x", "f.txt", "")
+
+
+class TestPickEncryptedPath:
+    def test_with_timestamp(self, tmp_path):
+        p = nomnom._pick_encrypted_path(tmp_path, "20260511-120000")
+        assert p.parent == tmp_path
+        assert p.suffix == ".nomnom-enc"
+        assert p.stem.endswith("-20260511-120000")
+        # 8 hex chars + dash + 15-char timestamp
+        assert len(p.stem) == 8 + 1 + 15
+
+    def test_without_timestamp(self, tmp_path):
+        p = nomnom._pick_encrypted_path(tmp_path, None)
+        assert p.parent == tmp_path
+        assert p.suffix == ".nomnom-enc"
+        assert len(p.stem) == 8
+
+
+class TestPickDecryptedPath:
+    def test_returns_base_when_free(self, tmp_path):
+        assert nomnom._pick_decrypted_path(tmp_path, "a.txt") == tmp_path / "a.txt"
+
+    def test_suffixes_on_collision(self, tmp_path):
+        (tmp_path / "a.txt").write_text("x")
+        assert nomnom._pick_decrypted_path(tmp_path, "a.txt") == tmp_path / "a-1.txt"
+        (tmp_path / "a-1.txt").write_text("y")
+        assert nomnom._pick_decrypted_path(tmp_path, "a.txt") == tmp_path / "a-2.txt"
+
+
+class TestCmdEncryptDecrypt:
+    @pytest.fixture(autouse=True)
+    def _pass(self, monkeypatch):
+        monkeypatch.setenv("NOMNOM_PASSPHRASE", "test-pass")
+
+    def test_round_trip_with_timestamp(self, tmp_path, capsys):
+        src = tmp_path / "myrepo-20260511-120000.txt"
+        src.write_text("secret bundle contents\n")
+        rc = nomnom.cmd_encrypt(str(src))
+        assert rc == 0
+        enc_files = list(tmp_path.glob("*.nomnom-enc"))
+        assert len(enc_files) == 1
+        enc = enc_files[0]
+        import re as _re
+        assert _re.fullmatch(r"[0-9a-f]{8}-20260511-120000\.nomnom-enc", enc.name)
+
+        # Remove the plaintext so decrypt has to recreate it.
+        src.unlink()
+        rc = nomnom.cmd_decrypt(str(enc))
+        assert rc == 0
+        restored = tmp_path / "myrepo-20260511-120000.txt"
+        assert restored.read_text() == "secret bundle contents\n"
+
+    def test_round_trip_without_timestamp(self, tmp_path):
+        src = tmp_path / "README.md"
+        src.write_text("# hi\n")
+        rc = nomnom.cmd_encrypt(str(src))
+        assert rc == 0
+        enc_files = list(tmp_path.glob("*.nomnom-enc"))
+        assert len(enc_files) == 1
+        import re as _re
+        assert _re.fullmatch(r"[0-9a-f]{8}\.nomnom-enc", enc_files[0].name)
+
+        src.unlink()
+        rc = nomnom.cmd_decrypt(str(enc_files[0]))
+        assert rc == 0
+        assert (tmp_path / "README.md").read_text() == "# hi\n"
+
+    def test_decrypted_name_collision_suffix(self, tmp_path):
+        src = tmp_path / "notes.txt"
+        src.write_text("original\n")
+        assert nomnom.cmd_encrypt(str(src)) == 0
+        enc = next(tmp_path.glob("*.nomnom-enc"))
+        # Don't delete src — force a collision on decrypt.
+        assert nomnom.cmd_decrypt(str(enc)) == 0
+        assert (tmp_path / "notes.txt").read_text() == "original\n"
+        assert (tmp_path / "notes-1.txt").read_text() == "original\n"
+
+    def test_wrong_passphrase_no_output(self, tmp_path, capsys, monkeypatch):
+        src = tmp_path / "f.txt"
+        src.write_text("secret\n")
+        assert nomnom.cmd_encrypt(str(src)) == 0
+        enc = next(tmp_path.glob("*.nomnom-enc"))
+        src.unlink()
+
+        monkeypatch.setenv("NOMNOM_PASSPHRASE", "wrong-pass")
+        rc = nomnom.cmd_decrypt(str(enc))
+        assert rc == 1
+        assert "authentication" in capsys.readouterr().err
+        assert not (tmp_path / "f.txt").exists()
+
+    def test_decrypt_plaintext_rejected(self, tmp_path, capsys):
+        plain = tmp_path / "plain.txt"
+        # Long enough to clear the 65-byte header length check so we trip
+        # the magic check, not the "too short" one.
+        plain.write_text("just text " * 100)
+        rc = nomnom.cmd_decrypt(str(plain))
+        assert rc == 1
+        assert "bad magic" in capsys.readouterr().err
+
+    def test_encrypt_missing_file(self, tmp_path, capsys):
+        rc = nomnom.cmd_encrypt(str(tmp_path / "nope.txt"))
+        assert rc == 1
+        assert "not a file" in capsys.readouterr().err
+
+    def test_no_passphrase_available(self, tmp_path, capsys, monkeypatch):
+        monkeypatch.delenv("NOMNOM_PASSPHRASE", raising=False)
+        # Force the non-tty path so no real prompt happens.
+        monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+        src = tmp_path / "f.txt"
+        src.write_text("x")
+        rc = nomnom.cmd_encrypt(str(src))
+        assert rc == 1
+        assert "passphrase" in capsys.readouterr().err
+        assert list(tmp_path.glob("*.nomnom-enc")) == []
