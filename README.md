@@ -123,10 +123,36 @@ Each section is wrapped in a `<section name="...">` block (mirroring the file bu
 
 `commit` errors out if there are no staged or unstaged changes. `pr` and `review` require the [`gh`](https://cli.github.com) CLI. `pr` auto-detects the default base branch via `gh repo view` and looks up an existing PR for the current branch via `gh pr view` (the section is `none` if there isn't one yet). `review` pulls a specific PR by number — meta, body, linked issues, commits, diff summary, reviews, top-level comments, inline review threads (grouped by file then line, tagged `[resolved]` / `[outdated]`), curated timeline events, and CI checks. The full diff is opt-in (`--diff`) since inline review comments already carry their own diff hunks. Output filenames look like `<repo>-<branch>-commit-<ts>.txt`, `<repo>-<branch>-pr-<ts>.txt`, and `<repo>-pr-<n>-review-<ts>.txt` (detached HEAD substitutes a short SHA for the branch name).
 
+## Rebuild a bundle
+
+`nomnom rebuild` is the inverse of bundling: feed it a bundle `.txt` (saved file or piped from stdin) and it reconstructs the file tree under your current directory.
+
+```sh
+nomnom rebuild foo-20260503-101415.txt   # → ./foo/ (auto-suffixes to foo-1/ if it exists)
+pbpaste | nomnom rebuild                 # read from clipboard via stdin
+nomnom rebuild bundle.txt --name scratch # override the target folder name
+```
+
+The folder name comes from the `<repo>` token in the bundle's header; `--name` overrides it. Collisions auto-suffix `-1`, `-2`, ... — nomnom never overwrites an existing folder. Git-context bundles (`commit` / `pr` / `review` outputs) aren't invertible into files and are rejected with a clear error. Paths in the bundle that try to escape the target folder (absolute paths, `..` segments) are refused.
+
+## Encrypt / decrypt
+
+Lock a bundle (or any file) on disk under a passphrase. The encrypted filename hides the original name but keeps the timestamp segment when the source has one, so date sorting still works:
+
+```sh
+nomnom encrypt foo-20260503-101415.txt   # → <hex>-20260503-101415.nomnom-enc
+nomnom decrypt <hex>-20260503-101415.nomnom-enc   # → foo-20260503-101415.txt
+```
+
+The passphrase comes from `NOMNOM_PASSPHRASE` if set, otherwise a `getpass` prompt (confirmed twice on encrypt). Decrypt restores the original filename verbatim into the same directory as the encrypted file, auto-suffixing on collision so nothing is overwritten. Wrong passphrase, tampering, or a non-encrypted file fails authentication and exits non-zero before anything is written.
+
+Crypto is stdlib-only and self-contained: scrypt (n=2¹⁶) for key derivation, HMAC-SHA256 in counter mode for the stream cipher, encrypt-then-HMAC for authentication. This is for casual at-rest privacy on a single machine — not nation-state grade. Use a real key-management tool for serious threat models.
+
 ## Environment
 
 - `NO_COLOR=1` — disable color in the picker.
 - `WAYLAND_DISPLAY` — when set, `--copy` prefers `wl-copy` over `xclip`.
+- `NOMNOM_PASSPHRASE` — passphrase for `encrypt` / `decrypt`. If unset, an interactive prompt is used.
 
 ## Requirements
 
