@@ -2432,6 +2432,10 @@ def main() -> int:
         help="Disable the default skip of .env, *.pem, id_rsa*, etc.",
     )
     parser.add_argument(
+        "--include-ignored", action="store_true",
+        help="Bundle files normally excluded by .gitignore rules.",
+    )
+    parser.add_argument(
         "--no-color", action="store_true",
         help="Disable colored output (also honors the NO_COLOR env var).",
     )
@@ -2450,7 +2454,7 @@ def main() -> int:
 
     repo_name = root.name
     print(f"scanning {root} ...", file=sys.stderr)
-    gi = load_gitignore(root)
+    gi = GitignoreMatcher([]) if args.include_ignored else load_gitignore(root)
     items = scan_repo(root, gi, skip_secrets=not args.include_secrets)
     file_items = [it for it in items if not it.is_dir]
     if not file_items:

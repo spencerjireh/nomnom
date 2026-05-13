@@ -207,6 +207,19 @@ class TestScanRepo:
         assert "app.log" not in paths
         assert "app.py" in paths
 
+    def test_include_ignored_bypasses_gitignore(self, tmp_path):
+        make_repo(tmp_path, {
+            ".gitignore": "secrets/\n*.log\n",
+            "secrets": {"key.txt": "shh"},
+            "app.log": "noise",
+            "app.py": "code",
+        })
+        paths = rels(nomnom.scan_repo(tmp_path, nomnom.GitignoreMatcher([])))
+        assert "secrets" in paths
+        assert "secrets/key.txt" in paths
+        assert "app.log" in paths
+        assert "app.py" in paths
+
     def test_binary_files_skipped(self, tmp_path):
         make_repo(tmp_path, {
             "code.py": "print('hi')",

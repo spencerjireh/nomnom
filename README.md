@@ -62,6 +62,7 @@ foo/
 | --- | --- |
 | `--copy` | Pipe output to the system clipboard (`pbcopy` on macOS; `wl-copy` / `xclip` / `xsel` on Linux) instead of writing a file. Falls back to a file if no tool is found. |
 | `--include-secrets` | Disable the default skip of `.env*`, `*.pem`, `*.key`, `id_rsa*`, `.netrc`, `.npmrc`, `secrets.{json,yaml}`, etc. |
+| `--include-ignored` | Bundle files normally excluded by `.gitignore` rules. Useful when you need generated code (e.g. protobuf output) that's gitignored. Junk dirs (`.git`, `node_modules`, etc.) and the secrets filter still apply. |
 | `--no-color` | Render the picker without color (also honors the `NO_COLOR` env var). |
 
 ## Picker keys
