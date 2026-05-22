@@ -17,8 +17,10 @@ import locale
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -2009,13 +2011,6 @@ _NMNM_SCRYPT_R = 8
 _NMNM_SCRYPT_P = 1
 _NMNM_KEY_LEN = 64  # 32 bytes enc_key + 32 bytes mac_key
 
-_NMNM_TS_RE = re.compile(r"\d{8}-\d{6}")
-
-
-def _extract_timestamp(name: str) -> str | None:
-    m = _NMNM_TS_RE.search(name)
-    return m.group(0) if m else None
-
 
 def _derive_keys(passphrase: str, salt: bytes) -> tuple[bytes, bytes]:
     dk = hashlib.scrypt(
@@ -2128,38 +2123,6 @@ def decrypt_bytes(blob: bytes, passphrase: str) -> tuple[str, bytes]:
     return name, body
 
 
-def _read_passphrase(confirm: bool) -> str:
-    env = os.environ.get("NOMNOM_PASSPHRASE")
-    if env is not None:
-        if not env:
-            raise ValueError("NOMNOM_PASSPHRASE is set but empty")
-        return env
-    if not sys.stdin.isatty():
-        raise ValueError(
-            "no passphrase: set NOMNOM_PASSPHRASE or run interactively"
-        )
-    import getpass
-    p1 = getpass.getpass("passphrase: ")
-    if not p1:
-        raise ValueError("empty passphrase")
-    if confirm:
-        p2 = getpass.getpass("confirm passphrase: ")
-        if p1 != p2:
-            raise ValueError("passphrases do not match")
-    return p1
-
-
-def _pick_encrypted_path(parent: Path, ts: str | None) -> Path:
-    import secrets as _secrets
-    while True:
-        hex8 = _secrets.token_hex(4)
-        stem = f"{hex8}-{ts}" if ts else hex8
-        candidate = parent / f"{stem}.nomnom-enc"
-        if not candidate.exists():
-            return candidate
-        # token_hex collisions are astronomically unlikely; loop just in case.
-
-
 def _pick_decrypted_path(parent: Path, name: str) -> Path:
     base = parent / name
     if not base.exists():
@@ -2174,7 +2137,785 @@ def _pick_decrypted_path(parent: Path, name: str) -> Path:
         n += 1
 
 
-def cmd_encrypt(path: str) -> int:
+# ---------- LAN transfer ----------
+#
+# Move a file between two machines on the same Wi-Fi, encrypted, with no file
+# written to disk on the sending side and zero-config discovery. There is no
+# pairing step: you run `encrypt`/`decrypt`, pick a peer from the discovered
+# list, and the transfer happens. Trust is trust-on-first-use (TOFU), like
+# SSH's known_hosts. Stdlib-only:
+#   * each machine has a stable random device id + a long-term Diffie-Hellman
+#     identity keypair (RFC 3526 2048-bit MODP group, plain big-ints) in
+#     identity.json;
+#   * the first time we transfer with a peer we record (pin) its identity
+#     public key in known_peers.json. On later transfers a changed key is the
+#     man-in-the-middle signature: we warn and ask before continuing;
+#   * each transfer derives a fresh session key with a triple Diffie-Hellman
+#     (each side contributes a throwaway ephemeral key plus its pinned identity
+#     key), giving forward secrecy and authenticating the exchange against the
+#     pinned identities — a MITM lacking the pinned private key cannot produce
+#     a key that decrypts;
+#   * a UDP limited-broadcast beacon (255.255.255.255, which routers do not
+#     forward, so it stays on the local link) advertises a machine's device id,
+#     name, role, http endpoint, and its identity + session-ephemeral pubkeys;
+#   * `encrypt`/`decrypt` discover peers, you pick one from a list, and the
+#     blob is encrypted under the session key via encrypt_bytes. Whoever runs
+#     first hosts; the other joins and picks. Only ciphertext crosses the wire.
+
+_LAN_BEACON_PORT = 48222
+_LAN_BEACON_MAGIC = b"NMNMLAN2"
+_LAN_BROADCAST_ADDR = "255.255.255.255"
+_LAN_BEACON_INTERVAL = 1.0
+_LAN_MAX_UPLOAD = 256 * 1024 * 1024  # cap on pushed ciphertext (256 MiB)
+_LAN_DISCOVER_TIMEOUT = 4.0          # default discovery window, seconds
+_LAN_DEVICE_HEADER = "X-Nomnom-Device"   # joiner's device id
+_LAN_NAME_HEADER = "X-Nomnom-Name"       # joiner's display name
+_LAN_IK_HEADER = "X-Nomnom-Ik"           # joiner's identity public key (hex)
+_LAN_EK_HEADER = "X-Nomnom-Ek"           # joiner's session ephemeral pub (hex)
+
+
+# ----- identity + known-peer (TOFU) store -----
+
+def _nomnom_config_dir() -> Path:
+    base = os.environ.get("XDG_CONFIG_HOME")
+    root = Path(base) if base else Path.home() / ".config"
+    d = root / "nomnom"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _load_identity() -> dict:
+    """Return this machine's identity, creating/upgrading it on first use.
+
+    Identity is {device_id, name, ik_priv, ik_pub} where ik_* is a long-term
+    Diffie-Hellman keypair (hex) used to authenticate transfers under TOFU.
+    """
+    import secrets as _secrets
+    path = _nomnom_config_dir() / "identity.json"
+    ident: dict = {}
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(loaded, dict):
+            ident = loaded
+    except (OSError, json.JSONDecodeError):
+        pass
+    changed = False
+    if not ident.get("device_id"):
+        ident["device_id"] = _secrets.token_hex(8)
+        changed = True
+    if not ident.get("name"):
+        ident["name"] = socket.gethostname() or "nomnom"
+        changed = True
+    if not ident.get("ik_priv") or not ident.get("ik_pub"):
+        priv, pub = _dh_keypair()
+        ident["ik_priv"] = format(priv, "x")
+        ident["ik_pub"] = format(pub, "x")
+        changed = True
+    if changed:
+        try:
+            path.write_text(json.dumps(ident), encoding="utf-8")
+        except OSError:
+            pass
+    return ident
+
+
+def _known_peers_path() -> Path:
+    return _nomnom_config_dir() / "known_peers.json"
+
+
+def _load_known_peers() -> dict:
+    try:
+        data = json.loads(_known_peers_path().read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _save_known_peer(device_id: str, name: str, ik_pub_hex: str) -> None:
+    """Pin (or re-pin) a peer's identity public key."""
+    peers = _load_known_peers()
+    existing = peers.get(device_id)
+    rec = existing if isinstance(existing, dict) else {}
+    rec["name"] = name
+    rec["ik_pub"] = ik_pub_hex
+    rec.setdefault("first_seen", int(time.time()))
+    peers[device_id] = rec
+    _known_peers_path().write_text(json.dumps(peers, indent=2),
+                                   encoding="utf-8")
+
+
+def _known_peer_ik(device_id: str) -> str | None:
+    """Return the pinned identity public key (hex) for a peer, or None."""
+    rec = _load_known_peers().get(device_id)
+    if not isinstance(rec, dict):
+        return None
+    ik = rec.get("ik_pub")
+    return ik if isinstance(ik, str) else None
+
+
+def _forget_peer(needle: str) -> list:
+    """Drop pins matching `needle` (a device id or name). Returns dropped names."""
+    peers = _load_known_peers()
+    dropped = []
+    for dev_id in list(peers.keys()):
+        rec = peers[dev_id]
+        name = rec.get("name", "") if isinstance(rec, dict) else ""
+        if needle == dev_id or needle == name:
+            dropped.append(name or dev_id)
+            del peers[dev_id]
+    if dropped:
+        _known_peers_path().write_text(json.dumps(peers, indent=2),
+                                       encoding="utf-8")
+    return dropped
+
+
+# ----- transfer crypto: triple Diffie-Hellman over RFC 3526 group 14 -----
+
+# RFC 3526 group 14 (2048-bit MODP prime), generator g = 2. Used for the
+# long-term identity keys and the per-transfer ephemeral keys alike.
+_DH_P = int(
+    "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD1"
+    "29024E088A67CC74020BBEA63B139B22514A08798E3404DD"
+    "EF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245"
+    "E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7ED"
+    "EE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3D"
+    "C2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F"
+    "83655D23DCA3AD961C62F356208552BB9ED529077096966D"
+    "670C354E4ABC9804F1746C08CA18217C32905E462E36CE3B"
+    "E39E772C180E86039B2783A2EC07A28FB5C55DF06F4C52C9"
+    "DE2BCBF6955817183995497CEA956AE515D2261898FA0510"
+    "15728E5A8AACAA68FFFFFFFFFFFFFFFF", 16)
+_DH_G = 2
+_DH_BYTES = (_DH_P.bit_length() + 7) // 8
+
+
+def _dh_keypair() -> tuple[int, int]:
+    import secrets as _secrets
+    priv = _secrets.randbelow(_DH_P - 3) + 2
+    return priv, pow(_DH_G, priv, _DH_P)
+
+
+def _dh_pub_bytes(pub: int) -> bytes:
+    return pub.to_bytes(_DH_BYTES, "big")
+
+
+def _dh_shared(priv: int, peer_pub: int) -> bytes:
+    if not 2 <= peer_pub <= _DH_P - 2:
+        raise ValueError("invalid DH public value")
+    return pow(peer_pub, priv, _DH_P).to_bytes(_DH_BYTES, "big")
+
+
+def _session_key(*, ik_init_pub: int, ek_init_pub: int,
+                 ik_resp_pub: int, ek_resp_pub: int,
+                 dh1: bytes, dh2: bytes, dh3: bytes) -> bytes:
+    """Derive a transfer session key from a triple Diffie-Hellman exchange.
+
+    The "initiator" is the joiner that picked a peer and connected; the
+    "responder" is the host. The three DH terms bind both long-term identity
+    keys and both throwaway ephemerals:
+      dh1 = DH(initiator identity,  responder ephemeral)
+      dh2 = DH(initiator ephemeral, responder identity)
+      dh3 = DH(initiator ephemeral, responder ephemeral)   # forward secrecy
+    Both sides hash the same transcript (all four public keys, then the three
+    shared secrets in fixed order) so they arrive at an identical key.
+    """
+    h = hashlib.sha256()
+    h.update(b"nomnom-session-v1")
+    for part in (_dh_pub_bytes(ik_init_pub), _dh_pub_bytes(ek_init_pub),
+                 _dh_pub_bytes(ik_resp_pub), _dh_pub_bytes(ek_resp_pub),
+                 dh1, dh2, dh3):
+        h.update(part)
+    return h.digest()
+
+
+def _session_key_initiator(ik_init_priv: int, ek_init_priv: int,
+                           ik_init_pub: int, ek_init_pub: int,
+                           ik_resp_pub: int, ek_resp_pub: int) -> bytes:
+    """Compute the session key from the joiner (initiator) side."""
+    return _session_key(
+        ik_init_pub=ik_init_pub, ek_init_pub=ek_init_pub,
+        ik_resp_pub=ik_resp_pub, ek_resp_pub=ek_resp_pub,
+        dh1=_dh_shared(ik_init_priv, ek_resp_pub),
+        dh2=_dh_shared(ek_init_priv, ik_resp_pub),
+        dh3=_dh_shared(ek_init_priv, ek_resp_pub),
+    )
+
+
+def _session_key_responder(ik_resp_priv: int, ek_resp_priv: int,
+                           ik_resp_pub: int, ek_resp_pub: int,
+                           ik_init_pub: int, ek_init_pub: int) -> bytes:
+    """Compute the session key from the host (responder) side."""
+    return _session_key(
+        ik_init_pub=ik_init_pub, ek_init_pub=ek_init_pub,
+        ik_resp_pub=ik_resp_pub, ek_resp_pub=ek_resp_pub,
+        dh1=_dh_shared(ek_resp_priv, ik_init_pub),
+        dh2=_dh_shared(ik_resp_priv, ek_init_pub),
+        dh3=_dh_shared(ek_resp_priv, ek_init_pub),
+    )
+
+
+def _lan_encode_beacon(device_id: str, name: str, ip: str, port: int,
+                       role: str, token: str, ik: str, ek: str) -> bytes:
+    body = json.dumps(
+        {"id": device_id, "name": name, "ip": ip, "port": port,
+         "role": role, "tok": token, "ik": ik, "ek": ek},
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return _LAN_BEACON_MAGIC + body
+
+
+def _lan_decode_beacon(packet: bytes) -> dict | None:
+    """Decode a beacon packet, or return None on any malformation.
+
+    Must never raise: the discovery socket sees arbitrary UDP noise. `ik` is
+    the host's identity public key and `ek` its per-session ephemeral pub
+    (both hex); together they let a joiner check the TOFU pin before connecting
+    and derive the session key.
+    """
+    if not packet.startswith(_LAN_BEACON_MAGIC):
+        return None
+    try:
+        info = json.loads(packet[len(_LAN_BEACON_MAGIC):].decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(info, dict):
+        return None
+    try:
+        out = {
+            "id": str(info["id"]),
+            "name": str(info["name"]),
+            "ip": str(info["ip"]),
+            "port": int(info["port"]),
+            "role": str(info["role"]),
+            "tok": str(info["tok"]),
+            "ik": str(info["ik"]),
+            "ek": str(info["ek"]),
+        }
+    except (KeyError, TypeError, ValueError):
+        return None
+    if out["role"] not in ("send", "recv"):
+        return None
+    return out
+
+
+def _lan_local_ip() -> str:
+    """Best-effort LAN IPv4 of the outbound interface (no packets sent)."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except OSError:
+        try:
+            return socket.gethostbyname(socket.gethostname())
+        except OSError:
+            return "127.0.0.1"
+    finally:
+        s.close()
+
+
+def _lan_beacon_sender(stop: threading.Event, device_id: str, name: str,
+                       ip: str, port: int, role: str, token: str,
+                       ik: str, ek: str,
+                       interval: float = _LAN_BEACON_INTERVAL) -> None:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    packet = _lan_encode_beacon(device_id, name, ip, port, role, token, ik, ek)
+    try:
+        while not stop.is_set():
+            try:
+                sock.sendto(packet, (_LAN_BROADCAST_ADDR, _LAN_BEACON_PORT))
+            except OSError:
+                pass  # interface flap; keep trying
+            stop.wait(interval)
+    finally:
+        sock.close()
+
+
+def _lan_listen_for_beacons(timeout: float, role: str | None = None,
+                            exclude_id: str | None = None,
+                            bind_host: str = "") -> list[dict]:
+    """Collect unique beacons (deduped by device id) until `timeout` elapses.
+
+    Filters by `role` if given and drops `exclude_id` (this machine's own id).
+    `bind_host` is a test seam (use "127.0.0.1" for loopback).
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    except (AttributeError, OSError):
+        pass
+    sock.bind((bind_host, _LAN_BEACON_PORT))
+    sock.settimeout(0.5)
+    seen: dict = {}
+    deadline = time.monotonic() + timeout
+    try:
+        while time.monotonic() < deadline:
+            try:
+                packet, _addr = sock.recvfrom(4096)
+            except (socket.timeout, OSError):
+                continue
+            info = _lan_decode_beacon(packet)
+            if info is None:
+                continue
+            if role is not None and info["role"] != role:
+                continue
+            if exclude_id is not None and info["id"] == exclude_id:
+                continue
+            seen[info["id"]] = info
+    finally:
+        sock.close()
+    return list(seen.values())
+
+
+def _handler_session(handler, make_session):
+    """Read the joiner's identity headers and run the TOFU + triple-DH step.
+
+    Returns (peer_id, name, session_key) on success, or None after sending the
+    appropriate HTTP error (the joiner is rejected: unknown headers -> 400,
+    refused by TOFU / bad keys -> 403).
+    """
+    peer_id = handler.headers.get(_LAN_DEVICE_HEADER, "")
+    name = handler.headers.get(_LAN_NAME_HEADER, "") or peer_id
+    ik_hex = handler.headers.get(_LAN_IK_HEADER, "")
+    ek_hex = handler.headers.get(_LAN_EK_HEADER, "")
+    if not peer_id or not ik_hex or not ek_hex:
+        handler.send_error(400, "missing identity headers")
+        return None
+    key = make_session(peer_id, name, ik_hex, ek_hex)
+    if key is None:
+        handler.send_error(403, "rejected (no matching identity)")
+        return None
+    return peer_id, name, key
+
+
+def _lan_make_pull_handler(make_session, make_blob, token: str,
+                           state: dict) -> type:
+    """Serve a blob encrypted under a freshly derived session key.
+
+    `make_session(id, name, ik, ek)` runs TOFU + triple-DH and returns the
+    session key (or None to reject). `make_blob(session_key)` returns the
+    ciphertext to send.
+    """
+    import http.server
+
+    class _PullHandler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            if self.path != "/" + token:
+                self.send_error(404)
+                return
+            got = _handler_session(self, make_session)
+            if got is None:
+                return
+            _peer_id, _name, key = got
+            blob = make_blob(key)
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Length", str(len(blob)))
+                self.end_headers()
+                self.wfile.write(blob)
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                return  # dropped/partial fetch; let the receiver retry
+            state["done"] = True
+            state["peer"] = self.client_address[0]
+
+    return _PullHandler
+
+
+def _lan_make_push_handler(make_session, state: dict, token: str,
+                           max_bytes: int, lock: threading.Lock) -> type:
+    """Accept one uploaded blob, decrypting it under a derived session key.
+
+    `make_session(id, name, ik, ek)` runs TOFU + triple-DH and returns the
+    session key (or None to reject). The raw ciphertext body and the key land
+    in `state` for the main thread to decrypt and write.
+    """
+    import http.server
+
+    class _PushHandler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def _recv(self):
+            if self.path != "/" + token:
+                self.send_error(404)
+                return
+            got = _handler_session(self, make_session)
+            if got is None:
+                return
+            _peer_id, _name, key = got
+            raw = self.headers.get("Content-Length")
+            if raw is None:
+                self.send_error(400, "missing Content-Length")
+                return
+            try:
+                length = int(raw)
+            except ValueError:
+                self.send_error(400, "bad Content-Length")
+                return
+            if length > max_bytes:
+                self.send_error(413, "payload too large")
+                return
+            try:
+                body = self.rfile.read(length)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                return
+            if len(body) != length:
+                self.send_error(400, "short read")
+                return
+            with lock:
+                state["blob"] = body
+                state["session_key"] = key
+                state["peer"] = self.client_address[0]
+                state["done"] = True
+            self.send_response(200)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        do_POST = _recv
+        do_PUT = _recv
+
+    return _PushHandler
+
+
+def _lan_serve_one(handler_cls: type, bind_host: str, state: dict,
+                   stop: threading.Event, on_listen=None,
+                   deadline: float | None = None) -> None:
+    """Run a one-shot HTTP server until a transfer completes or we stop.
+
+    Binds to an OS-assigned free port. `on_listen(port)` fires once the
+    socket is bound so the caller can start advertising the real port.
+    """
+    import http.server
+    server = http.server.ThreadingHTTPServer((bind_host, 0), handler_cls)
+    server.timeout = 0.5
+    if on_listen is not None:
+        on_listen(server.server_address[1])
+    try:
+        while not state.get("done") and not stop.is_set():
+            if deadline is not None and time.monotonic() > deadline:
+                break
+            server.handle_request()
+    finally:
+        server.server_close()
+
+
+def _lan_identity_headers(identity: dict, ek_pub_hex: str) -> dict:
+    """Headers the joiner sends so the host can run TOFU + triple-DH."""
+    return {
+        _LAN_DEVICE_HEADER: identity["device_id"],
+        _LAN_NAME_HEADER: identity["name"],
+        _LAN_IK_HEADER: identity["ik_pub"],
+        _LAN_EK_HEADER: ek_pub_hex,
+    }
+
+
+def _lan_fetch_blob(ip: str, port: int, token: str, identity: dict,
+                    ek_pub_hex: str, timeout: float = 30.0) -> bytes:
+    import urllib.error
+    import urllib.request
+    url = f"http://{ip}:{port}/{token}"
+    req = urllib.request.Request(
+        url, headers=_lan_identity_headers(identity, ek_pub_hex))
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read()
+    except urllib.error.HTTPError as e:
+        if e.code == 403:
+            raise ConnectionError("the other side declined your identity") from e
+        raise ConnectionError(f"fetch rejected (HTTP {e.code})") from e
+    except urllib.error.URLError as e:
+        raise ConnectionError(str(getattr(e, "reason", e))) from e
+    except OSError as e:
+        raise ConnectionError(str(e)) from e
+
+
+def _lan_upload_blob(ip: str, port: int, token: str, blob: bytes,
+                     identity: dict, ek_pub_hex: str,
+                     timeout: float = 30.0) -> None:
+    import urllib.error
+    import urllib.request
+    url = f"http://{ip}:{port}/{token}"
+    headers = _lan_identity_headers(identity, ek_pub_hex)
+    headers["Content-Type"] = "application/octet-stream"
+    headers["Content-Length"] = str(len(blob))
+    req = urllib.request.Request(url, data=blob, method="POST", headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            if resp.status != 200:
+                raise ConnectionError(f"upload rejected (HTTP {resp.status})")
+    except urllib.error.HTTPError as e:
+        if e.code == 413:
+            raise ConnectionError("file too large for the receiver") from e
+        if e.code == 403:
+            raise ConnectionError("the other side declined your identity") from e
+        raise ConnectionError(f"upload rejected (HTTP {e.code})") from e
+    except urllib.error.URLError as e:
+        raise ConnectionError(str(getattr(e, "reason", e))) from e
+    except OSError as e:
+        raise ConnectionError(str(e)) from e
+
+
+def _lan_random_token() -> str:
+    import secrets as _secrets
+    return _secrets.token_urlsafe(8)
+
+
+def _lan_warn_firewall() -> None:
+    if sys.platform == "darwin":
+        print("note: macOS may ask to allow incoming connections — click Allow",
+              file=sys.stderr)
+
+
+def _lan_discover(role: str, *, discover_timeout: float = _LAN_DISCOVER_TIMEOUT,
+                  bind_host: str = "") -> list:
+    """Discover peers advertising `role`, excluding this machine."""
+    identity = _load_identity()
+    return _lan_listen_for_beacons(discover_timeout, role=role,
+                                   exclude_id=identity["device_id"],
+                                   bind_host=bind_host)
+
+
+def _ik_fingerprint(ik_hex: str) -> str:
+    """Short, readable fingerprint of an identity public key for display."""
+    try:
+        # `format(pub, "x")` drops a leading zero nibble, so the hex can be
+        # odd-length; pad before decoding (bytes.fromhex rejects odd lengths).
+        raw = bytes.fromhex(ik_hex if len(ik_hex) % 2 == 0 else "0" + ik_hex)
+    except (ValueError, TypeError):
+        return "?"
+    d = hashlib.sha256(raw).hexdigest()[:16]
+    return ":".join(d[i:i + 4] for i in range(0, 16, 4))
+
+
+def _tofu_decision(device_id: str, ik_hex: str) -> str:
+    """Classify a peer's offered identity key against what we have pinned.
+
+    Returns "new" (never seen), "match" (same as pinned), or "changed".
+    """
+    pinned = _known_peer_ik(device_id)
+    if pinned is None:
+        return "new"
+    return "match" if pinned == ik_hex else "changed"
+
+
+def _tofu_confirm_change(name: str, old_hex, new_hex: str) -> bool:
+    """Warn that a known peer's identity key changed and ask to continue."""
+    print("", file=sys.stderr)
+    print(f"  WARNING: the identity key for {name!r} has CHANGED.",
+          file=sys.stderr)
+    print("  Expected if it was reinstalled or its config was wiped, but this",
+          file=sys.stderr)
+    print("  is also exactly what a man-in-the-middle attack looks like.",
+          file=sys.stderr)
+    if old_hex:
+        print(f"    pinned:  {_ik_fingerprint(old_hex)}", file=sys.stderr)
+    print(f"    offered: {_ik_fingerprint(new_hex)}", file=sys.stderr)
+    try:
+        ans = input("  trust the new key and continue? [y/N]: ").strip().lower()
+    except EOFError:
+        return False
+    return ans in ("y", "yes")
+
+
+def _tofu_check_join(peer: dict) -> bool:
+    """Joiner-side TOFU gate: prompt if the picked peer's key changed."""
+    if _tofu_decision(peer["id"], peer["ik"]) == "changed":
+        return _tofu_confirm_change(peer["name"], _known_peer_ik(peer["id"]),
+                                    peer["ik"])
+    return True
+
+
+def _lan_choose(found: list, what: str) -> dict | None:
+    """Print a numbered list of `found` peers and let the user pick one.
+
+    Each peer is tagged from its TOFU status: a brand-new device, a known one,
+    or one whose identity key has changed (a warning).
+    """
+    found = sorted(found, key=lambda b: b["name"])
+    print(f"found {len(found)} {what}:", file=sys.stderr)
+    for i, b in enumerate(found, 1):
+        decision = _tofu_decision(b["id"], b["ik"])
+        if decision == "new":
+            tag = "new device"
+        elif decision == "match":
+            tag = "known"
+        else:
+            tag = "WARNING: identity key changed"
+        print(f"  {i}) {b['name']}  ({b['ip']}, {tag})", file=sys.stderr)
+    try:
+        raw = input(f"pick [1-{len(found)}]: ").strip()
+    except EOFError:
+        print("error: nothing picked", file=sys.stderr)
+        return None
+    try:
+        idx = int(raw) if raw else 1
+        if not 1 <= idx <= len(found):
+            raise ValueError
+    except ValueError:
+        print(f"error: invalid choice {raw!r}", file=sys.stderr)
+        return None
+    return found[idx - 1]
+
+
+def _make_responder_session(identity: dict, ek_priv: int, ek_pub: int,
+                            state: dict, lock: threading.Lock):
+    """Build the host-side `make_session(id, name, ik, ek)` callback.
+
+    It runs TOFU on the joiner's identity key (prompting under `lock` if the
+    key changed), derives the triple-DH session key, and records the peer in
+    `state` for the main thread to pin after a successful transfer. Returns the
+    session key, or None to reject the joiner (HTTP 403).
+    """
+    ik_priv = int(identity["ik_priv"], 16)
+    ik_pub = int(identity["ik_pub"], 16)
+
+    def make_session(peer_id, name, ik_hex, ek_hex):
+        try:
+            peer_ik = int(ik_hex, 16)
+            peer_ek = int(ek_hex, 16)
+        except (ValueError, TypeError):
+            return None
+        decision = _tofu_decision(peer_id, ik_hex)
+        if decision == "changed":
+            with lock:
+                if _known_peer_ik(peer_id) != ik_hex and not _tofu_confirm_change(
+                        name, _known_peer_ik(peer_id), ik_hex):
+                    return None
+        try:
+            key = _session_key_responder(ik_priv, ek_priv, ik_pub, ek_pub,
+                                         peer_ik, peer_ek)
+        except ValueError:
+            return None
+        state["peer_id"] = peer_id
+        state["peer_name"] = name
+        state["peer_ik"] = ik_hex
+        return key
+
+    return make_session
+
+
+def _lan_host(*, role: str, handler_for, host: str | None, timeout: float,
+              waiting: str):
+    """Start a one-shot server + beacon and block until a transfer or stop.
+
+    Generates a per-session ephemeral keypair (advertised in the beacon for
+    forward secrecy) and a host-side `make_session` callback. `handler_for(
+    token, state, make_session)` builds the request handler. Returns `state`
+    (carries "done"/"peer"/"peer_id"/"peer_name"/"peer_ik" and, for receives,
+    "blob"/"session_key").
+    """
+    identity = _load_identity()
+    token = _lan_random_token()
+    advertise_ip = host or _lan_local_ip()
+    bind_host = host or ""
+    ek_priv, ek_pub = _dh_keypair()
+    ik_pub_hex = identity["ik_pub"]
+    ek_pub_hex = format(ek_pub, "x")
+    state: dict = {}
+    stop = threading.Event()
+    make_session = _make_responder_session(identity, ek_priv, ek_pub, state,
+                                           threading.Lock())
+    handler = handler_for(token, state, make_session)
+    beacon_thread = {"t": None}
+
+    def on_listen(port):
+        _lan_warn_firewall()
+        if advertise_ip == "127.0.0.1":
+            print("warning: advertising 127.0.0.1 (only reachable from this "
+                  "machine)", file=sys.stderr)
+        print(f"listening as {identity['name']} on {advertise_ip}:{port} — "
+              f"{waiting}", file=sys.stderr)
+        t = threading.Thread(
+            target=_lan_beacon_sender,
+            args=(stop, identity["device_id"], identity["name"], advertise_ip,
+                  port, role, token, ik_pub_hex, ek_pub_hex),
+            daemon=True,
+        )
+        t.start()
+        beacon_thread["t"] = t
+
+    deadline = time.monotonic() + timeout if timeout > 0 else None
+    try:
+        _lan_serve_one(handler, bind_host, state, stop, on_listen, deadline)
+    except OSError as e:
+        print(f"error: cannot start server: {e}", file=sys.stderr)
+    finally:
+        stop.set()
+        if beacon_thread["t"] is not None:
+            beacon_thread["t"].join(timeout=2)
+    return state
+
+
+def _lan_write_received(blob: bytes, session_key: bytes, peer: str) -> int:
+    """Decrypt a received blob and write the plaintext into the cwd."""
+    try:
+        name, data = decrypt_bytes(blob, session_key.hex())
+    except ValueError:
+        print("error: authentication failed (identity mismatch, or the file "
+              "was corrupted in transit)", file=sys.stderr)
+        return 1
+    out = _pick_decrypted_path(Path.cwd(), name)
+    try:
+        out.write_bytes(data)
+    except OSError as e:
+        print(f"error: cannot write {out}: {e}", file=sys.stderr)
+        return 1
+    print(f"received {name} from {peer} -> {out.name}", file=sys.stderr)
+    return 0
+
+
+def cmd_forget(needle: str) -> int:
+    """Drop the pinned identity key(s) for a peer (by name or device id).
+
+    Use this to reset trust after a legitimate reinstall, so the next transfer
+    re-pins the new key silently instead of warning.
+    """
+    dropped = _forget_peer(needle)
+    if not dropped:
+        print(f"error: no known peer matching {needle!r}", file=sys.stderr)
+        return 1
+    print(f"forgot {', '.join(dropped)} — the next transfer will re-pin.",
+          file=sys.stderr)
+    return 0
+
+
+def _joiner_session(identity: dict, peer: dict) -> tuple:
+    """Generate an ephemeral key and derive the session key with a host peer.
+
+    Returns (session_key_bytes, ek_pub_hex). Raises ValueError if the peer
+    advertised an invalid identity or ephemeral public key.
+    """
+    ek_priv, ek_pub = _dh_keypair()
+    key = _session_key_initiator(
+        int(identity["ik_priv"], 16), ek_priv,
+        int(identity["ik_pub"], 16), ek_pub,
+        int(peer["ik"], 16), int(peer["ek"], 16))
+    return key, format(ek_pub, "x")
+
+
+def _pin_from_state(state: dict) -> None:
+    """Pin the peer recorded by the host-side handshake, after a transfer."""
+    peer_id = state.get("peer_id")
+    if peer_id and state.get("peer_ik"):
+        _save_known_peer(peer_id, state.get("peer_name") or peer_id,
+                         state["peer_ik"])
+
+
+def cmd_encrypt(path: str, *, host: str | None = None,
+                timeout: float = 0.0) -> int:
+    """Send a file to another machine on the same Wi-Fi (nothing hits disk).
+
+    If a receiver is already waiting, pick it from the list and upload. If
+    none is waiting, host the file and wait for a receiver to fetch it. The
+    transfer is encrypted under a fresh session key (triple-DH); the peer's
+    identity is checked against the TOFU pin.
+    """
     p = Path(path).expanduser()
     if not p.is_file():
         print(f"error: not a file: {p}", file=sys.stderr)
@@ -2184,43 +2925,130 @@ def cmd_encrypt(path: str) -> int:
     except OSError as e:
         print(f"error: cannot read {p}: {e}", file=sys.stderr)
         return 1
+    identity = _load_identity()
+    # Short, fixed probe to see if a peer is already waiting; the wait
+    # `timeout` applies only once we host.
     try:
-        passphrase = _read_passphrase(confirm=True)
-    except ValueError as e:
-        print(f"error: {e}", file=sys.stderr)
-        return 1
-    blob = encrypt_bytes(data, p.name, passphrase)
-    ts = _extract_timestamp(p.name)
-    out = _pick_encrypted_path(p.parent, ts)
-    out.write_bytes(blob)
-    print(f"encrypted {p.name} -> {out.name}", file=sys.stderr)
-    return 0
-
-
-def cmd_decrypt(path: str) -> int:
-    p = Path(path).expanduser()
-    if not p.is_file():
-        print(f"error: not a file: {p}", file=sys.stderr)
-        return 1
-    try:
-        blob = p.read_bytes()
+        waiting = _lan_discover("recv", discover_timeout=_LAN_DISCOVER_TIMEOUT,
+                                bind_host=host or "")
     except OSError as e:
-        print(f"error: cannot read {p}: {e}", file=sys.stderr)
+        print(f"error: cannot listen on the network: {e}", file=sys.stderr)
         return 1
-    try:
-        passphrase = _read_passphrase(confirm=False)
-    except ValueError as e:
-        print(f"error: {e}", file=sys.stderr)
+
+    if waiting:
+        # Join a waiting receiver and upload.
+        peer = _lan_choose(waiting, "receiver(s)")
+        if peer is None:
+            return 1
+        if not _tofu_check_join(peer):
+            print("aborted (identity not trusted).", file=sys.stderr)
+            return 1
+        try:
+            key, ek_pub_hex = _joiner_session(identity, peer)
+        except (ValueError, TypeError):
+            print(f"error: {peer['name']} advertised an invalid key",
+                  file=sys.stderr)
+            return 1
+        blob = encrypt_bytes(data, p.name, key.hex())
+        try:
+            _lan_upload_blob(peer["ip"], peer["port"], peer["tok"], blob,
+                             identity, ek_pub_hex)
+        except ConnectionError as e:
+            print(f"error: could not send to {peer['name']} ({e})",
+                  file=sys.stderr)
+            return 1
+        _save_known_peer(peer["id"], peer["name"], peer["ik"])
+        print(f"sent {p.name} ({len(data):,} bytes) to {peer['name']}.",
+              file=sys.stderr)
+        return 0
+
+    # Nobody waiting: host the file and let a receiver fetch it. The handler
+    # derives the session key per requester; we encrypt the blob under it.
+    def make_blob(session_key):
+        return encrypt_bytes(data, p.name, session_key.hex())
+
+    state = _lan_host(
+        role="send",
+        handler_for=lambda token, st, mk: _lan_make_pull_handler(
+            mk, make_blob, token, st),
+        host=host, timeout=timeout, waiting="waiting for a receiver...")
+    if not state.get("done"):
+        print("error: no receiver connected"
+              + (f" within {timeout:.0f}s" if timeout > 0 else "")
+              + " (run `nomnom decrypt` on the other machine)",
+              file=sys.stderr)
         return 1
-    try:
-        name, data = decrypt_bytes(blob, passphrase)
-    except ValueError as e:
-        print(f"error: {e}", file=sys.stderr)
-        return 1
-    out = _pick_decrypted_path(p.parent, name)
-    out.write_bytes(data)
-    print(f"decrypted {p.name} -> {out.name}", file=sys.stderr)
+    _pin_from_state(state)
+    peer_name = state.get("peer_name") or state.get("peer")
+    print(f"sent {p.name} ({len(data):,} bytes) to {peer_name}.",
+          file=sys.stderr)
     return 0
+
+
+def cmd_decrypt(*, host: str | None = None, timeout: float = 0.0) -> int:
+    """Receive a file from another machine, writing it into the cwd.
+
+    If a sender is already hosting, pick it from the list and fetch. If none
+    is waiting, host and wait for a sender to push to you. The peer's identity
+    is checked against the TOFU pin.
+    """
+    identity = _load_identity()
+    # Short, fixed probe to see if a peer is already waiting; the wait
+    # `timeout` applies only once we host.
+    try:
+        waiting = _lan_discover("send", discover_timeout=_LAN_DISCOVER_TIMEOUT,
+                                bind_host=host or "")
+    except OSError as e:
+        print(f"error: cannot listen on the network: {e}", file=sys.stderr)
+        return 1
+
+    if waiting:
+        # Join a waiting sender and fetch.
+        peer = _lan_choose(waiting, "sender(s)")
+        if peer is None:
+            return 1
+        if not _tofu_check_join(peer):
+            print("aborted (identity not trusted).", file=sys.stderr)
+            return 1
+        try:
+            key, ek_pub_hex = _joiner_session(identity, peer)
+        except (ValueError, TypeError):
+            print(f"error: {peer['name']} advertised an invalid key",
+                  file=sys.stderr)
+            return 1
+        try:
+            blob = _lan_fetch_blob(peer["ip"], peer["port"], peer["tok"],
+                                   identity, ek_pub_hex)
+        except ConnectionError as e:
+            print(f"error: could not fetch from {peer['name']} ({e})",
+                  file=sys.stderr)
+            return 1
+        rc = _lan_write_received(blob, key, peer["name"])
+        if rc == 0:
+            _save_known_peer(peer["id"], peer["name"], peer["ik"])
+        return rc
+
+    # Nobody waiting: host and wait for a sender to push.
+    state = _lan_host(
+        role="recv",
+        handler_for=lambda token, st, mk: _lan_make_push_handler(
+            mk, st, token, _LAN_MAX_UPLOAD, threading.Lock()),
+        host=host, timeout=timeout, waiting="waiting for a sender...")
+    if not state.get("done"):
+        print("error: no sender connected"
+              + (f" within {timeout:.0f}s" if timeout > 0 else "")
+              + " (run `nomnom encrypt <file>` on the other machine)",
+              file=sys.stderr)
+        return 1
+    key = state.get("session_key")
+    if key is None:
+        print("error: handshake did not complete", file=sys.stderr)
+        return 1
+    peer_name = state.get("peer_name") or state.get("peer")
+    rc = _lan_write_received(state.get("blob") or b"", key, peer_name)
+    if rc == 0:
+        _pin_from_state(state)
+    return rc
 
 
 # ---------- main ----------
@@ -2341,18 +3169,38 @@ def _build_rebuild_parser() -> argparse.ArgumentParser:
     return sub
 
 
+def _build_forget_parser() -> argparse.ArgumentParser:
+    sub = argparse.ArgumentParser(
+        prog="nomnom forget",
+        description=(
+            "Drop the pinned identity key for a known peer (matched by name or "
+            "device id). Use this to reset trust after a legitimate reinstall, "
+            "so the next transfer re-pins the new key without warning."
+        ),
+    )
+    sub.add_argument("peer", help="Peer name or device id to forget.")
+    return sub
+
+
 def _build_encrypt_parser() -> argparse.ArgumentParser:
     sub = argparse.ArgumentParser(
         prog="nomnom encrypt",
         description=(
-            "Encrypt a file (typically a nomnom bundle .txt) under a "
-            "passphrase. The encrypted filename omits the original name but "
-            "keeps the timestamp segment when present (e.g. "
-            "`<hex>-20260511-120000.nomnom-enc`). Passphrase comes from the "
-            "NOMNOM_PASSPHRASE env var, or an interactive getpass prompt."
+            "Send a file to another machine on the same Wi-Fi, encrypted. "
+            "Nothing is written to disk on this side. If a receiver is already "
+            "waiting (`nomnom decrypt`), pick it from the list and upload; "
+            "otherwise host the file and wait for one to fetch it. No pairing "
+            "step: a peer is trusted on first use and pinned, and a later "
+            "identity-key change is flagged. Stops after one transfer."
         ),
     )
-    sub.add_argument("file", help="Path to the file to encrypt.")
+    sub.add_argument("file", help="Path to the file to send.")
+    sub.add_argument("--host", default=None,
+                     help="Advanced: bind/advertise this IP (e.g. under a VPN).")
+    sub.add_argument("--timeout", type=float, default=0.0,
+                     help="Seconds to wait while hosting (0.0 = forever). "
+                          "Discovery uses a fixed probe window and is not "
+                          "controlled by this flag.")
     return sub
 
 
@@ -2360,13 +3208,20 @@ def _build_decrypt_parser() -> argparse.ArgumentParser:
     sub = argparse.ArgumentParser(
         prog="nomnom decrypt",
         description=(
-            "Decrypt a `.nomnom-enc` file produced by `nomnom encrypt`. "
-            "Restores the original filename next to the encrypted file. "
-            "Wrong passphrase or any tampering is rejected with a clear "
-            "error before anything is written."
+            "Receive a file from another machine on the same Wi-Fi and write "
+            "the decrypted file into the current directory. If a sender is "
+            "already hosting (`nomnom encrypt <file>`), pick it from the list "
+            "and fetch; otherwise wait for one to push to you. No pairing step: "
+            "a peer is trusted on first use and pinned, and a later "
+            "identity-key change is flagged. Stops after one transfer."
         ),
     )
-    sub.add_argument("file", help="Path to the .nomnom-enc file to decrypt.")
+    sub.add_argument("--host", default=None,
+                     help="Advanced: bind/advertise this IP (e.g. under a VPN).")
+    sub.add_argument("--timeout", type=float, default=0.0,
+                     help="Seconds to wait while hosting (0.0 = forever). "
+                          "Discovery uses a fixed probe window and is not "
+                          "controlled by this flag.")
     return sub
 
 
@@ -2389,19 +3244,22 @@ def _dispatch_subcommand(argv: list[str]) -> int:
     if verb == "rebuild":
         args = _build_rebuild_parser().parse_args(argv[1:])
         return cmd_rebuild(args.bundle, args.name)
+    if verb == "forget":
+        args = _build_forget_parser().parse_args(argv[1:])
+        return cmd_forget(args.peer)
     if verb == "encrypt":
         args = _build_encrypt_parser().parse_args(argv[1:])
-        return cmd_encrypt(args.file)
+        return cmd_encrypt(args.file, host=args.host, timeout=args.timeout)
     if verb == "decrypt":
         args = _build_decrypt_parser().parse_args(argv[1:])
-        return cmd_decrypt(args.file)
+        return cmd_decrypt(host=args.host, timeout=args.timeout)
     print(f"error: unknown subcommand: {verb}", file=sys.stderr)
     return 2
 
 
 SUBCOMMANDS = (
     "register", "unregister", "commit", "pr", "review", "rebuild",
-    "encrypt", "decrypt",
+    "encrypt", "decrypt", "forget",
 )
 
 
@@ -2415,7 +3273,10 @@ def main() -> int:
             "subcommands: register / unregister edit the auto-managed "
             "extension lists; commit / pr / review bundle git context for "
             "an LLM; rebuild reconstructs a file tree from a bundle .txt; "
-            "encrypt / decrypt lock a file under a passphrase. "
+            "encrypt / decrypt move a file between two machines on the same "
+            "Wi-Fi (encrypt sends, decrypt receives; pick the peer from a "
+            "list, only ciphertext crosses the wire), trusting a peer on "
+            "first use; forget drops a peer's pinned key. "
             "run `nomnom <subcommand> --help` for details."
         ),
     )
