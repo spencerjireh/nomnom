@@ -2684,7 +2684,9 @@ def _lan_discover(role: str, *, discover_timeout: float = _LAN_DISCOVER_TIMEOUT,
 def _ik_fingerprint(ik_hex: str) -> str:
     """Short, readable fingerprint of an identity public key for display."""
     try:
-        raw = bytes.fromhex(ik_hex)
+        # `format(pub, "x")` drops a leading zero nibble, so the hex can be
+        # odd-length; pad before decoding (bytes.fromhex rejects odd lengths).
+        raw = bytes.fromhex(ik_hex if len(ik_hex) % 2 == 0 else "0" + ik_hex)
     except (ValueError, TypeError):
         return "?"
     d = hashlib.sha256(raw).hexdigest()[:16]

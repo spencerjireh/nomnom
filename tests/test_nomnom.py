@@ -2082,6 +2082,13 @@ class TestTofu:
         assert fp == nomnom._ik_fingerprint(h)
         assert fp.count(":") == 3 and len(fp) == 19
 
+    def test_fingerprint_handles_odd_length_hex(self):
+        # `format(pub, "x")` can be odd-length when the top nibble is zero;
+        # the fingerprint must still decode it rather than returning "?".
+        assert nomnom._ik_fingerprint("abc").count(":") == 3
+        assert nomnom._ik_fingerprint("0abc") == nomnom._ik_fingerprint("abc")
+        assert nomnom._ik_fingerprint("nothex!!") == "?"
+
     def test_check_join_prompts_on_change(self, tmp_path, monkeypatch):
         monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
         nomnom._save_known_peer("H", "host", "aa")
