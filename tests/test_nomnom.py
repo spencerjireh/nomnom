@@ -11,6 +11,8 @@ import json
 import os
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -1847,19 +1849,7 @@ class TestCmdRebuild:
         assert list(out_dir.iterdir()) == []
 
 
-# ---------- encryption ----------
-
-class TestExtractTimestamp:
-    @pytest.mark.parametrize("name,expected", [
-        ("myrepo-20260511-120000.txt", "20260511-120000"),
-        ("myrepo-main-commit-20260511-120000.txt", "20260511-120000"),
-        ("README.md", None),
-        ("notes-2026-05-11.txt", None),  # not the nomnom format
-        ("20260511-120000-extra-20270101-010101.txt", "20260511-120000"),
-    ])
-    def test_extraction(self, name, expected):
-        assert nomnom._extract_timestamp(name) == expected
-
+# ---------- encryption (wire format) ----------
 
 class TestPayloadPackUnpack:
     def test_round_trip_text(self):
@@ -1961,22 +1951,6 @@ class TestEncryptBytes:
             nomnom.encrypt_bytes(b"x", "f.txt", "")
 
 
-class TestPickEncryptedPath:
-    def test_with_timestamp(self, tmp_path):
-        p = nomnom._pick_encrypted_path(tmp_path, "20260511-120000")
-        assert p.parent == tmp_path
-        assert p.suffix == ".nomnom-enc"
-        assert p.stem.endswith("-20260511-120000")
-        # 8 hex chars + dash + 15-char timestamp
-        assert len(p.stem) == 8 + 1 + 15
-
-    def test_without_timestamp(self, tmp_path):
-        p = nomnom._pick_encrypted_path(tmp_path, None)
-        assert p.parent == tmp_path
-        assert p.suffix == ".nomnom-enc"
-        assert len(p.stem) == 8
-
-
 class TestPickDecryptedPath:
     def test_returns_base_when_free(self, tmp_path):
         assert nomnom._pick_decrypted_path(tmp_path, "a.txt") == tmp_path / "a.txt"
@@ -1988,88 +1962,460 @@ class TestPickDecryptedPath:
         assert nomnom._pick_decrypted_path(tmp_path, "a.txt") == tmp_path / "a-2.txt"
 
 
-class TestCmdEncryptDecrypt:
-    @pytest.fixture(autouse=True)
-    def _pass(self, monkeypatch):
-        monkeypatch.setenv("NOMNOM_PASSPHRASE", "test-pass")
 
-    def test_round_trip_with_timestamp(self, tmp_path, capsys):
-        src = tmp_path / "myrepo-20260511-120000.txt"
-        src.write_text("secret bundle contents\n")
-        rc = nomnom.cmd_encrypt(str(src))
-        assert rc == 0
-        enc_files = list(tmp_path.glob("*.nomnom-enc"))
-        assert len(enc_files) == 1
-        enc = enc_files[0]
-        import re as _re
-        assert _re.fullmatch(r"[0-9a-f]{8}-20260511-120000\.nomnom-enc", enc.name)
+# ---------- LAN transfer (trust-on-first-use model) ----------
 
-        # Remove the plaintext so decrypt has to recreate it.
-        src.unlink()
-        rc = nomnom.cmd_decrypt(str(enc))
-        assert rc == 0
-        restored = tmp_path / "myrepo-20260511-120000.txt"
-        assert restored.read_text() == "secret bundle contents\n"
+def _mk_ident(device_id, name):
+    """Build an identity dict with a real long-term DH keypair."""
+    priv, pub = nomnom._dh_keypair()
+    return {"device_id": device_id, "name": name,
+            "ik_priv": format(priv, "x"), "ik_pub": format(pub, "x")}
 
-    def test_round_trip_without_timestamp(self, tmp_path):
-        src = tmp_path / "README.md"
-        src.write_text("# hi\n")
-        rc = nomnom.cmd_encrypt(str(src))
-        assert rc == 0
-        enc_files = list(tmp_path.glob("*.nomnom-enc"))
-        assert len(enc_files) == 1
-        import re as _re
-        assert _re.fullmatch(r"[0-9a-f]{8}\.nomnom-enc", enc_files[0].name)
 
-        src.unlink()
-        rc = nomnom.cmd_decrypt(str(enc_files[0]))
-        assert rc == 0
-        assert (tmp_path / "README.md").read_text() == "# hi\n"
+class TestIdentityKnownPeers:
+    def test_identity_created_stable_and_keyed(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        i1 = nomnom._load_identity()
+        i2 = nomnom._load_identity()
+        assert i1["device_id"] and i1["name"]
+        assert i1["device_id"] == i2["device_id"]
+        # long-term identity keypair present, stable, and a valid DH pair
+        assert i1["ik_priv"] == i2["ik_priv"] and i1["ik_pub"] == i2["ik_pub"]
+        priv, pub = int(i1["ik_priv"], 16), int(i1["ik_pub"], 16)
+        assert pow(nomnom._DH_G, priv, nomnom._DH_P) == pub
 
-    def test_decrypted_name_collision_suffix(self, tmp_path):
-        src = tmp_path / "notes.txt"
-        src.write_text("original\n")
-        assert nomnom.cmd_encrypt(str(src)) == 0
-        enc = next(tmp_path.glob("*.nomnom-enc"))
-        # Don't delete src — force a collision on decrypt.
-        assert nomnom.cmd_decrypt(str(enc)) == 0
-        assert (tmp_path / "notes.txt").read_text() == "original\n"
-        assert (tmp_path / "notes-1.txt").read_text() == "original\n"
+    def test_legacy_identity_gets_keypair(self, tmp_path, monkeypatch):
+        # An identity.json from before TOFU (no ik) is upgraded in place.
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        cfg = tmp_path / "nomnom"
+        cfg.mkdir()
+        (cfg / "identity.json").write_text(json.dumps(
+            {"device_id": "old", "name": "legacy"}))
+        ident = nomnom._load_identity()
+        assert ident["device_id"] == "old" and ident["name"] == "legacy"
+        assert ident.get("ik_pub") and ident.get("ik_priv")
+        assert json.loads((cfg / "identity.json").read_text()).get("ik_pub")
 
-    def test_wrong_passphrase_no_output(self, tmp_path, capsys, monkeypatch):
-        src = tmp_path / "f.txt"
-        src.write_text("secret\n")
-        assert nomnom.cmd_encrypt(str(src)) == 0
-        enc = next(tmp_path.glob("*.nomnom-enc"))
-        src.unlink()
+    def test_known_peer_pin_lookup_and_forget(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        nomnom._save_known_peer("abc", "box", "deadbeef")
+        assert nomnom._known_peer_ik("abc") == "deadbeef"
+        assert nomnom._known_peer_ik("missing") is None
+        assert nomnom._load_known_peers()["abc"]["name"] == "box"
+        # re-pinning a new key keeps first_seen
+        first = nomnom._load_known_peers()["abc"]["first_seen"]
+        nomnom._save_known_peer("abc", "box", "feedface")
+        assert nomnom._known_peer_ik("abc") == "feedface"
+        assert nomnom._load_known_peers()["abc"]["first_seen"] == first
+        # forget by name drops it
+        assert nomnom._forget_peer("box") == ["box"]
+        assert nomnom._known_peer_ik("abc") is None
+        assert nomnom._forget_peer("nope") == []
 
-        monkeypatch.setenv("NOMNOM_PASSPHRASE", "wrong-pass")
-        rc = nomnom.cmd_decrypt(str(enc))
-        assert rc == 1
-        assert "authentication" in capsys.readouterr().err
-        assert not (tmp_path / "f.txt").exists()
 
-    def test_decrypt_plaintext_rejected(self, tmp_path, capsys):
-        plain = tmp_path / "plain.txt"
-        # Long enough to clear the 65-byte header length check so we trip
-        # the magic check, not the "too short" one.
-        plain.write_text("just text " * 100)
-        rc = nomnom.cmd_decrypt(str(plain))
-        assert rc == 1
-        assert "bad magic" in capsys.readouterr().err
+class TestSessionCrypto:
+    def test_dh_prime_is_2048_bit(self):
+        assert nomnom._DH_P.bit_length() == 2048
+        assert nomnom._DH_G == 2
 
-    def test_encrypt_missing_file(self, tmp_path, capsys):
-        rc = nomnom.cmd_encrypt(str(tmp_path / "nope.txt"))
+    def test_dh_roundtrip(self):
+        a_priv, a_pub = nomnom._dh_keypair()
+        b_priv, b_pub = nomnom._dh_keypair()
+        assert nomnom._dh_shared(a_priv, b_pub) == nomnom._dh_shared(b_priv, a_pub)
+
+    def test_dh_rejects_bad_public(self):
+        with pytest.raises(ValueError):
+            nomnom._dh_shared(123, 1)
+
+    def test_triple_dh_both_sides_agree(self):
+        ik_i_priv, ik_i_pub = nomnom._dh_keypair()
+        ek_i_priv, ek_i_pub = nomnom._dh_keypair()
+        ik_r_priv, ik_r_pub = nomnom._dh_keypair()
+        ek_r_priv, ek_r_pub = nomnom._dh_keypair()
+        ki = nomnom._session_key_initiator(ik_i_priv, ek_i_priv, ik_i_pub,
+                                           ek_i_pub, ik_r_pub, ek_r_pub)
+        kr = nomnom._session_key_responder(ik_r_priv, ek_r_priv, ik_r_pub,
+                                           ek_r_pub, ik_i_pub, ek_i_pub)
+        assert ki == kr and len(ki) == 32
+
+    def test_mitm_identity_swap_diverges(self):
+        # An attacker who lacks the pinned identity private key cannot land on
+        # the same session key: swapping the initiator identity changes it.
+        ik_i_priv, ik_i_pub = nomnom._dh_keypair()
+        ek_i_priv, ek_i_pub = nomnom._dh_keypair()
+        ik_r_priv, ik_r_pub = nomnom._dh_keypair()
+        ek_r_priv, ek_r_pub = nomnom._dh_keypair()
+        good = nomnom._session_key_initiator(ik_i_priv, ek_i_priv, ik_i_pub,
+                                             ek_i_pub, ik_r_pub, ek_r_pub)
+        _m_priv, m_pub = nomnom._dh_keypair()
+        bad = nomnom._session_key_responder(ik_r_priv, ek_r_priv, ik_r_pub,
+                                            ek_r_pub, m_pub, ek_i_pub)
+        assert good != bad
+
+    def test_forward_secrecy_fresh_key_per_transfer(self):
+        # Two transfers with the same identities still derive different keys,
+        # because each side mints a throwaway ephemeral.
+        ident = _mk_ident("J", "join")
+        peer = {"ik": _mk_ident("H", "host")["ik_pub"],
+                "ek": format(nomnom._dh_keypair()[1], "x")}
+        k1, ek1 = nomnom._joiner_session(ident, peer)
+        k2, ek2 = nomnom._joiner_session(ident, peer)
+        assert ek1 != ek2 and k1 != k2
+
+    def test_joiner_session_rejects_bad_peer_key(self):
+        ident = _mk_ident("J", "join")
+        with pytest.raises(ValueError):
+            nomnom._joiner_session(ident, {"ik": "01", "ek": "01"})
+
+
+class TestTofu:
+    def test_decision_new_match_changed(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        assert nomnom._tofu_decision("X", "aa") == "new"
+        nomnom._save_known_peer("X", "box", "aa")
+        assert nomnom._tofu_decision("X", "aa") == "match"
+        assert nomnom._tofu_decision("X", "bb") == "changed"
+
+    def test_fingerprint_stable_and_grouped(self):
+        h = format(nomnom._dh_keypair()[1], "x")
+        fp = nomnom._ik_fingerprint(h)
+        assert fp == nomnom._ik_fingerprint(h)
+        assert fp.count(":") == 3 and len(fp) == 19
+
+    def test_check_join_prompts_on_change(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        nomnom._save_known_peer("H", "host", "aa")
+        peer = {"id": "H", "name": "host", "ik": "bb"}
+        monkeypatch.setattr("builtins.input", lambda *a: "n")
+        assert nomnom._tofu_check_join(peer) is False
+        monkeypatch.setattr("builtins.input", lambda *a: "y")
+        assert nomnom._tofu_check_join(peer) is True
+
+    def test_check_join_silent_when_known(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        nomnom._save_known_peer("H", "host", "aa")
+
+        def boom(*a):
+            raise AssertionError("should not prompt for a matching key")
+        monkeypatch.setattr("builtins.input", boom)
+        assert nomnom._tofu_check_join({"id": "H", "name": "host", "ik": "aa"})
+
+
+class TestLanBeacon:
+    def test_roundtrip(self):
+        pkt = nomnom._lan_encode_beacon("id1", "box", "10.0.0.1", 5000,
+                                        "send", "tk", "abcd", "ef01")
+        assert nomnom._lan_decode_beacon(pkt) == {
+            "id": "id1", "name": "box", "ip": "10.0.0.1", "port": 5000,
+            "role": "send", "tok": "tk", "ik": "abcd", "ek": "ef01"}
+
+    @pytest.mark.parametrize("pkt", [
+        b"junk",
+        b"NMNMLAN2{bad json",
+        b"NMNMLAN2" + json.dumps({"id": "x"}).encode(),
+        # role "pair" is no longer valid in the TOFU model
+        b"NMNMLAN2" + json.dumps({"id": "x", "name": "n", "ip": "i", "port": 1,
+                                  "role": "pair", "tok": "t", "ik": "a",
+                                  "ek": "b"}).encode(),
+        b"NMNMLAN2" + json.dumps({"id": "x", "name": "n", "ip": "i", "port": 1,
+                                  "role": "send", "tok": "t"}).encode(),
+    ])
+    def test_rejects_bad_packets(self, pkt):
+        assert nomnom._lan_decode_beacon(pkt) is None
+
+
+class TestLanHttp:
+    """Drive the real pull/push handlers over loopback with a full triple-DH
+    handshake; no known-peers file is set, so TOFU treats peers as new."""
+
+    def _serve(self, handler, state):
+        import http.server
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        srv.timeout = 0.5
+        port = srv.server_address[1]
+        stop = {"go": True}
+
+        def loop():
+            while stop["go"] and not state.get("done"):
+                srv.handle_request()
+        threading.Thread(target=loop, daemon=True).start()
+        return srv, port, stop
+
+    def _host_session(self, host_ident, state):
+        ek_priv, ek_pub = nomnom._dh_keypair()
+        make_session = nomnom._make_responder_session(
+            host_ident, ek_priv, ek_pub, state, threading.Lock())
+        return make_session, format(ek_pub, "x")
+
+    def _peer(self, host_ident, ek_pub_hex, port):
+        return {"id": host_ident["device_id"], "name": host_ident["name"],
+                "ip": "127.0.0.1", "port": port, "tok": "tok",
+                "ik": host_ident["ik_pub"], "ek": ek_pub_hex}
+
+    def test_pull_roundtrip(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        host = _mk_ident("H", "host")
+        join = _mk_ident("J", "join")
+        state = {}
+        make_session, host_ek = self._host_session(host, state)
+        handler = nomnom._lan_make_pull_handler(
+            make_session,
+            lambda key: nomnom.encrypt_bytes(b"hi there", "n.txt", key.hex()),
+            "tok", state)
+        srv, port, stop = self._serve(handler, state)
+        try:
+            peer = self._peer(host, host_ek, port)
+            key, ek_hex = nomnom._joiner_session(join, peer)
+            got = nomnom._lan_fetch_blob("127.0.0.1", port, "tok", join,
+                                         ek_hex, timeout=5)
+            assert nomnom.decrypt_bytes(got, key.hex()) == ("n.txt", b"hi there")
+            assert state.get("peer_id") == "J"
+            assert state.get("peer_ik") == join["ik_pub"]
+        finally:
+            stop["go"] = False
+            state["done"] = True
+            srv.server_close()
+
+    def test_pull_rejected_403(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        join = _mk_ident("J", "join")
+        state = {}
+        handler = nomnom._lan_make_pull_handler(
+            lambda *a: None, lambda key: b"", "tok", state)
+        srv, port, stop = self._serve(handler, state)
+        try:
+            with pytest.raises(ConnectionError):
+                nomnom._lan_fetch_blob("127.0.0.1", port, "tok", join, "ab",
+                                       timeout=5)
+            assert not state.get("done")
+        finally:
+            stop["go"] = False
+            srv.server_close()
+
+    def test_pull_missing_headers_400(self, tmp_path, monkeypatch):
+        import urllib.error
+        import urllib.request
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        host = _mk_ident("H", "host")
+        state = {}
+        make_session, _ek = self._host_session(host, state)
+        handler = nomnom._lan_make_pull_handler(
+            make_session, lambda key: b"x", "tok", state)
+        srv, port, stop = self._serve(handler, state)
+        try:
+            with pytest.raises(urllib.error.HTTPError) as ei:
+                urllib.request.urlopen(f"http://127.0.0.1:{port}/tok", timeout=5)
+            assert ei.value.code == 400
+        finally:
+            stop["go"] = False
+            srv.server_close()
+
+    def test_push_roundtrip(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        host = _mk_ident("H", "host")
+        join = _mk_ident("J", "join")
+        state = {}
+        make_session, host_ek = self._host_session(host, state)
+        handler = nomnom._lan_make_push_handler(
+            make_session, state, "tok", nomnom._LAN_MAX_UPLOAD, threading.Lock())
+        srv, port, stop = self._serve(handler, state)
+        try:
+            peer = self._peer(host, host_ek, port)
+            key, ek_hex = nomnom._joiner_session(join, peer)
+            blob = nomnom.encrypt_bytes(b"data", "f.bin", key.hex())
+            nomnom._lan_upload_blob("127.0.0.1", port, "tok", blob, join,
+                                    ek_hex, timeout=5)
+            time.sleep(0.2)
+            assert state.get("blob") == blob
+            assert state.get("session_key") == key
+            assert state.get("peer_id") == "J"
+            assert nomnom.decrypt_bytes(state["blob"],
+                                        state["session_key"].hex()) == (
+                "f.bin", b"data")
+        finally:
+            stop["go"] = False
+            state["done"] = True
+            srv.server_close()
+
+    def test_push_rejected_403(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        join = _mk_ident("J", "join")
+        state = {}
+        handler = nomnom._lan_make_push_handler(
+            lambda *a: None, state, "tok", nomnom._LAN_MAX_UPLOAD,
+            threading.Lock())
+        srv, port, stop = self._serve(handler, state)
+        try:
+            with pytest.raises(ConnectionError):
+                nomnom._lan_upload_blob("127.0.0.1", port, "tok", b"x" * 70,
+                                        join, "ab", timeout=5)
+        finally:
+            stop["go"] = False
+            srv.server_close()
+
+
+class TestLanTransfer:
+    """Full cmd round-trips on loopback. Two devices are simulated with a
+    per-thread identity and a real (initially empty) known-peers store, so the
+    triple-DH handshake and TOFU first-use pinning run for real (no UDP)."""
+
+    def _setup(self, monkeypatch, tmp_path, host_thread, host_ident, join_ident):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+
+        def fake_identity():
+            if threading.current_thread().name == host_thread:
+                return host_ident
+            return join_ident
+        monkeypatch.setattr(nomnom, "_load_identity", fake_identity)
+
+        rec = {}
+
+        def fake_beacon(stop, device_id, name, ip, port, role, token, ik, ek,
+                        interval=1.0):
+            rec["beacon"] = {"id": device_id, "name": name, "ip": ip,
+                             "port": port, "role": role, "tok": token,
+                             "ik": ik, "ek": ek}
+            stop.wait()
+        monkeypatch.setattr(nomnom, "_lan_beacon_sender", fake_beacon)
+        monkeypatch.setattr(
+            nomnom, "_lan_discover",
+            lambda role, **k: ([rec["beacon"]] if rec.get("beacon")
+                               and rec["beacon"]["role"] == role else []))
+        monkeypatch.setattr("builtins.input", lambda *a: "1")
+        return rec
+
+    def _wait_beacon(self, rec, timeout=10):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if "beacon" in rec:
+                return
+            time.sleep(0.02)
+        raise AssertionError("host never beaconed")
+
+    def test_receiver_first(self, tmp_path, monkeypatch):
+        host = _mk_ident("R", "rxbox")
+        join = _mk_ident("S", "txbox")
+        rec = self._setup(monkeypatch, tmp_path, "rxhost", host, join)
+        out = tmp_path / "out"
+        out.mkdir()
+        monkeypatch.chdir(out)
+        src = tmp_path / "f.bin"
+        payload = bytes(range(256)) * 5
+        src.write_bytes(payload)
+
+        result = {}
+
+        def run():
+            result["rc"] = nomnom.cmd_decrypt(host="127.0.0.1", timeout=10)
+        th = threading.Thread(target=run, name="rxhost", daemon=True)
+        th.start()
+        self._wait_beacon(rec)
+        rc = nomnom.cmd_encrypt(str(src), host="127.0.0.1", timeout=8)
+        th.join(timeout=5)
+        assert rc == 0 and result.get("rc") == 0
+        assert (out / "f.bin").read_bytes() == payload
+        # both sides pinned each other on first use
+        peers = nomnom._load_known_peers()
+        assert "R" in peers and "S" in peers
+
+    def test_sender_first(self, tmp_path, monkeypatch):
+        host = _mk_ident("S", "txbox")
+        join = _mk_ident("R", "rxbox")
+        rec = self._setup(monkeypatch, tmp_path, "txhost", host, join)
+        out = tmp_path / "out"
+        out.mkdir()
+        monkeypatch.chdir(out)
+        src = tmp_path / "f.bin"
+        payload = b"hello world\n" * 200
+        src.write_bytes(payload)
+
+        result = {}
+
+        def run():
+            result["rc"] = nomnom.cmd_encrypt(str(src), host="127.0.0.1",
+                                              timeout=10)
+        th = threading.Thread(target=run, name="txhost", daemon=True)
+        th.start()
+        self._wait_beacon(rec)
+        rc = nomnom.cmd_decrypt(host="127.0.0.1", timeout=8)
+        th.join(timeout=5)
+        assert rc == 0 and result.get("rc") == 0
+        assert (out / "f.bin").read_bytes() == payload
+
+
+class TestLanErrors:
+    def test_encrypt_missing_file(self, tmp_path, capsys, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        rc = nomnom.cmd_encrypt(str(tmp_path / "nope.txt"), timeout=1)
         assert rc == 1
         assert "not a file" in capsys.readouterr().err
 
-    def test_no_passphrase_available(self, tmp_path, capsys, monkeypatch):
-        monkeypatch.delenv("NOMNOM_PASSPHRASE", raising=False)
-        # Force the non-tty path so no real prompt happens.
-        monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    def test_encrypt_no_peer(self, tmp_path, capsys, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        monkeypatch.setattr(nomnom, "_lan_discover", lambda *a, **k: [])
+        monkeypatch.setattr(nomnom, "_lan_host", lambda **k: {})
         src = tmp_path / "f.txt"
         src.write_text("x")
-        rc = nomnom.cmd_encrypt(str(src))
+        rc = nomnom.cmd_encrypt(str(src), timeout=1)
         assert rc == 1
-        assert "passphrase" in capsys.readouterr().err
-        assert list(tmp_path.glob("*.nomnom-enc")) == []
+        assert "no receiver" in capsys.readouterr().err
+
+    def test_decrypt_no_peer(self, tmp_path, capsys, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        monkeypatch.setattr(nomnom, "_lan_discover", lambda *a, **k: [])
+        monkeypatch.setattr(nomnom, "_lan_host", lambda **k: {})
+        rc = nomnom.cmd_decrypt(timeout=1)
+        assert rc == 1
+        assert "no sender" in capsys.readouterr().err
+
+    def test_forget_command(self, tmp_path, capsys, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        nomnom._save_known_peer("H", "host", "aa")
+        assert nomnom.cmd_forget("host") == 0
+        assert "forgot host" in capsys.readouterr().err
+        assert nomnom._known_peer_ik("H") is None
+        assert nomnom.cmd_forget("host") == 1
+        assert "no known peer" in capsys.readouterr().err
+
+
+@pytest.mark.skipif(
+    os.environ.get("NOMNOM_E2E") != "1",
+    reason="real-broadcast e2e on localhost; run with NOMNOM_E2E=1",
+)
+class TestLanTofuE2E:
+    """Spawn the real CLI as two processes (separate config dirs) and let them
+    discover and transfer over genuine UDP broadcast, trusting on first use.
+    Skipped by default."""
+
+    NOM = Path(__file__).resolve().parent.parent / "nomnom.py"
+
+    def _env(self, cfg):
+        return dict(os.environ, XDG_CONFIG_HOME=str(cfg), PYTHONUNBUFFERED="1")
+
+    def test_transfer_first_use(self, tmp_path):
+        a, b = tmp_path / "a", tmp_path / "b"
+        a.mkdir()
+        b.mkdir()
+        out = tmp_path / "out"
+        out.mkdir()
+        src = tmp_path / "doc.txt"
+        payload = b"tofu transfer\n" * 40
+        src.write_bytes(payload)
+        # receiver hosts first
+        rcv = subprocess.Popen(
+            [sys.executable, str(self.NOM), "decrypt", "--timeout", "25"],
+            stdin=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+            env=self._env(b), cwd=out)
+        time.sleep(5)  # let it start beaconing
+        snd = subprocess.Popen(
+            [sys.executable, str(self.NOM), "encrypt", str(src),
+             "--timeout", "20"],
+            stdin=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+            env=self._env(a))
+        snd.communicate("1\n", timeout=40)   # pick the only receiver
+        rcv.communicate(timeout=40)
+        assert snd.returncode == 0 and rcv.returncode == 0
+        assert (out / "doc.txt").read_bytes() == payload
+        # both sides pinned each other on first use
+        assert (a / "nomnom" / "known_peers.json").exists()
+        assert (b / "nomnom" / "known_peers.json").exists()

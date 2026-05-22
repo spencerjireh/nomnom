@@ -136,24 +136,68 @@ nomnom rebuild bundle.txt --name scratch # override the target folder name
 
 The folder name comes from the `<repo>` token in the bundle's header; `--name` overrides it. Collisions auto-suffix `-1`, `-2`, ... — nomnom never overwrites an existing folder. Git-context bundles (`commit` / `pr` / `review` outputs) aren't invertible into files and are rejected with a clear error. Paths in the bundle that try to escape the target folder (absolute paths, `..` segments) are refused.
 
-## Encrypt / decrypt
+## Send over LAN
 
-Lock a bundle (or any file) on disk under a passphrase. The encrypted filename hides the original name but keeps the timestamp segment when the source has one, so date sorting still works:
+`encrypt` and `decrypt` move a file between two machines **on the same Wi-Fi**, encrypted — nothing is written to disk on the sending side, and there's no code, passphrase, or IP to type. **No pairing step:** you run the command, pick the peer from a list of discovered devices, and the transfer happens.
 
 ```sh
-nomnom encrypt foo-20260503-101415.txt   # → <hex>-20260503-101415.nomnom-enc
-nomnom decrypt <hex>-20260503-101415.nomnom-enc   # → foo-20260503-101415.txt
+# Receiver
+nomnom decrypt                      # waits, or pick a sender if one's already hosting
+#   found 1 sender:
+#     1) alice-mbp  (192.168.1.42, known)
+#   pick [1-1]:
+
+# Sender
+nomnom encrypt report.txt           # → received on the other machine as ./report.txt
+#   found 1 receiver:
+#     1) bob-laptop  (192.168.1.55, new device)
+#   pick [1-1]:
 ```
 
-The passphrase comes from `NOMNOM_PASSPHRASE` if set, otherwise a `getpass` prompt (confirmed twice on encrypt). Decrypt restores the original filename verbatim into the same directory as the encrypted file, auto-suffixing on collision so nothing is overwritten. Wrong passphrase, tampering, or a non-encrypted file fails authentication and exits non-zero before anything is written.
+`encrypt` sends, `decrypt` receives. Whoever runs first hosts and waits; the other discovers it, you pick the peer from the list, and the transfer runs. The decrypted file lands in the receiver's current directory (auto-suffixed on name collision, never overwriting).
 
-Crypto is stdlib-only and self-contained: scrypt (n=2¹⁶) for key derivation, HMAC-SHA256 in counter mode for the stream cipher, encrypt-then-HMAC for authentication. This is for casual at-rest privacy on a single machine — not nation-state grade. Use a real key-management tool for serious threat models.
+### Trust on first use
+
+There's no setup, but transfers are still authenticated and private — trust works like SSH's `known_hosts`. Each machine has a long-term identity key; the first time you transfer with a peer, nomnom **pins** that peer's identity key (in `~/.config/nomnom/known_peers.json`) and tags it `new device` in the list. On later transfers a matching key shows as `known`. If a peer's identity key ever **changes**, nomnom warns and asks before continuing:
+
+```text
+  WARNING: the identity key for 'bob-laptop' has CHANGED.
+  Expected if it was reinstalled or its config was wiped, but this
+  is also exactly what a man-in-the-middle attack looks like.
+    pinned:  b685:2bf3:e978:49de
+    offered: 9c01:7a4f:21bd:0e88
+  trust the new key and continue? [y/N]:
+```
+
+Press `y` only if you know why it changed (the other machine was reinstalled, etc.). To clear a pin ahead of time so the next transfer re-pins silently, run `nomnom forget <name>`.
+
+### How it's kept private
+
+Each transfer derives a **fresh session key** with a triple Diffie-Hellman exchange (RFC 3526 2048-bit group): each side contributes a throwaway ephemeral key plus its pinned identity key. That gives **forward secrecy** (a leaked key can't decrypt past transfers) and authenticates the exchange against the pinned identities — a man-in-the-middle that lacks the pinned private key can't produce a key that decrypts.
+
+Only ciphertext crosses the wire. Discovery uses a UDP limited broadcast (`255.255.255.255`), which routers don't forward — so it stays on your local link and never reaches the wider internet. Each transfer is one-shot. A peer whose identity you decline, or a tampered blob, is rejected before anything is written.
+
+Crypto is stdlib-only: triple Diffie-Hellman over big-ints for the session key, scrypt for the per-message key schedule, HMAC-SHA256 in counter mode for the stream cipher, encrypt-then-HMAC for authentication.
+
+Notes:
+- **Same Wi-Fi only.** Not an internet transfer; both machines must be on the same network segment.
+- **Trust on first contact** is implicit: a man-in-the-middle present during the very first transfer with a peer would be pinned silently (TOFU's known limitation). Every later transfer is checked against that pin.
+- On **macOS**, the first run may pop a firewall "allow incoming connections" prompt — click Allow, or the other machine can't reach the host.
+- Under a **VPN** (or with multiple interfaces) auto-detection may pick the wrong address; pass `--host <your-wifi-ip>` on the side that hosts.
+- `--timeout <seconds>` bounds how long a host waits.
+
+### Two-machine check
+
+1. Put `nomnom.py` on both machines (`curl -O …`) and join them to the same Wi-Fi.
+2. On the receiver: `nomnom decrypt`. On the sender: `nomnom encrypt <file>`, then pick the receiver from the list.
+3. On macOS, click Allow at the firewall prompt on whichever machine hosts. Under a VPN, add `--host <wifi-ip>` to the side that hosts.
+
+A scripted version (two processes on one machine over real broadcast, trusting on first use) lives in the test suite as `TestLanTofuE2E`; run it with `NOMNOM_E2E=1 pytest -k TofuE2E`.
 
 ## Environment
 
 - `NO_COLOR=1` — disable color in the picker.
 - `WAYLAND_DISPLAY` — when set, `--copy` prefers `wl-copy` over `xclip`.
-- `NOMNOM_PASSPHRASE` — passphrase for `encrypt` / `decrypt`. If unset, an interactive prompt is used.
 
 ## Requirements
 
