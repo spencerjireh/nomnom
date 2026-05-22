@@ -3198,8 +3198,9 @@ def _build_encrypt_parser() -> argparse.ArgumentParser:
     sub.add_argument("--host", default=None,
                      help="Advanced: bind/advertise this IP (e.g. under a VPN).")
     sub.add_argument("--timeout", type=float, default=0.0,
-                     help="Seconds to wait/discover (default: forever when "
-                          "hosting, a few when joining).")
+                     help="Seconds to wait while hosting (0.0 = forever). "
+                          "Discovery uses a fixed probe window and is not "
+                          "controlled by this flag.")
     return sub
 
 
@@ -3218,8 +3219,9 @@ def _build_decrypt_parser() -> argparse.ArgumentParser:
     sub.add_argument("--host", default=None,
                      help="Advanced: bind/advertise this IP (e.g. under a VPN).")
     sub.add_argument("--timeout", type=float, default=0.0,
-                     help="Seconds to wait/discover (default: forever when "
-                          "hosting, a few when joining).")
+                     help="Seconds to wait while hosting (0.0 = forever). "
+                          "Discovery uses a fixed probe window and is not "
+                          "controlled by this flag.")
     return sub
 
 

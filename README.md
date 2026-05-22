@@ -169,7 +169,7 @@ There's no setup, but transfers are still authenticated and private — trust wo
   trust the new key and continue? [y/N]:
 ```
 
-Press `y` only if you know why it changed (the other machine was reinstalled, etc.). To clear a pin ahead of time so the next transfer re-pins silently, run `nomnom forget <name>`.
+Press `y` only if you know why it changed (the other machine was reinstalled, etc.). To clear a pin ahead of time so the next transfer re-pins silently, run `nomnom forget <name|device-id>` (it matches either the pinned name or the device id).
 
 ### How it's kept private
 
