@@ -2,7 +2,7 @@
 
 [![tests](https://github.com/spencerjireh/nomnom/actions/workflows/test.yml/badge.svg)](https://github.com/spencerjireh/nomnom/actions/workflows/test.yml)
 
-Single-file Python CLI that bundles a repo into one `.txt` for an LLM. Stdlib only — no install, no venv, no deps. Output mirrors [repomix](https://github.com/yamadashy/repomix)'s `<file path="…">` blocks.
+Single-file Python CLI that bundles a repo into one `.txt` for an LLM. Stdlib only — no install, no venv, no deps.
 
 ## Install
 
@@ -11,19 +11,17 @@ curl -O https://raw.githubusercontent.com/spencerjireh/nomnom/main/nomnom.py
 chmod +x nomnom.py && ln -s "$(pwd)/nomnom.py" ~/.local/bin/nomnom   # optional
 ```
 
-## Use
+## Bundle a repo
 
 ```sh
-nomnom                              # launcher TUI (bare invocation on a TTY)
-nomnom .                            # picker for current dir → ./<repo>-<ts>.txt
-nomnom ~/code/foo                   # specific repo
-nomnom --all --stdout . | pbcopy    # everything, piped, no picker
-nomnom --include 'src/**/*.py' .    # pre-checks matches in the picker
+nomnom .
 ```
 
-`.gitignore` is honored; junk dirs (`.git`, `node_modules`, …), binaries, symlinks, and obvious secrets are skipped by default.
+Opens a picker for the current directory. Pick files, hit `Enter`, get `./<repo>-<timestamp>.txt`. `.gitignore`, junk dirs (`.git`, `node_modules`, …), binaries, symlinks, and obvious secrets are skipped before the picker loads.
 
-## Output shape
+Bare `nomnom` on a TTY opens a launcher menu fronting every verb (bundle, `commit`, `pr`, `review`, `encrypt`, `decrypt`, `rebuild`, `register`).
+
+Output mirrors [repomix](https://github.com/yamadashy/repomix)'s shape:
 
 ```text
 <file_tree>
@@ -36,19 +34,15 @@ foo/
 </file>
 ```
 
-## Flags
+Skip the picker when you already know what you want:
 
-| Flag | Effect |
-| --- | --- |
-| `--all` | Skip the picker, bundle every scanned file. |
-| `--include GLOB` | Gitignore-style include (repeatable). With `--all`/`--stdout`, filters; otherwise pre-checks the picker. |
-| `--exclude GLOB` | Gitignore-style exclude, applied after `--include`. |
-| `--stdout` | Pipe the bundle to stdout. No TTY required. |
-| `--include-secrets` | Disable the default secret-file skip. |
-| `--include-ignored` | Bundle gitignored files (e.g. generated protobuf). Junk dirs and secrets still apply. |
-| `--no-color` | Plain picker (or set `NO_COLOR=1`). |
+```sh
+nomnom --all --stdout . | pbcopy    # everything → clipboard
+nomnom --include 'src/**/*.py' .    # pre-check matches in the picker
+```
 
-## Picker keys
+<details>
+<summary><b>Picker keys</b></summary>
 
 | Key | Action |
 | --- | --- |
@@ -61,11 +55,35 @@ foo/
 | `Enter` / `q` | write / cancel |
 | Click / dbl-click | toggle row / expand folder |
 
-Preview auto-shows at terminal width ≥ 100 cols.
+Preview pane auto-shows at terminal width ≥ 100 cols.
 
-## Git context bundles
+</details>
 
-`commit`, `pr`, and `review` dump git/gh state into a bundle for an LLM (same `<section name="…">` shape).
+<details>
+<summary><b>Flags</b></summary>
+
+| Flag | Effect |
+| --- | --- |
+| `--all` | Skip the picker, bundle every scanned file. |
+| `--include GLOB` | Gitignore-style include (repeatable). With `--all`/`--stdout`, filters; otherwise pre-checks the picker. |
+| `--exclude GLOB` | Gitignore-style exclude, applied after `--include`. |
+| `--stdout` | Pipe the bundle to stdout. No TTY required. |
+| `--include-secrets` | Disable the default secret-file skip. |
+| `--include-ignored` | Bundle gitignored files (e.g. generated protobuf). Junk dirs and secrets still apply. |
+| `--no-color` | Plain picker (or set `NO_COLOR=1`). |
+
+</details>
+
+<details>
+<summary><b>Secret files skipped by default</b></summary>
+
+`.env`, `.env.*`, `*.pem`, `*.key`, `*.pfx`, `*.p12`, `id_rsa*`, `id_dsa*`, `id_ecdsa*`, `id_ed25519*` (but `.pub` files pass), `.netrc`, `.npmrc`, `.pypirc`, `secrets.{json,yaml,yml}`, `credentials`, `credentials.json`. Override with `--include-secrets`.
+
+</details>
+
+## Git context for an LLM
+
+`commit`, `pr`, and `review` bundle git/gh state into the same `<section name="…">` shape.
 
 ```sh
 nomnom commit                  # status, diffs, recent commits
@@ -98,7 +116,8 @@ nomnom encrypt report.txt
 
 Scripted: `--peer <name|id>` skips the pick (case-insensitive, prefix-ok); `--trust-new` auto-accepts TOFU prompts. `--host <ip>` overrides interface detection (useful under a VPN); `--timeout <s>` bounds the host wait.
 
-### Trust on first use
+<details>
+<summary><b>Trust on first use</b></summary>
 
 Each machine has a long-term identity key. The first transfer pins the peer's key in `~/.config/nomnom/known_peers.json` (`new device` in the list); later transfers show `known`. If a pinned key changes, nomnom blocks:
 
@@ -111,13 +130,18 @@ Each machine has a long-term identity key. The first transfer pins the peer's ke
 
 `nomnom forget <name|id>` clears a pin.
 
-### Crypto
+</details>
+
+<details>
+<summary><b>Crypto</b></summary>
 
 Triple-DH over RFC 3526 group 14 derives a fresh session key per transfer (forward secrecy, identity-pinned auth). Stdlib only: 3DH for the key, scrypt for the message schedule, HMAC-SHA256 stream cipher in counter mode, encrypt-then-HMAC. Only ciphertext crosses the wire; discovery is a limited UDP broadcast (`255.255.255.255`) that routers don't forward.
 
 Caveats: same network segment only; TOFU's known weakness is the very first transfer (a MitM there would be pinned silently); macOS may show a firewall prompt on the host.
 
-## Extension lists
+</details>
+
+## Register extensions
 
 The text/binary/name/secret lists live inside a marker block in `nomnom.py`. nomnom edits them itself:
 
@@ -130,10 +154,6 @@ nomnom unregister text .pyx
 ```
 
 Each edit alphabetizes + dedupes the block and prints the diff. Conflicting kinds (text vs binary) are refused.
-
-## Safety defaults
-
-Skipped by default: `.env`, `.env.*`, `*.pem`, `*.key`, `*.pfx`, `*.p12`, `id_rsa*`, `id_dsa*`, `id_ecdsa*`, `id_ed25519*` (but `.pub` files pass), `.netrc`, `.npmrc`, `.pypirc`, `secrets.{json,yaml,yml}`, `credentials`, `credentials.json`. Override with `--include-secrets`.
 
 ## Requirements
 
