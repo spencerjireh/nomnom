@@ -3595,10 +3595,11 @@ class RebuildScreen(Screen):
                 self.error = f"cannot write {dest}: {e}"
                 self.step = "done"
                 return
-        self.message = (
-            f"wrote {len(self.files)} files into "
-            f"{self.target.relative_to(Path.cwd()) if self.target.is_relative_to(Path.cwd()) else self.target}"
-        )
+        try:
+            shown = self.target.relative_to(Path.cwd())
+        except ValueError:
+            shown = self.target
+        self.message = f"wrote {len(self.files)} files into {shown}"
         self.step = "done"
 
     def render(self, stdscr) -> None:  # pragma: no cover - curses I/O
