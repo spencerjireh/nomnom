@@ -3535,6 +3535,10 @@ def _launcher_open(verb: str):
         return PRScreen()
     if verb == "Review":
         return ReviewScreen()
+    if verb == "Send":
+        return SendScreen()
+    if verb == "Receive":
+        return ReceiveScreen()
     return PlaceholderScreen(
         verb,
         f"`nomnom {verb.lower()}` works from the shell. A dedicated TUI "
@@ -3732,37 +3736,77 @@ class RebuildScreen(Screen):
 
 
 class ExtensionsScreen(Screen):
-    """Read-only view of the four auto-managed extension lists.
+    """Editable view of the four auto-managed extension lists.
 
-    Editing still happens via `nomnom register / unregister` on the CLI; the
-    screen surfaces the current state so users can see what's active without
-    grepping nomnom.py."""
+    Section cursor (h/l) selects a list; entry cursor (j/k) selects an
+    item within it. `a` opens an add input, `d` deletes the focused
+    entry (with confirm). Edits are applied via `cmd_register`, which
+    rewrites the marker block in nomnom.py."""
 
     title = "Extensions"
     help_lines = [
-        "j/k or ↑/↓   move between sections",
+        "h/l or ←/→   switch section",
+        "j/k or ↑/↓   move within section",
+        "a            add a new value",
+        "d            delete the focused entry (confirms)",
         "esc / q      back to launcher",
-        "",
-        "edit via CLI:",
-        "  nomnom register text .pyx",
-        "  nomnom register binary .lockb",
-        "  nomnom register name MODULE.bazel",
-        "  nomnom register secret '*.creds'",
-        "  nomnom unregister <kind> <value>",
     ]
 
-    def __init__(self) -> None:
-        self.cursor = 0
-        self.sections = self._load_sections()
+    # (display label, register kind, value-source iterable)
+    _SECTION_DEFS = (
+        ("Text extensions",   "text",   "TEXT_EXTENSIONS"),
+        ("Binary extensions", "binary", "BINARY_EXTENSIONS"),
+        ("Known text names",  "name",   "KNOWN_TEXT_NAMES"),
+        ("Secret patterns",   "secret", "SECRET_PATTERNS"),
+    )
 
-    @staticmethod
-    def _load_sections() -> list[tuple[str, list[str]]]:
+    def __init__(self) -> None:
+        self.step = "view"
+        self.section_cursor = 0
+        self.entry_cursor = 0
+        self.add_buf = ""
+        self.sections = self._load_sections()
+        self.message = ""
+        self.error = ""
+
+    @classmethod
+    def _load_sections(cls) -> list[tuple[str, str, list[str]]]:
+        """Return [(label, kind, sorted entries), ...]."""
+        # Pull current contents via globals so cmd_register's marker-block
+        # rewrite is reflected on reload.
+        g = globals()
         return [
-            ("Text extensions",   sorted(TEXT_EXTENSIONS)),
-            ("Binary extensions", sorted(BINARY_EXTENSIONS)),
-            ("Known text names",  sorted(KNOWN_TEXT_NAMES)),
-            ("Secret patterns",   sorted(SECRET_PATTERNS)),
+            (label, kind, sorted(g[name]))
+            for label, kind, name in cls._SECTION_DEFS
         ]
+
+    def _current(self) -> tuple[str, str, list[str]]:
+        return self.sections[self.section_cursor]
+
+    def _capture_register(self, kind: str, value: str, *, remove: bool) -> int:
+        """Call cmd_register with stderr captured; messages land in self.message
+        (success) or self.error (failure)."""
+        self.message = ""
+        self.error = ""
+        out_buf = io.StringIO()
+        err_buf = io.StringIO()
+        with contextlib.redirect_stdout(out_buf), \
+             contextlib.redirect_stderr(err_buf):
+            rc = cmd_register(kind, [value], remove=remove)
+        captured = (err_buf.getvalue() + out_buf.getvalue()).strip()
+        if rc == 0:
+            self.message = captured or (
+                f"removed {value!r}" if remove else f"added {value!r}"
+            )
+        else:
+            self.error = captured or f"register failed (rc={rc})"
+        self.sections = self._load_sections()
+        _, _, entries = self._current()
+        if not entries:
+            self.entry_cursor = 0
+        elif self.entry_cursor >= len(entries):
+            self.entry_cursor = len(entries) - 1
+        return rc
 
     def render(self, stdscr) -> None:  # pragma: no cover - curses I/O
         theme = _setup_theme()
@@ -3772,40 +3816,148 @@ class ExtensionsScreen(Screen):
                           theme["filter"])
         except curses.error:
             pass
-        row = 2
-        for si, (label, entries) in enumerate(self.sections):
-            if row >= h - 1:
-                break
-            attr = theme["cursor"] if si == self.cursor else theme["dim"]
-            head = f"  {label}  ({len(entries)})"
+
+        if self.step == "add":
+            label, kind, _ = self._current()
+            _text_input_field(stdscr, 2, 2,
+                              f"Add to {label} ({kind}):",
+                              self.add_buf, theme, max(1, w - 4))
+            if self.error:
+                try:
+                    stdscr.addstr(5, 2, f"error: {self.error}", theme["dim"])
+                except curses.error:
+                    pass
+            footer = "enter:add  esc:cancel  ?:help"
             try:
-                stdscr.addstr(row, 0, head[: max(1, w - 1)], attr)
+                stdscr.addstr(h - 1, 0, footer[: max(1, w - 1)], theme["dim"])
+            except curses.error:
+                pass
+            return
+
+        # view step
+        row = 2
+        for si, (label, kind, entries) in enumerate(self.sections):
+            if row >= h - 4:
+                break
+            is_active_section = (si == self.section_cursor)
+            head_attr = theme["cursor"] if is_active_section else theme["dim"]
+            head = f"  {label} ({kind})  [{len(entries)}]"
+            try:
+                stdscr.addstr(row, 0, head[: max(1, w - 1)], head_attr)
             except curses.error:
                 pass
             row += 1
-            line = "    " + "  ".join(entries)
+            if is_active_section and entries:
+                # Render entries on a wrapped line, highlight focused one.
+                # We render one entry per cell-row for clarity if it fits.
+                ec = max(0, min(self.entry_cursor, len(entries) - 1))
+                line_parts = []
+                for ei, e in enumerate(entries):
+                    if ei == ec:
+                        line_parts.append(f"[{e}]")
+                    else:
+                        line_parts.append(e)
+                line = "    " + "  ".join(line_parts)
+            else:
+                line = "    " + "  ".join(entries) if entries else "    (empty)"
             try:
                 stdscr.addstr(row, 0, line[: max(1, w - 1)], 0)
             except curses.error:
                 pass
             row += 2
+
+        msg_row = h - 3
+        if self.message:
+            try:
+                stdscr.addstr(msg_row, 0, self.message[: max(1, w - 1)],
+                              theme["dim"])
+            except curses.error:
+                pass
+        if self.error:
+            try:
+                stdscr.addstr(msg_row - 1, 0, f"error: {self.error}"[: max(1, w - 1)],
+                              theme["dim"])
+            except curses.error:
+                pass
         try:
             stdscr.addstr(
                 h - 1, 0,
-                "j/k:section  esc/q:back  ?:help"[: max(1, w - 1)],
+                "h/l:section  j/k:entry  a:add  d:delete  esc/q:back  ?:help"
+                [: max(1, w - 1)],
                 theme["dim"],
             )
         except curses.error:
             pass
 
     def handle_key(self, ch: int, stdscr=None):
+        if self.step == "add":
+            if ch in (ord("q"), 3, 27):
+                self.step = "view"
+                self.add_buf = ""
+                self.error = ""
+                return ScreenAction.CONTINUE
+            if ch in (10, 13):
+                value = self.add_buf.strip()
+                if not value:
+                    self.error = "empty value"
+                    return ScreenAction.CONTINUE
+                _, kind, _ = self._current()
+                self._capture_register(kind, value, remove=False)
+                if not self.error:
+                    self.add_buf = ""
+                    self.step = "view"
+                return ScreenAction.CONTINUE
+            if ch in (curses.KEY_BACKSPACE, 127, 8):
+                self.add_buf = self.add_buf[:-1]
+                return ScreenAction.CONTINUE
+            if 32 <= ch < 127:
+                self.add_buf += chr(ch)
+            return ScreenAction.CONTINUE
+
+        # view step
         if ch in (ord("q"), 3, 27):
             return ScreenAction.BACK
+        if ch in (curses.KEY_RIGHT, ord("l")):
+            self.section_cursor = (self.section_cursor + 1) % len(self.sections)
+            self.entry_cursor = 0
+            return ScreenAction.CONTINUE
+        if ch in (curses.KEY_LEFT, ord("h")):
+            self.section_cursor = (self.section_cursor - 1) % len(self.sections)
+            self.entry_cursor = 0
+            return ScreenAction.CONTINUE
         if ch in (curses.KEY_DOWN, ord("j")):
-            self.cursor = (self.cursor + 1) % len(self.sections)
+            _, _, entries = self._current()
+            if entries:
+                self.entry_cursor = (self.entry_cursor + 1) % len(entries)
             return ScreenAction.CONTINUE
         if ch in (curses.KEY_UP, ord("k")):
-            self.cursor = (self.cursor - 1) % len(self.sections)
+            _, _, entries = self._current()
+            if entries:
+                self.entry_cursor = (self.entry_cursor - 1) % len(entries)
+            return ScreenAction.CONTINUE
+        if ch == ord("a"):
+            self.step = "add"
+            self.add_buf = ""
+            self.error = ""
+            self.message = ""
+            return ScreenAction.CONTINUE
+        if ch == ord("d"):
+            label, kind, entries = self._current()
+            if not entries:
+                self.message = "(empty section)"
+                return ScreenAction.CONTINUE
+            value = entries[max(0, min(self.entry_cursor, len(entries) - 1))]
+            if stdscr is not None:
+                ok = _confirm_modal(
+                    stdscr,
+                    f" delete {value!r} from {label}? ",
+                    [f"This rewrites the marker block in nomnom.py."],
+                    default=False,
+                )
+                if not ok:
+                    self.message = "delete cancelled."
+                    return ScreenAction.CONTINUE
+            self._capture_register(kind, value, remove=True)
             return ScreenAction.CONTINUE
         return ScreenAction.CONTINUE
 
@@ -4286,6 +4438,190 @@ class ReviewScreen(_GitContextScreen):
         )
 
 
+class _LanScreen(Screen):
+    """Base for Send / Receive. Common pattern: pause curses (so the
+    existing CLI LAN flow can print + TOFU-prompt as normal), run the
+    sync function, resume.
+
+    Trade-off vs. a fully in-curses flow: the user briefly sees a normal
+    terminal during discovery / transfer. Trade-up: we reuse every
+    interactive piece of the CLI (peer pick, TOFU prompt, host wait)
+    without duplicating the LAN state machine."""
+
+    def __init__(self) -> None:
+        self.step = "ready"
+        self.error = ""
+        self.rc = 0
+        self.message = ""
+
+    def _suspend_and_run(self, stdscr, fn) -> None:
+        try:
+            curses.endwin()
+        except curses.error:
+            pass
+        try:
+            self.rc = fn()
+        except KeyboardInterrupt:
+            self.rc = 130
+            self.message = "cancelled."
+        except Exception as e:  # pragma: no cover - defensive
+            self.rc = 1
+            self.error = f"{type(e).__name__}: {e}"
+        finally:
+            try:
+                stdscr.clear()
+            except curses.error:
+                pass
+        self.step = "done"
+
+    def _render_done(self, stdscr, theme, h, w) -> None:  # pragma: no cover
+        try:
+            rc_attr = theme["dim"] if self.rc == 0 else theme["filter"]
+            stdscr.addstr(2, 2, f"rc: {self.rc}", rc_attr)
+        except curses.error:
+            pass
+        row = 4
+        if self.message:
+            try:
+                stdscr.addstr(row, 2, self.message[: max(1, w - 3)], 0)
+            except curses.error:
+                pass
+            row += 1
+        if self.error:
+            try:
+                stdscr.addstr(row, 2, f"error: {self.error}", theme["dim"])
+            except curses.error:
+                pass
+
+
+class SendScreen(_LanScreen):
+    """Send a file over LAN. Pauses curses during the flow."""
+
+    title = "Send"
+    verb = "Send"
+    help_lines = [
+        "type a file path to send",
+        "enter starts the LAN flow (curses pauses for it)",
+        "esc / q returns to the launcher",
+    ]
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.step = "path"
+        self.path_buf = ""
+
+    def _validate_and_send(self, stdscr) -> None:
+        self.error = ""
+        path = Path(self.path_buf.strip()).expanduser()
+        if not path.is_file():
+            self.error = f"not a file: {path}"
+            return
+        try:
+            data = path.read_bytes()
+        except OSError as e:
+            self.error = f"cannot read {path}: {e}"
+            return
+        self._suspend_and_run(stdscr, lambda: _lan_send_bytes(path.name, data))
+
+    def render(self, stdscr) -> None:  # pragma: no cover - curses I/O
+        theme = _setup_theme()
+        h, w = stdscr.getmaxyx()
+        try:
+            stdscr.addstr(0, 0, f" {self.title} ".ljust(max(1, w - 1)),
+                          theme["filter"])
+        except curses.error:
+            pass
+        if self.step == "path":
+            _text_input_field(stdscr, 2, 2, "File to send:", self.path_buf,
+                              theme, max(1, w - 4))
+            if self.error:
+                try:
+                    stdscr.addstr(5, 2, f"error: {self.error}", theme["dim"])
+                except curses.error:
+                    pass
+            footer = "enter:send (curses pauses)  esc/q:back  ?:help"
+        else:
+            self._render_done(stdscr, theme, h, w)
+            footer = "esc/q:back  ?:help"
+        try:
+            stdscr.addstr(h - 1, 0, footer[: max(1, w - 1)], theme["dim"])
+        except curses.error:
+            pass
+
+    def handle_key(self, ch: int, stdscr=None):
+        if self.step == "path":
+            if ch in (ord("q"), 3, 27):
+                return ScreenAction.BACK
+            if ch in (10, 13):
+                if stdscr is not None:
+                    self._validate_and_send(stdscr)
+                return ScreenAction.CONTINUE
+            if ch in (curses.KEY_BACKSPACE, 127, 8):
+                self.path_buf = self.path_buf[:-1]
+                return ScreenAction.CONTINUE
+            if 32 <= ch < 127:
+                self.path_buf += chr(ch)
+            return ScreenAction.CONTINUE
+        # done
+        if ch in (ord("q"), 3, 27, 10, 13):
+            return ScreenAction.BACK
+        return ScreenAction.CONTINUE
+
+
+class ReceiveScreen(_LanScreen):
+    """Wait for an incoming LAN transfer. Pauses curses during the flow."""
+
+    title = "Receive"
+    verb = "Receive"
+    help_lines = [
+        "enter starts receiving (curses pauses for the flow)",
+        "the file lands in the cwd you launched nomnom from",
+        "esc / q returns to the launcher",
+    ]
+
+    def render(self, stdscr) -> None:  # pragma: no cover - curses I/O
+        theme = _setup_theme()
+        h, w = stdscr.getmaxyx()
+        try:
+            stdscr.addstr(0, 0, f" {self.title} ".ljust(max(1, w - 1)),
+                          theme["filter"])
+        except curses.error:
+            pass
+        if self.step == "ready":
+            try:
+                stdscr.addstr(2, 2,
+                              "Press Enter to start waiting for a sender.",
+                              0)
+                stdscr.addstr(4, 2,
+                              "Curses suspends so the LAN flow can pick the "
+                              "peer and prompt for trust as usual.",
+                              theme["dim"])
+            except curses.error:
+                pass
+            footer = "enter:receive  esc/q:back  ?:help"
+        else:
+            self._render_done(stdscr, theme, h, w)
+            footer = "esc/q:back  ?:help"
+        try:
+            stdscr.addstr(h - 1, 0, footer[: max(1, w - 1)], theme["dim"])
+        except curses.error:
+            pass
+
+    def handle_key(self, ch: int, stdscr=None):
+        if self.step == "ready":
+            if ch in (ord("q"), 3, 27):
+                return ScreenAction.BACK
+            if ch in (10, 13):
+                if stdscr is not None:
+                    self._suspend_and_run(stdscr, cmd_decrypt)
+                return ScreenAction.CONTINUE
+            return ScreenAction.CONTINUE
+        # done
+        if ch in (ord("q"), 3, 27, 10, 13):
+            return ScreenAction.BACK
+        return ScreenAction.CONTINUE
+
+
 def _wrap(text: str, width: int) -> list[str]:
     """Simple word-wrap; preserves paragraph order, drops nothing."""
     if width <= 0:
@@ -4323,6 +4659,42 @@ def _text_input_field(
         stdscr.addstr(y + 1, x, line, 0)
     except curses.error:
         pass
+
+
+def _confirm_modal(
+    stdscr, title: str, lines: list[str], default: bool = False,
+) -> bool:  # pragma: no cover - curses I/O
+    """Centered modal with a y/N (or Y/n) gate. Blocks on getch.
+
+    Returns True for `y`/`Y`, False for `n`/`N`/Esc, and `default` on
+    Enter. Useful for destructive confirmations from inside a Screen."""
+    h, w = stdscr.getmaxyx()
+    prompt = " [Y/n] " if default else " [y/N] "
+    body = [title.center(50, "─"), *lines, "─" * 50, prompt]
+    box_w = min(max(1, w - 2), max(len(r) for r in body) + 4)
+    box_h = min(max(1, h - 2), len(body) + 2)
+    y0 = max(0, (h - box_h) // 2)
+    x0 = max(0, (w - box_w) // 2)
+    for i in range(box_h):
+        try:
+            stdscr.addstr(y0 + i, x0, " " * box_w, curses.A_REVERSE)
+        except curses.error:
+            pass
+    for i, line in enumerate(body[: box_h - 1]):
+        try:
+            stdscr.addstr(y0 + 1 + i, x0 + 2,
+                          line[: max(0, box_w - 4)], curses.A_REVERSE)
+        except curses.error:
+            pass
+    stdscr.refresh()
+    while True:
+        ch = stdscr.getch()
+        if ch in (ord("y"), ord("Y")):
+            return True
+        if ch in (ord("n"), ord("N"), 27, 3):
+            return False
+        if ch in (10, 13):
+            return default
 
 
 # ---------- main ----------

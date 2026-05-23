@@ -700,14 +700,116 @@ class TestExtensionsScreen:
             "Known text names", "Secret patterns",
         ]
 
+    def test_section_tuple_carries_kind(self):
+        s = nomnom.ExtensionsScreen()
+        kinds = [section[1] for section in s.sections]
+        assert kinds == ["text", "binary", "name", "secret"]
+
     def test_known_text_extension_present(self):
         s = nomnom.ExtensionsScreen()
-        text_section = next(e for label, e in s.sections if label == "Text extensions")
+        text_section = next(
+            entries for label, _kind, entries in s.sections
+            if label == "Text extensions"
+        )
         assert ".py" in text_section
 
     def test_q_returns_back(self):
         s = nomnom.ExtensionsScreen()
         assert s.handle_key(ord("q")) == nomnom.ScreenAction.BACK
+
+    def test_h_l_switch_sections(self):
+        s = nomnom.ExtensionsScreen()
+        assert s.section_cursor == 0
+        s.handle_key(ord("l"))
+        assert s.section_cursor == 1
+        s.handle_key(ord("h"))
+        assert s.section_cursor == 0
+
+    def test_j_k_move_within_section(self):
+        s = nomnom.ExtensionsScreen()
+        _, _, entries = s._current()
+        assert len(entries) > 1
+        s.handle_key(ord("j"))
+        assert s.entry_cursor == 1
+        s.handle_key(ord("k"))
+        assert s.entry_cursor == 0
+
+    def test_a_enters_add_step(self):
+        s = nomnom.ExtensionsScreen()
+        s.handle_key(ord("a"))
+        assert s.step == "add"
+        s.handle_key(ord("."))
+        s.handle_key(ord("x"))
+        s.handle_key(ord("y"))
+        s.handle_key(ord("z"))
+        assert s.add_buf == ".xyz"
+
+    def test_add_dispatches_to_cmd_register(self, monkeypatch):
+        called: dict = {}
+
+        def fake_register(kind, values, remove=False, path=None):
+            called["kind"] = kind
+            called["values"] = list(values)
+            called["remove"] = remove
+            return 0
+        monkeypatch.setattr(nomnom, "cmd_register", fake_register)
+        # Make _load_sections cheap so it doesn't reflect real globals.
+        monkeypatch.setattr(
+            nomnom.ExtensionsScreen, "_load_sections",
+            classmethod(lambda cls: [
+                ("Text extensions", "text", [".py"]),
+                ("Binary extensions", "binary", []),
+                ("Known text names", "name", []),
+                ("Secret patterns", "secret", []),
+            ]),
+        )
+        s = nomnom.ExtensionsScreen()
+        s.step = "add"
+        s.add_buf = ".pyx"
+        s.handle_key(10)  # Enter
+        assert called == {"kind": "text", "values": [".pyx"], "remove": False}
+        assert s.step == "view"
+
+    def test_add_empty_value_keeps_step(self, monkeypatch):
+        s = nomnom.ExtensionsScreen()
+        s.step = "add"
+        s.add_buf = ""
+        s.handle_key(10)
+        assert s.step == "add"
+        assert "empty" in s.error
+
+    def test_add_esc_cancels(self):
+        s = nomnom.ExtensionsScreen()
+        s.step = "add"
+        s.add_buf = ".pyx"
+        s.handle_key(27)
+        assert s.step == "view"
+        assert s.add_buf == ""
+
+    def test_delete_without_stdscr_skips_confirm(self, monkeypatch):
+        # When stdscr is None (tests), confirm modal is skipped and the
+        # delete proceeds — verifies the dispatch path. (Real usage always
+        # has stdscr.)
+        removed: dict = {}
+
+        def fake_register(kind, values, remove=False, path=None):
+            removed["kind"] = kind
+            removed["values"] = list(values)
+            removed["remove"] = remove
+            return 0
+        monkeypatch.setattr(nomnom, "cmd_register", fake_register)
+        monkeypatch.setattr(
+            nomnom.ExtensionsScreen, "_load_sections",
+            classmethod(lambda cls: [
+                ("Text extensions", "text", [".py"]),
+                ("Binary extensions", "binary", []),
+                ("Known text names", "name", []),
+                ("Secret patterns", "secret", []),
+            ]),
+        )
+        s = nomnom.ExtensionsScreen()
+        s.handle_key(ord("d"), stdscr=None)
+        assert removed == {"kind": "text", "values": [".py"], "remove": True}
 
 
 class TestPinsScreen:
@@ -1032,6 +1134,104 @@ class TestReviewScreen:
         s.handle_key(10)
         assert called == {"pr": 42, "diff": True,
                           "dest": nomnom.Destination.SEND}
+
+
+class _FakeStdscr:
+    """Just enough stdscr surface for SendScreen / ReceiveScreen tests."""
+    def clear(self) -> None:
+        pass
+    def erase(self) -> None:
+        pass
+    def refresh(self) -> None:
+        pass
+
+
+class TestSendScreen:
+    def test_init_defaults(self):
+        s = nomnom.SendScreen()
+        assert s.step == "path"
+        assert s.path_buf == ""
+        assert s.rc == 0
+
+    def test_path_edit_appends_chars(self):
+        s = nomnom.SendScreen()
+        s.handle_key(ord("a"))
+        s.handle_key(ord("/"))
+        s.handle_key(ord("b"))
+        assert s.path_buf == "a/b"
+
+    def test_q_returns_back(self):
+        s = nomnom.SendScreen()
+        assert s.handle_key(ord("q")) == nomnom.ScreenAction.BACK
+
+    def test_invalid_path_sets_error(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(nomnom.curses, "endwin", lambda: None)
+        s = nomnom.SendScreen()
+        s.path_buf = str(tmp_path / "missing.bin")
+        s._validate_and_send(_FakeStdscr())
+        assert s.step == "path"
+        assert "not a file" in s.error
+
+    def test_happy_path_dispatches_to_lan_send_bytes(self, tmp_path, monkeypatch):
+        f = tmp_path / "blob.bin"
+        f.write_bytes(b"hello\n")
+        captured: dict = {}
+
+        def fake_send(name, data, **kw):
+            captured["name"] = name
+            captured["bytes"] = len(data)
+            return 0
+        monkeypatch.setattr(nomnom, "_lan_send_bytes", fake_send)
+        monkeypatch.setattr(nomnom.curses, "endwin", lambda: None)
+        s = nomnom.SendScreen()
+        s.path_buf = str(f)
+        s._validate_and_send(_FakeStdscr())
+        assert s.step == "done"
+        assert s.rc == 0
+        assert captured == {"name": "blob.bin", "bytes": 6}
+
+    def test_lan_send_failure_recorded(self, tmp_path, monkeypatch):
+        f = tmp_path / "blob.bin"
+        f.write_bytes(b"x")
+        monkeypatch.setattr(nomnom, "_lan_send_bytes", lambda n, d, **k: 1)
+        monkeypatch.setattr(nomnom.curses, "endwin", lambda: None)
+        s = nomnom.SendScreen()
+        s.path_buf = str(f)
+        s._validate_and_send(_FakeStdscr())
+        assert s.step == "done"
+        assert s.rc == 1
+
+
+class TestReceiveScreen:
+    def test_init_defaults(self):
+        s = nomnom.ReceiveScreen()
+        assert s.step == "ready"
+        assert s.rc == 0
+
+    def test_q_returns_back(self):
+        s = nomnom.ReceiveScreen()
+        assert s.handle_key(ord("q")) == nomnom.ScreenAction.BACK
+
+    def test_enter_dispatches_to_cmd_decrypt(self, monkeypatch):
+        called: dict = {"n": 0}
+
+        def fake_decrypt(**kw):
+            called["n"] += 1
+            return 0
+        monkeypatch.setattr(nomnom, "cmd_decrypt", fake_decrypt)
+        monkeypatch.setattr(nomnom.curses, "endwin", lambda: None)
+        s = nomnom.ReceiveScreen()
+        s.handle_key(10, stdscr=_FakeStdscr())
+        assert called["n"] == 1
+        assert s.step == "done"
+
+    def test_decrypt_failure_recorded(self, monkeypatch):
+        monkeypatch.setattr(nomnom, "cmd_decrypt", lambda **kw: 1)
+        monkeypatch.setattr(nomnom.curses, "endwin", lambda: None)
+        s = nomnom.ReceiveScreen()
+        s.handle_key(10, stdscr=_FakeStdscr())
+        assert s.rc == 1
+        assert s.step == "done"
 
 
 class TestEmitGitBundleSend:
