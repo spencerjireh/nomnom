@@ -720,8 +720,20 @@ _DESTINATION_LABELS = {
 }
 
 
-def cycle_destination(d: Destination) -> Destination:
-    return Destination((int(d) + 1) % len(Destination))
+def cycle_destination(
+    d: Destination, allowed: tuple[Destination, ...] | None = None,
+) -> Destination:
+    """Advance `d` to the next destination.
+
+    `allowed` restricts the cycle to a subset (used inside the TUI to hide
+    STDOUT, which is meaningless when curses owns the terminal). If `d`
+    isn't in `allowed`, snap to the first allowed entry."""
+    if allowed is None:
+        return Destination((int(d) + 1) % len(Destination))
+    if d not in allowed:
+        return allowed[0]
+    i = allowed.index(d)
+    return allowed[(i + 1) % len(allowed)]
 
 
 def compute_summary(nodes: list[Node]) -> tuple[int, int, int]:
@@ -819,288 +831,295 @@ def _clip(s: str, width: int) -> str:
     return s[: width - 1] + "…"
 
 
-def pick(
+def _picker_ui(
+    stdscr,
     nodes: list[Node],
     root: Path | None = None,
     initial_destination: Destination = Destination.FILE,
     initial_include_tree: bool = True,
+    allow_stdout: bool = True,
 ) -> PickResult | None:
-    """Curses checkbox-tree picker. Returns PickResult, or None on cancel.
+    """Run the picker loop on an existing `stdscr`.
 
-    When `root` is given, the picker shows a preview pane on wide
-    terminals (>= PREVIEW_MIN_TERMINAL_WIDTH cols). Press `p` to hide
-    or show the preview."""
+    `pick()` calls this through `curses.wrapper`. The launcher TUI calls it
+    directly, since `curses.wrapper` cannot nest. `allow_stdout=False`
+    drops STDOUT from the `d` cycle — meaningless when curses owns the
+    terminal."""
     if not nodes:
-        return PickResult(set(), initial_destination, initial_include_tree)
+        dest = initial_destination
+        if not allow_stdout and dest == Destination.STDOUT:
+            dest = Destination.FILE
+        return PickResult(set(), dest, initial_include_tree)
+
+    cycle_allowed: tuple[Destination, ...] | None
+    if allow_stdout:
+        cycle_allowed = None
+    else:
+        cycle_allowed = (Destination.FILE, Destination.CLIPBOARD, Destination.SEND)
+        if initial_destination == Destination.STDOUT:
+            initial_destination = Destination.FILE
 
     cancelled = False
     destination = initial_destination
     include_tree = initial_include_tree
     preview_visible = root is not None
 
-    def _picker(stdscr) -> None:
-        nonlocal cancelled, destination, include_tree, preview_visible
-        curses.curs_set(0)
-        stdscr.keypad(True)
-        try:
-            curses.mousemask(
-                curses.BUTTON1_CLICKED | curses.BUTTON1_DOUBLE_CLICKED
-            )
-        except curses.error:
-            pass
-        theme = _setup_theme()
-        cursor_ni: int = 0
-        viewport = 0
-        filter_active = False
-        filter_buf = ""
-        sort_mode = "alpha"
-        preview_cache: dict[tuple[int, int, int], list[str]] = {}
+    curses.curs_set(0)
+    stdscr.keypad(True)
+    try:
+        curses.mousemask(
+            curses.BUTTON1_CLICKED | curses.BUTTON1_DOUBLE_CLICKED
+        )
+    except curses.error:
+        pass
+    theme = _setup_theme()
+    cursor_ni: int = 0
+    viewport = 0
+    filter_active = False
+    filter_buf = ""
+    sort_mode = "alpha"
+    preview_cache: dict[tuple[int, int, int], list[str]] = {}
 
-        def _sort_key(n: Node):
-            return (-n.size, n.name)
+    def _sort_key(n: Node):
+        return (-n.size, n.name)
 
-        while True:
-            sk = _sort_key if sort_mode == "size" else None
-            if filter_buf:
-                q = filter_buf.lower()
-                matches = [i for i, n in enumerate(nodes) if q in n.rel.lower()]
-                if sk is not None:
-                    matches.sort(key=lambda i: sk(nodes[i]))
-                visible = matches
-            else:
-                visible = visible_indices(nodes, sort_key=sk)
+    while True:
+        sk = _sort_key if sort_mode == "size" else None
+        if filter_buf:
+            q = filter_buf.lower()
+            matches = [i for i, n in enumerate(nodes) if q in n.rel.lower()]
+            if sk is not None:
+                matches.sort(key=lambda i: sk(nodes[i]))
+            visible = matches
+        else:
+            visible = visible_indices(nodes, sort_key=sk)
 
-            if not visible:
-                stdscr.erase()
-                stdscr.addstr(0, 0, "(no matches)")
-                stdscr.addstr(1, 0, f"/ {filter_buf}", curses.A_DIM)
-                stdscr.refresh()
-                ch = stdscr.getch()
-                if filter_active or filter_buf:
-                    filter_active, filter_buf = _apply_filter_key(
-                        ch, filter_active, filter_buf
-                    )
-                    continue
-                if ch in (ord("q"), 3):
-                    cancelled = True
-                    return
-                continue
-
-            if cursor_ni not in visible:
-                cursor_ni = visible[0]
-            cursor_pos = visible.index(cursor_ni)
-
-            h, w = stdscr.getmaxyx()
-            list_h = max(1, h - 3)
-            if cursor_pos < viewport:
-                viewport = cursor_pos
-            elif cursor_pos >= viewport + list_h:
-                viewport = cursor_pos - list_h + 1
-
-            show_preview = (
-                preview_visible
-                and root is not None
-                and w >= PREVIEW_MIN_TERMINAL_WIDTH
-            )
-            if show_preview:
-                tree_w = max(40, int(w * 0.6))
-                preview_x = tree_w + 1
-                preview_w = max(0, w - preview_x)
-            else:
-                tree_w = w
-                preview_x = preview_w = 0
-
+        if not visible:
             stdscr.erase()
-            for row in range(list_h):
-                vi = viewport + row
-                if vi >= len(visible):
-                    break
-                ni = visible[vi]
-                n = nodes[ni]
-                check = "[x]" if n.checked else "[ ]"
-                indent = "" if filter_buf else "  " * n.depth
-                if n.is_dir:
-                    glyph = "v " if n.expanded else "> "
-                else:
-                    glyph = "  "
-                label = n.rel if filter_buf else n.name
-                if n.is_dir and not label.endswith("/"):
-                    label += "/"
-                prefix = f"{check} {indent}{glyph}{label}"
-                if n.read_error:
-                    stat_variants = ("?  ?  ?", "?  ?", "?")
-                else:
-                    s_size = _fmt_size(n.size)
-                    s_loc = _fmt_loc(n.loc)
-                    s_tok = _fmt_tokens(n.tokens)
-                    stat_variants = (
-                        f"{s_size}  {s_loc}  {s_tok}",
-                        f"{s_size}  {s_loc}",
-                        s_size,
-                    )
-                chosen_suffix = ""
-                gap = 2
-                avail = tree_w - 1
-                for cand in stat_variants:
-                    if len(prefix) + gap + len(cand) <= avail:
-                        chosen_suffix = cand
-                        break
-                if chosen_suffix:
-                    pad_len = avail - len(prefix) - len(chosen_suffix)
-                    main = prefix + " " * pad_len
-                else:
-                    main = prefix[:avail]
-                if n.checked:
-                    attr = theme["checked"]
-                elif n.is_dir:
-                    attr = theme["dir"]
-                else:
-                    attr = theme["file"]
-                suffix_attr = theme["dim"]
-                if vi == cursor_pos:
-                    attr |= theme["cursor"]
-                    suffix_attr |= theme["cursor"]
-                try:
-                    stdscr.addstr(row, 0, main, attr)
-                    if chosen_suffix:
-                        stdscr.addstr(row, len(main), chosen_suffix, suffix_attr)
-                except curses.error:
-                    pass
-
-            if show_preview and preview_w > 0:
-                cur_node = nodes[cursor_ni]
-                preview_lines: list[str]
-                if cur_node.is_dir or root is None:
-                    preview_lines = []
-                else:
-                    cache_key = (cursor_ni, list_h, preview_w)
-                    cached = preview_cache.get(cache_key)
-                    if cached is None:
-                        cached = render_preview(
-                            root / cur_node.rel, list_h, preview_w,
-                        )
-                        preview_cache[cache_key] = cached
-                    preview_lines = cached
-                for row, line in enumerate(preview_lines[:list_h]):
-                    try:
-                        stdscr.addstr(row, preview_x, line, theme["dim"])
-                    except curses.error:
-                        pass
-
-            summary = compute_summary(nodes)
-            if h >= 3:
-                footer = format_footer(destination, include_tree, summary, max(1, w - 1))
-                try:
-                    stdscr.addstr(h - 3, 0, footer, theme["dim"])
-                except curses.error:
-                    pass
-            if filter_active or filter_buf:
-                try:
-                    stdscr.addstr(h - 2, 0, "/ ", theme["filter"])
-                    stdscr.addstr(filter_buf[: max(0, w - 3)], theme["filter"])
-                except curses.error:
-                    pass
-            status = (
-                "space:toggle  /:filter  d:dest  t:tree  p:preview  "
-                "s:sort  a:toggle-visible  enter:write  q:quit"
-            )
-            try:
-                stdscr.addstr(h - 1, 0, status[: w - 1], theme["dim"])
-            except curses.error:
-                pass
+            stdscr.addstr(0, 0, "(no matches)")
+            stdscr.addstr(1, 0, f"/ {filter_buf}", curses.A_DIM)
             stdscr.refresh()
-
             ch = stdscr.getch()
-
-            if ch == curses.KEY_RESIZE:
-                continue
-
-            if filter_active:
+            if filter_active or filter_buf:
                 filter_active, filter_buf = _apply_filter_key(
                     ch, filter_active, filter_buf
                 )
                 continue
-
-            if ch == curses.KEY_MOUSE:
-                try:
-                    _, _mx, my, _mz, bstate = curses.getmouse()
-                except curses.error:
-                    continue
-                if 0 <= my < list_h:
-                    new_pos = viewport + my
-                    if 0 <= new_pos < len(visible):
-                        cursor_pos = new_pos
-                        cursor_ni = visible[cursor_pos]
-                        n = nodes[cursor_ni]
-                        if bstate & curses.BUTTON1_DOUBLE_CLICKED and n.is_dir:
-                            n.expanded = not n.expanded
-                        else:
-                            cascade_check(nodes, cursor_ni, not n.checked)
-                continue
-
-            if ch in (curses.KEY_DOWN, ord("j")):
-                cursor_pos = min(cursor_pos + 1, len(visible) - 1)
-                cursor_ni = visible[cursor_pos]
-            elif ch in (curses.KEY_UP, ord("k")):
-                cursor_pos = max(cursor_pos - 1, 0)
-                cursor_ni = visible[cursor_pos]
-            elif ch == curses.KEY_NPAGE:
-                cursor_pos = min(cursor_pos + list_h, len(visible) - 1)
-                cursor_ni = visible[cursor_pos]
-            elif ch == curses.KEY_PPAGE:
-                cursor_pos = max(cursor_pos - list_h, 0)
-                cursor_ni = visible[cursor_pos]
-            elif ch in (curses.KEY_HOME, ord("g")):
-                cursor_pos = 0
-                cursor_ni = visible[0]
-            elif ch in (curses.KEY_END, ord("G")):
-                cursor_pos = len(visible) - 1
-                cursor_ni = visible[cursor_pos]
-            elif ch == ord(" "):
-                cascade_check(nodes, cursor_ni, not nodes[cursor_ni].checked)
-            elif ch in (curses.KEY_RIGHT, ord("l")):
-                if nodes[cursor_ni].is_dir:
-                    nodes[cursor_ni].expanded = True
-            elif ch in (curses.KEY_LEFT, ord("h")):
-                n = nodes[cursor_ni]
-                if n.is_dir and n.expanded:
-                    n.expanded = False
-                elif n.parent is not None:
-                    cursor_ni = n.parent
-            elif ch == ord("E"):
-                for nn in nodes:
-                    if nn.is_dir:
-                        nn.expanded = True
-            elif ch == ord("C"):
-                for nn in nodes:
-                    if nn.is_dir:
-                        nn.expanded = False
-            elif ch == ord("/"):
-                filter_active = True
-            elif ch == 27:
-                filter_buf = ""
-            elif ch == ord("a"):
-                any_unchecked = any(not nodes[v].checked for v in visible)
-                for v in visible:
-                    cascade_check(nodes, v, any_unchecked)
-            elif ch == ord("s"):
-                sort_mode = "size" if sort_mode == "alpha" else "alpha"
-            elif ch == ord("d"):
-                destination = cycle_destination(destination)
-            elif ch == ord("t"):
-                include_tree = not include_tree
-            elif ch == ord("p"):
-                preview_visible = not preview_visible
-            elif ch in (10, 13):
-                return
-            elif ch in (ord("q"), 3):
+            if ch in (ord("q"), 3):
                 cancelled = True
-                return
+                break
+            continue
 
-    try:
-        curses.wrapper(_picker)
-    except KeyboardInterrupt:
-        cancelled = True
+        if cursor_ni not in visible:
+            cursor_ni = visible[0]
+        cursor_pos = visible.index(cursor_ni)
+
+        h, w = stdscr.getmaxyx()
+        list_h = max(1, h - 3)
+        if cursor_pos < viewport:
+            viewport = cursor_pos
+        elif cursor_pos >= viewport + list_h:
+            viewport = cursor_pos - list_h + 1
+
+        show_preview = (
+            preview_visible
+            and root is not None
+            and w >= PREVIEW_MIN_TERMINAL_WIDTH
+        )
+        if show_preview:
+            tree_w = max(40, int(w * 0.6))
+            preview_x = tree_w + 1
+            preview_w = max(0, w - preview_x)
+        else:
+            tree_w = w
+            preview_x = preview_w = 0
+
+        stdscr.erase()
+        for row in range(list_h):
+            vi = viewport + row
+            if vi >= len(visible):
+                break
+            ni = visible[vi]
+            n = nodes[ni]
+            check = "[x]" if n.checked else "[ ]"
+            indent = "" if filter_buf else "  " * n.depth
+            if n.is_dir:
+                glyph = "v " if n.expanded else "> "
+            else:
+                glyph = "  "
+            label = n.rel if filter_buf else n.name
+            if n.is_dir and not label.endswith("/"):
+                label += "/"
+            prefix = f"{check} {indent}{glyph}{label}"
+            if n.read_error:
+                stat_variants = ("?  ?  ?", "?  ?", "?")
+            else:
+                s_size = _fmt_size(n.size)
+                s_loc = _fmt_loc(n.loc)
+                s_tok = _fmt_tokens(n.tokens)
+                stat_variants = (
+                    f"{s_size}  {s_loc}  {s_tok}",
+                    f"{s_size}  {s_loc}",
+                    s_size,
+                )
+            chosen_suffix = ""
+            gap = 2
+            avail = tree_w - 1
+            for cand in stat_variants:
+                if len(prefix) + gap + len(cand) <= avail:
+                    chosen_suffix = cand
+                    break
+            if chosen_suffix:
+                pad_len = avail - len(prefix) - len(chosen_suffix)
+                main = prefix + " " * pad_len
+            else:
+                main = prefix[:avail]
+            if n.checked:
+                attr = theme["checked"]
+            elif n.is_dir:
+                attr = theme["dir"]
+            else:
+                attr = theme["file"]
+            suffix_attr = theme["dim"]
+            if vi == cursor_pos:
+                attr |= theme["cursor"]
+                suffix_attr |= theme["cursor"]
+            try:
+                stdscr.addstr(row, 0, main, attr)
+                if chosen_suffix:
+                    stdscr.addstr(row, len(main), chosen_suffix, suffix_attr)
+            except curses.error:
+                pass
+
+        if show_preview and preview_w > 0:
+            cur_node = nodes[cursor_ni]
+            preview_lines: list[str]
+            if cur_node.is_dir or root is None:
+                preview_lines = []
+            else:
+                cache_key = (cursor_ni, list_h, preview_w)
+                cached = preview_cache.get(cache_key)
+                if cached is None:
+                    cached = render_preview(
+                        root / cur_node.rel, list_h, preview_w,
+                    )
+                    preview_cache[cache_key] = cached
+                preview_lines = cached
+            for row, line in enumerate(preview_lines[:list_h]):
+                try:
+                    stdscr.addstr(row, preview_x, line, theme["dim"])
+                except curses.error:
+                    pass
+
+        summary = compute_summary(nodes)
+        if h >= 3:
+            footer = format_footer(destination, include_tree, summary, max(1, w - 1))
+            try:
+                stdscr.addstr(h - 3, 0, footer, theme["dim"])
+            except curses.error:
+                pass
+        if filter_active or filter_buf:
+            try:
+                stdscr.addstr(h - 2, 0, "/ ", theme["filter"])
+                stdscr.addstr(filter_buf[: max(0, w - 3)], theme["filter"])
+            except curses.error:
+                pass
+        status = (
+            "space:toggle  /:filter  d:dest  t:tree  p:preview  "
+            "s:sort  a:toggle-visible  enter:write  q:quit"
+        )
+        try:
+            stdscr.addstr(h - 1, 0, status[: w - 1], theme["dim"])
+        except curses.error:
+            pass
+        stdscr.refresh()
+
+        ch = stdscr.getch()
+
+        if ch == curses.KEY_RESIZE:
+            continue
+
+        if filter_active:
+            filter_active, filter_buf = _apply_filter_key(
+                ch, filter_active, filter_buf
+            )
+            continue
+
+        if ch == curses.KEY_MOUSE:
+            try:
+                _, _mx, my, _mz, bstate = curses.getmouse()
+            except curses.error:
+                continue
+            if 0 <= my < list_h:
+                new_pos = viewport + my
+                if 0 <= new_pos < len(visible):
+                    cursor_pos = new_pos
+                    cursor_ni = visible[cursor_pos]
+                    n = nodes[cursor_ni]
+                    if bstate & curses.BUTTON1_DOUBLE_CLICKED and n.is_dir:
+                        n.expanded = not n.expanded
+                    else:
+                        cascade_check(nodes, cursor_ni, not n.checked)
+            continue
+
+        if ch in (curses.KEY_DOWN, ord("j")):
+            cursor_pos = min(cursor_pos + 1, len(visible) - 1)
+            cursor_ni = visible[cursor_pos]
+        elif ch in (curses.KEY_UP, ord("k")):
+            cursor_pos = max(cursor_pos - 1, 0)
+            cursor_ni = visible[cursor_pos]
+        elif ch == curses.KEY_NPAGE:
+            cursor_pos = min(cursor_pos + list_h, len(visible) - 1)
+            cursor_ni = visible[cursor_pos]
+        elif ch == curses.KEY_PPAGE:
+            cursor_pos = max(cursor_pos - list_h, 0)
+            cursor_ni = visible[cursor_pos]
+        elif ch in (curses.KEY_HOME, ord("g")):
+            cursor_pos = 0
+            cursor_ni = visible[0]
+        elif ch in (curses.KEY_END, ord("G")):
+            cursor_pos = len(visible) - 1
+            cursor_ni = visible[cursor_pos]
+        elif ch == ord(" "):
+            cascade_check(nodes, cursor_ni, not nodes[cursor_ni].checked)
+        elif ch in (curses.KEY_RIGHT, ord("l")):
+            if nodes[cursor_ni].is_dir:
+                nodes[cursor_ni].expanded = True
+        elif ch in (curses.KEY_LEFT, ord("h")):
+            n = nodes[cursor_ni]
+            if n.is_dir and n.expanded:
+                n.expanded = False
+            elif n.parent is not None:
+                cursor_ni = n.parent
+        elif ch == ord("E"):
+            for nn in nodes:
+                if nn.is_dir:
+                    nn.expanded = True
+        elif ch == ord("C"):
+            for nn in nodes:
+                if nn.is_dir:
+                    nn.expanded = False
+        elif ch == ord("/"):
+            filter_active = True
+        elif ch == 27:
+            filter_buf = ""
+        elif ch == ord("a"):
+            any_unchecked = any(not nodes[v].checked for v in visible)
+            for v in visible:
+                cascade_check(nodes, v, any_unchecked)
+        elif ch == ord("s"):
+            sort_mode = "size" if sort_mode == "alpha" else "alpha"
+        elif ch == ord("d"):
+            destination = cycle_destination(destination, cycle_allowed)
+        elif ch == ord("t"):
+            include_tree = not include_tree
+        elif ch == ord("p"):
+            preview_visible = not preview_visible
+        elif ch in (10, 13):
+            break
+        elif ch in (ord("q"), 3):
+            cancelled = True
+            break
 
     if cancelled:
         return None
@@ -1109,6 +1128,32 @@ def pick(
         destination=destination,
         include_tree=include_tree,
     )
+
+
+def pick(
+    nodes: list[Node],
+    root: Path | None = None,
+    initial_destination: Destination = Destination.FILE,
+    initial_include_tree: bool = True,
+) -> PickResult | None:
+    """CLI entry: run `_picker_ui` under its own `curses.wrapper`.
+
+    The launcher TUI calls `_picker_ui` directly (curses.wrapper can't nest).
+    """
+    if not nodes:
+        return PickResult(set(), initial_destination, initial_include_tree)
+    holder: dict = {"result": None}
+    try:
+        curses.wrapper(
+            lambda stdscr: holder.__setitem__(
+                "result",
+                _picker_ui(stdscr, nodes, root, initial_destination,
+                           initial_include_tree, allow_stdout=True),
+            )
+        )
+    except KeyboardInterrupt:
+        return None
+    return holder["result"]
 
 
 # ---------- output ----------
@@ -3349,7 +3394,7 @@ class Screen:
     def render(self, stdscr) -> None:  # pragma: no cover - curses I/O
         raise NotImplementedError
 
-    def handle_key(self, ch: int):  # -> ScreenAction | Screen  # pragma: no cover
+    def handle_key(self, ch: int, stdscr=None):  # -> ScreenAction | Screen  # pragma: no cover
         raise NotImplementedError
 
 
@@ -3392,7 +3437,7 @@ def run_app(initial: Screen) -> None:  # pragma: no cover - curses I/O
             if ch == ord("?"):
                 show_help_modal(stdscr, current.help_lines)
                 continue
-            result = current.handle_key(ch)
+            result = current.handle_key(ch, stdscr)
             if isinstance(result, Screen):
                 stack.append(result)
             elif result == ScreenAction.BACK:
@@ -3451,7 +3496,7 @@ class LauncherScreen(Screen):
         except curses.error:
             pass
 
-    def handle_key(self, ch: int):
+    def handle_key(self, ch: int, stdscr=None):
         if ch in (curses.KEY_DOWN, ord("j")):
             self.cursor = (self.cursor + 1) % len(self.tiles)
             return ScreenAction.CONTINUE
@@ -3476,12 +3521,7 @@ def _launcher_open(verb: str):
     if verb == "Rebuild":
         return RebuildScreen()
     if verb == "Bundle":
-        return PlaceholderScreen(
-            "Bundle",
-            "Run `nomnom .` from a shell to open the picker. "
-            "Launching the picker from inside the app shell is wired up in a "
-            "follow-up slice.",
-        )
+        return BundleScreen()
     return PlaceholderScreen(
         verb,
         f"`nomnom {verb.lower()}` works from the shell. A dedicated TUI "
@@ -3518,7 +3558,7 @@ class PlaceholderScreen(Screen):
         except curses.error:
             pass
 
-    def handle_key(self, ch: int):
+    def handle_key(self, ch: int, stdscr=None):
         if ch in (ord("q"), 3, 27):
             return ScreenAction.BACK
         return ScreenAction.CONTINUE
@@ -3611,11 +3651,8 @@ class RebuildScreen(Screen):
         except curses.error:
             pass
         if self.step == "input":
-            try:
-                stdscr.addstr(2, 2, "Bundle path:", theme["dim"])
-                stdscr.addstr(3, 2, "> " + self.path_buf, 0)
-            except curses.error:
-                pass
+            _text_input_field(stdscr, 2, 2, "Bundle path:", self.path_buf,
+                              theme, max(1, w - 4))
             if self.error:
                 try:
                     stdscr.addstr(5, 2, f"error: {self.error}", theme["dim"])
@@ -3651,7 +3688,7 @@ class RebuildScreen(Screen):
         except curses.error:
             pass
 
-    def handle_key(self, ch: int):
+    def handle_key(self, ch: int, stdscr=None):
         if self.step == "input":
             if ch in (ord("q"), 3, 27):
                 return ScreenAction.BACK
@@ -3748,7 +3785,7 @@ class ExtensionsScreen(Screen):
         except curses.error:
             pass
 
-    def handle_key(self, ch: int):
+    def handle_key(self, ch: int, stdscr=None):
         if ch in (ord("q"), 3, 27):
             return ScreenAction.BACK
         if ch in (curses.KEY_DOWN, ord("j")):
@@ -3825,7 +3862,7 @@ class PinsScreen(Screen):
         except curses.error:
             pass
 
-    def handle_key(self, ch: int):
+    def handle_key(self, ch: int, stdscr=None):
         if ch in (ord("q"), 3, 27):
             return ScreenAction.BACK
         if not self.peers:
@@ -3841,6 +3878,132 @@ class PinsScreen(Screen):
             if self.cursor >= len(self.peers) and self.peers:
                 self.cursor = len(self.peers) - 1
             self.message = f"dropped {', '.join(dropped) or name}."
+        return ScreenAction.CONTINUE
+
+
+class BundleScreen(Screen):
+    """Two-step bundle flow inside the TUI: enter a repo path, then pick.
+
+    Step 1 ('path'): user types the repo to bundle (default cwd). Enter
+                     validates `is_dir`, scans, then opens the picker.
+    Step 2 ('done'): writes the bundle via `_emit_bundle` (file/clipboard
+                     /send only — STDOUT is hidden from the picker cycle
+                     because curses owns the terminal). Esc returns to
+                     the launcher."""
+
+    title = "Bundle"
+    help_lines = [
+        "type a repo path; enter to scan",
+        "in picker: d cycles file/clipboard/send, t toggles tree, p preview",
+        "esc / q from input mode returns to launcher",
+    ]
+
+    def __init__(self) -> None:
+        self.step = "path"
+        self.path_buf = str(Path.cwd())
+        self.error = ""
+        self.messages: list[str] = []
+
+    def _scan_and_pick(self, stdscr) -> bool:
+        """Validate path → scan → pick → emit. Returns False to send the
+        screen back to the launcher (cancelled), True to stay (error or
+        done state). All status is recorded on self for `render` to show."""
+        self.error = ""
+        self.messages = []
+        root = Path(self.path_buf.strip()).expanduser().resolve()
+        if not root.is_dir():
+            self.error = f"not a directory: {root}"
+            return True
+        repo_name = root.name
+        if not repo_name:
+            self.error = f"cannot derive a repo name from {root}"
+            return True
+
+        gi = load_gitignore(root)
+        items = scan_repo(root, gi, skip_secrets=True)
+        file_items = [it for it in items if not it.is_dir]
+        if not file_items:
+            self.error = "no files found after applying excludes."
+            return True
+
+        stats = collect_stats(root, items)
+        nodes = build_tree(items, stats=stats)
+
+        result = _picker_ui(stdscr, nodes, root=root, allow_stdout=False)
+        if result is None:
+            return False
+        if not result.selected:
+            self.error = "no files selected."
+            self.step = "done"
+            return True
+
+        selected = sorted(result.selected)
+        rc, lines = _emit_bundle(
+            repo_name, root, selected, result.include_tree, result.destination,
+        )
+        self.messages = lines
+        if rc != 0 and lines:
+            self.error = lines[-1]
+        self.step = "done"
+        return True
+
+    def render(self, stdscr) -> None:  # pragma: no cover - curses I/O
+        theme = _setup_theme()
+        h, w = stdscr.getmaxyx()
+        try:
+            stdscr.addstr(0, 0, f" {self.title} ".ljust(max(1, w - 1)),
+                          theme["filter"])
+        except curses.error:
+            pass
+        if self.step == "path":
+            _text_input_field(stdscr, 2, 2, "Repo path:", self.path_buf, theme,
+                              max(1, w - 4))
+            if self.error:
+                try:
+                    stdscr.addstr(5, 2, f"error: {self.error}", theme["dim"])
+                except curses.error:
+                    pass
+            footer = "enter:scan  esc/q:back  ?:help"
+        else:  # done
+            row = 2
+            for line in self.messages:
+                if row >= h - 1:
+                    break
+                try:
+                    stdscr.addstr(row, 2, line[: max(1, w - 3)], 0)
+                except curses.error:
+                    pass
+                row += 1
+            if self.error:
+                try:
+                    stdscr.addstr(row + 1, 2, f"error: {self.error}",
+                                  theme["dim"])
+                except curses.error:
+                    pass
+            footer = "esc/q:back  ?:help"
+        try:
+            stdscr.addstr(h - 1, 0, footer[: max(1, w - 1)], theme["dim"])
+        except curses.error:
+            pass
+
+    def handle_key(self, ch: int, stdscr=None):
+        if self.step == "path":
+            if ch in (ord("q"), 3, 27):
+                return ScreenAction.BACK
+            if ch in (10, 13):
+                if stdscr is None:
+                    return ScreenAction.CONTINUE
+                stay = self._scan_and_pick(stdscr)
+                return ScreenAction.CONTINUE if stay else ScreenAction.BACK
+            if ch in (curses.KEY_BACKSPACE, 127, 8):
+                self.path_buf = self.path_buf[:-1]
+                return ScreenAction.CONTINUE
+            if 32 <= ch < 127:
+                self.path_buf += chr(ch)
+            return ScreenAction.CONTINUE
+        # done
+        if ch in (ord("q"), 3, 27, 10, 13):
+            return ScreenAction.BACK
         return ScreenAction.CONTINUE
 
 
@@ -3861,6 +4024,26 @@ def _wrap(text: str, width: int) -> list[str]:
                 line = word
         out.append(line)
     return out
+
+
+def _text_input_field(
+    stdscr, y: int, x: int, label: str, buf: str, theme,
+    width: int = -1,
+) -> None:  # pragma: no cover - curses I/O
+    """Render `label` on row `y` and `> buf` on row `y+1` at column `x`.
+
+    Used by every screen that takes a free-text field (path, PR number,
+    extension value). The caller owns the input state; this helper only
+    draws. Clips long buffers to `width` (use the screen's available
+    columns)."""
+    try:
+        stdscr.addstr(y, x, label, theme["dim"])
+        line = "> " + buf
+        if width > 0:
+            line = line[:width]
+        stdscr.addstr(y + 1, x, line, 0)
+    except curses.error:
+        pass
 
 
 # ---------- main ----------
@@ -4125,6 +4308,50 @@ SUBCOMMANDS = (
 )
 
 
+def _emit_bundle(
+    repo_name: str,
+    root: Path,
+    selected: list[str],
+    include_tree: bool,
+    destination: Destination,
+) -> tuple[int, list[str]]:
+    """Render the bundle and dispatch to the chosen destination.
+
+    Returns (rc, status lines). The CLI prints the lines to stderr; the
+    TUI displays them on the done screen. STDOUT and SEND may still
+    write to their own streams as a side effect of dispatching."""
+    tree_str = render_ascii_tree(selected, repo_name) if include_tree else None
+    output = render_output(repo_name, root, selected, tree_str)
+
+    if destination == Destination.STDOUT:
+        sys.stdout.write(output)
+        sys.stdout.flush()
+        return 0, [f"wrote {len(output):,} bytes to stdout."]
+
+    if destination == Destination.SEND:
+        name = f"{repo_name}-{datetime.now().strftime('%Y%m%d-%H%M%S')}.txt"
+        rc = _lan_send_bytes(name, output.encode("utf-8"))
+        return rc, []
+
+    messages: list[str] = []
+    if destination == Destination.CLIPBOARD:
+        if copy_to_clipboard(output):
+            return 0, [f"copied {len(output):,} bytes to clipboard."]
+        messages.append(
+            "no clipboard tool found (pbcopy/wl-copy/xclip/xsel); "
+            "falling back to a file."
+        )
+
+    out_path = pick_output_path(repo_name)
+    try:
+        out_path.write_text(output, encoding="utf-8")
+    except OSError as e:
+        messages.append(f"error writing output: {e}")
+        return 1, messages
+    messages.append(f"wrote {out_path}")
+    return 0, messages
+
+
 def main() -> int:
     if len(sys.argv) >= 2 and sys.argv[1] in SUBCOMMANDS:
         return _dispatch_subcommand(sys.argv[1:])
@@ -4264,37 +4491,10 @@ def main() -> int:
         include_tree = result.include_tree
         destination = result.destination
 
-    tree_str = render_ascii_tree(selected, repo_name) if include_tree else None
-    output = render_output(repo_name, root, selected, tree_str)
-
-    if destination == Destination.STDOUT:
-        sys.stdout.write(output)
-        sys.stdout.flush()
-        print(f"wrote {len(output):,} bytes to stdout.", file=sys.stderr)
-        return 0
-
-    if destination == Destination.SEND:
-        name = f"{repo_name}-{datetime.now().strftime('%Y%m%d-%H%M%S')}.txt"
-        return _lan_send_bytes(name, output.encode("utf-8"))
-
-    if destination == Destination.CLIPBOARD:
-        if copy_to_clipboard(output):
-            print(f"copied {len(output):,} bytes to clipboard.", file=sys.stderr)
-            return 0
-        print(
-            "no clipboard tool found (pbcopy/wl-copy/xclip/xsel); "
-            "falling back to a file.",
-            file=sys.stderr,
-        )
-
-    out_path = pick_output_path(repo_name)
-    try:
-        out_path.write_text(output, encoding="utf-8")
-    except OSError as e:
-        print(f"error writing output: {e}", file=sys.stderr)
-        return 1
-    print(f"wrote {out_path}", file=sys.stderr)
-    return 0
+    rc, lines = _emit_bundle(repo_name, root, selected, include_tree, destination)
+    for line in lines:
+        print(line, file=sys.stderr)
+    return rc
 
 
 if __name__ == "__main__":

@@ -452,6 +452,22 @@ class TestCycleDestination:
     def test_send_wraps_to_file(self):
         assert nomnom.cycle_destination(nomnom.Destination.SEND) == nomnom.Destination.FILE
 
+    def test_allowed_subset_cycles_without_stdout(self):
+        allowed = (nomnom.Destination.FILE, nomnom.Destination.CLIPBOARD,
+                   nomnom.Destination.SEND)
+        # FILE → CLIPBOARD → SEND → FILE; STDOUT is never hit.
+        d = nomnom.Destination.FILE
+        for expected in (nomnom.Destination.CLIPBOARD, nomnom.Destination.SEND,
+                         nomnom.Destination.FILE):
+            d = nomnom.cycle_destination(d, allowed)
+            assert d == expected
+
+    def test_allowed_snaps_to_first_when_current_not_allowed(self):
+        allowed = (nomnom.Destination.FILE, nomnom.Destination.CLIPBOARD)
+        # STDOUT is not in allowed → snap to the first allowed entry.
+        assert nomnom.cycle_destination(nomnom.Destination.STDOUT, allowed) \
+            == nomnom.Destination.FILE
+
 
 class TestComputeSummary:
     def _node(self, rel, *, is_dir=False, checked=False, size=0):
@@ -716,6 +732,136 @@ class TestPinsScreen:
         nomnom._save_known_peer("dev-1", "alice", "aa")
         s = nomnom.PinsScreen()
         assert s.handle_key(ord("x")) == nomnom.ScreenAction.CONTINUE
+
+
+class TestBundleScreen:
+    def test_init_defaults_to_cwd(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        s = nomnom.BundleScreen()
+        assert s.step == "path"
+        assert s.path_buf == str(tmp_path)
+        assert s.error == ""
+
+    def test_path_edit_appends_chars(self):
+        s = nomnom.BundleScreen()
+        s.path_buf = ""
+        s.handle_key(ord("/"))
+        s.handle_key(ord("a"))
+        assert s.path_buf == "/a"
+
+    def test_path_edit_backspace(self):
+        s = nomnom.BundleScreen()
+        s.path_buf = "/abc"
+        s.handle_key(127)  # backspace
+        assert s.path_buf == "/ab"
+
+    def test_q_in_path_returns_back(self):
+        s = nomnom.BundleScreen()
+        assert s.handle_key(ord("q")) == nomnom.ScreenAction.BACK
+        assert s.handle_key(27) == nomnom.ScreenAction.BACK
+
+    def test_enter_without_stdscr_is_a_noop(self):
+        s = nomnom.BundleScreen()
+        assert s.handle_key(10) == nomnom.ScreenAction.CONTINUE
+        # _scan_and_pick should not have been entered.
+        assert s.step == "path"
+
+    def test_scan_invalid_path_sets_error(self, tmp_path):
+        s = nomnom.BundleScreen()
+        s.path_buf = str(tmp_path / "does-not-exist")
+        stay = s._scan_and_pick(stdscr=None)  # _picker_ui won't be reached
+        assert stay is True
+        assert s.step == "path"
+        assert "not a directory" in s.error
+
+    def test_scan_empty_repo_sets_error(self, tmp_path):
+        # Empty dir → scan returns no file items → records error before
+        # touching _picker_ui, so a None stdscr is fine.
+        s = nomnom.BundleScreen()
+        s.path_buf = str(tmp_path)
+        stay = s._scan_and_pick(stdscr=None)
+        assert stay is True
+        assert s.step == "path"
+        assert "no files found" in s.error
+
+    def test_scan_happy_path(self, tmp_path, monkeypatch):
+        make_repo(tmp_path, {"a.py": "print('a')\n"})
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        monkeypatch.chdir(out_dir)
+
+        # Stub the picker to return a deterministic selection.
+        def fake_picker(stdscr, nodes, **kw):
+            return nomnom.PickResult({"a.py"}, nomnom.Destination.FILE, True)
+        monkeypatch.setattr(nomnom, "_picker_ui", fake_picker)
+
+        s = nomnom.BundleScreen()
+        s.path_buf = str(tmp_path)
+        stay = s._scan_and_pick(stdscr=object())  # opaque, not used by fake
+        assert stay is True
+        assert s.step == "done"
+        # File written into out_dir (cwd) by _emit_bundle.
+        bundles = list(out_dir.glob(f"{tmp_path.name}-*.txt"))
+        assert len(bundles) == 1
+        assert any("wrote" in m for m in s.messages)
+
+    def test_scan_cancelled_picker_goes_back(self, tmp_path, monkeypatch):
+        make_repo(tmp_path, {"a.py": "x\n"})
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(nomnom, "_picker_ui",
+                            lambda *a, **kw: None)  # cancel
+        s = nomnom.BundleScreen()
+        s.path_buf = str(tmp_path)
+        stay = s._scan_and_pick(stdscr=object())
+        assert stay is False
+        assert s.step == "path"  # unchanged; caller sends to launcher
+
+    def test_done_state_esc_returns_back(self):
+        s = nomnom.BundleScreen()
+        s.step = "done"
+        s.messages = ["wrote foo.txt"]
+        assert s.handle_key(27) == nomnom.ScreenAction.BACK
+        assert s.handle_key(ord("q")) == nomnom.ScreenAction.BACK
+
+
+class TestEmitBundle:
+    def test_file_destination_writes(self, tmp_path, monkeypatch):
+        make_repo(tmp_path, {"a.py": "print('a')\n"})
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        monkeypatch.chdir(out_dir)
+        rc, lines = nomnom._emit_bundle(
+            tmp_path.name, tmp_path, ["a.py"], True, nomnom.Destination.FILE,
+        )
+        assert rc == 0
+        bundles = list(out_dir.glob(f"{tmp_path.name}-*.txt"))
+        assert len(bundles) == 1
+        assert "wrote " in lines[-1]
+
+    def test_clipboard_falls_back_to_file_when_no_tool(self, tmp_path, monkeypatch):
+        make_repo(tmp_path, {"a.py": "x\n"})
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        monkeypatch.chdir(out_dir)
+        monkeypatch.setattr(nomnom, "copy_to_clipboard", lambda _t: False)
+        rc, lines = nomnom._emit_bundle(
+            tmp_path.name, tmp_path, ["a.py"], True,
+            nomnom.Destination.CLIPBOARD,
+        )
+        assert rc == 0
+        assert any("no clipboard tool" in line for line in lines)
+        assert any("wrote " in line for line in lines)
+
+    def test_stdout_writes_to_stdout(self, tmp_path, capsys):
+        make_repo(tmp_path, {"a.py": "x\n"})
+        rc, lines = nomnom._emit_bundle(
+            tmp_path.name, tmp_path, ["a.py"], False,
+            nomnom.Destination.STDOUT,
+        )
+        assert rc == 0
+        captured = capsys.readouterr()
+        assert "<file path=\"a.py\">" in captured.out
+        assert any("stdout" in line for line in lines)
 
 
 class TestNomnomError:
