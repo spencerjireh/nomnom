@@ -1,8 +1,9 @@
 """Tests for nomnom.py.
 
 Covers the pure-logic surface: gitignore matching, repo scanning,
-tree model, selection cascade, output rendering, and last-selection
-persistence. The curses picker (`pick`) is excluded — it needs a TTY.
+tree model, selection cascade, output rendering, and the destination/
+summary/footer helpers extracted from the picker. The curses `pick`
+loop itself is excluded — it needs a TTY.
 """
 
 from __future__ import annotations
@@ -436,72 +437,407 @@ class TestPickOutputPath:
         assert p3.name == f"repo-{fixed}-3.txt"
 
 
-# ---------- last selection ----------
+# ---------- picker state helpers ----------
 
-class TestLastSelection:
-    @pytest.fixture(autouse=True)
-    def _fake_home(self, tmp_path, monkeypatch):
-        home = tmp_path / "_home"
-        home.mkdir()
-        monkeypatch.setenv("HOME", str(home))
+class TestCycleDestination:
+    def test_file_to_clipboard(self):
+        assert nomnom.cycle_destination(nomnom.Destination.FILE) == nomnom.Destination.CLIPBOARD
 
-    @pytest.fixture
-    def repo(self, tmp_path):
-        r = tmp_path / "repo"
-        r.mkdir()
-        return r
+    def test_clipboard_to_stdout(self):
+        assert nomnom.cycle_destination(nomnom.Destination.CLIPBOARD) == nomnom.Destination.STDOUT
 
-    def test_save_writes_outside_target_repo(self, repo):
-        nomnom.save_last_selection(repo, ["a.py"])
-        assert not (repo / ".nomnom-last.json").exists()
-        assert nomnom._cache_path_for(repo).exists()
+    def test_stdout_to_send(self):
+        assert nomnom.cycle_destination(nomnom.Destination.STDOUT) == nomnom.Destination.SEND
 
-    def test_save_and_load_roundtrip(self, repo):
-        nomnom.save_last_selection(repo, ["a.py", "src/b.py"])
-        out = nomnom.load_last_selection(repo)
-        assert out == ["a.py", "src/b.py"]
+    def test_send_wraps_to_file(self):
+        assert nomnom.cycle_destination(nomnom.Destination.SEND) == nomnom.Destination.FILE
 
-    def test_load_missing_returns_none(self, repo):
-        assert nomnom.load_last_selection(repo) is None
 
-    def test_load_invalid_json_returns_none(self, repo):
-        p = nomnom._cache_path_for(repo)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text("{not json")
-        assert nomnom.load_last_selection(repo) is None
-
-    def test_load_wrong_shape_returns_none(self, repo):
-        p = nomnom._cache_path_for(repo)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(
-            json.dumps(
-                {"repo_path": str(repo.resolve()), "selected": [1, 2, 3]}
-            )
+class TestComputeSummary:
+    def _node(self, rel, *, is_dir=False, checked=False, size=0):
+        return nomnom.Node(
+            rel=rel, name=rel.rsplit("/", 1)[-1], is_dir=is_dir,
+            depth=rel.count("/"), parent=None,
+            checked=checked, size=size,
         )
-        assert nomnom.load_last_selection(repo) is None
 
-    def test_load_repo_path_mismatch_returns_none(self, repo):
-        p = nomnom._cache_path_for(repo)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(
-            json.dumps(
-                {"repo_path": "/some/other/path", "selected": ["a.py"]}
-            )
+    def test_empty_selection(self):
+        nodes = [self._node("a.py", size=100), self._node("b.py", size=200)]
+        assert nomnom.compute_summary(nodes) == (0, 0, 0)
+
+    def test_mixed_excludes_dirs(self):
+        nodes = [
+            self._node("src", is_dir=True, checked=True, size=999),
+            self._node("src/a.py", checked=True, size=400),
+            self._node("src/b.py", checked=False, size=800),
+            self._node("c.py", checked=True, size=400),
+        ]
+        # Two checked files, 800 bytes total, 200 approx tokens.
+        assert nomnom.compute_summary(nodes) == (2, 800, 200)
+
+    def test_all_checked(self):
+        nodes = [
+            self._node("a.py", checked=True, size=400),
+            self._node("b.py", checked=True, size=600),
+        ]
+        assert nomnom.compute_summary(nodes) == (2, 1000, 250)
+
+
+class TestFormatFooter:
+    def test_each_destination_label(self):
+        for dest, label in [
+            (nomnom.Destination.FILE, "dest: file"),
+            (nomnom.Destination.CLIPBOARD, "dest: clipboard"),
+            (nomnom.Destination.STDOUT, "dest: stdout"),
+        ]:
+            out = nomnom.format_footer(dest, True, (3, 1000, 250), 120)
+            assert label in out
+
+    def test_tree_toggle_flips(self):
+        on = nomnom.format_footer(nomnom.Destination.FILE, True, (1, 100, 25), 120)
+        off = nomnom.format_footer(nomnom.Destination.FILE, False, (1, 100, 25), 120)
+        assert "tree: on" in on
+        assert "tree: off" in off
+
+    def test_narrow_width_drops_stats_block(self):
+        # Wide enough for "selected: 2 files" + gap + "dest: file  tree: on"
+        # but not the size/token block in between.
+        narrow = nomnom.format_footer(nomnom.Destination.FILE, True, (2, 1000, 250), 50)
+        assert "selected: 2 files" in narrow
+        assert "dest: file" in narrow
+        assert len(narrow) <= 50
+
+    def test_wide_width_includes_everything(self):
+        out = nomnom.format_footer(nomnom.Destination.FILE, True, (5, 4096, 1024), 120)
+        assert "selected: 5 files" in out
+        assert "dest: file" in out
+        assert "tree: on" in out
+        assert len(out) <= 120
+
+
+# ---------- --include / --exclude filters ----------
+
+class TestApplyIncludeExclude:
+    def _items(self, *rels_and_dirs):
+        out = []
+        for rel, is_dir in rels_and_dirs:
+            out.append(nomnom.ScanItem(rel=rel, is_dir=is_dir))
+        return out
+
+    def test_empty_patterns_passthrough(self):
+        items = self._items(("a.py", False), ("src", True), ("src/b.py", False))
+        assert nomnom.apply_include_exclude(items, [], []) == items
+
+    def test_include_filters_files_and_keeps_parent_dirs(self):
+        items = self._items(
+            ("src", True), ("src/a.py", False), ("src/a.js", False),
+            ("tests", True), ("tests/test_a.py", False),
         )
-        assert nomnom.load_last_selection(repo) is None
+        out = nomnom.apply_include_exclude(items, ["*.py"], [])
+        rels = [(it.rel, it.is_dir) for it in out]
+        assert ("src/a.py", False) in rels
+        assert ("tests/test_a.py", False) in rels
+        assert ("src/a.js", False) not in rels
+        # Parent dirs survive because their files survive.
+        assert ("src", True) in rels
+        assert ("tests", True) in rels
 
-    def test_save_is_deterministically_sorted(self, repo):
-        nomnom.save_last_selection(repo, ["z.py", "a.py", "m.py"])
-        data = json.loads(nomnom._cache_path_for(repo).read_text())
-        assert data["selected"] == ["a.py", "m.py", "z.py"]
-        assert data["repo_path"] == str(repo.resolve())
-
-    def test_save_silently_skips_when_unwritable(self, repo, monkeypatch):
-        monkeypatch.setattr(
-            nomnom, "_cache_path_for",
-            lambda _root: Path("/dev/null/nope.json"),
+    def test_exclude_drops_matching(self):
+        items = self._items(
+            ("src/a.py", False), ("src/test_a.py", False),
         )
-        nomnom.save_last_selection(repo, ["a.py"])
+        out = nomnom.apply_include_exclude(items, [], ["test_*"])
+        rels = [it.rel for it in out]
+        assert "src/a.py" in rels
+        assert "src/test_a.py" not in rels
+
+    def test_include_then_exclude(self):
+        items = self._items(
+            ("src/a.py", False), ("src/test_a.py", False),
+            ("src/b.js", False),
+        )
+        out = nomnom.apply_include_exclude(items, ["*.py"], ["test_*"])
+        rels = [it.rel for it in out]
+        assert rels == ["src/a.py"] or "src/a.py" in rels
+        assert "src/test_a.py" not in rels
+        assert "src/b.js" not in rels
+
+    def test_deep_double_star(self):
+        items = self._items(
+            ("a", True), ("a/b", True), ("a/b/c.py", False),
+            ("a/d.js", False),
+        )
+        out = nomnom.apply_include_exclude(items, ["**/*.py"], [])
+        rels = [it.rel for it in out if not it.is_dir]
+        assert rels == ["a/b/c.py"]
+
+    def test_anchored_pattern(self):
+        items = self._items(
+            ("src/a.py", False), ("nested/src/a.py", False),
+        )
+        # Leading slash anchors at repo root.
+        out = nomnom.apply_include_exclude(items, ["/src/"], [])
+        rels = [it.rel for it in out if not it.is_dir]
+        assert "src/a.py" in rels
+        assert "nested/src/a.py" not in rels
+
+
+# ---------- launcher screen ----------
+
+class TestLauncherScreen:
+    def test_tiles_include_every_verb(self):
+        s = nomnom.LauncherScreen()
+        labels = [t[0] for t in s.tiles]
+        for v in ("Bundle", "Commit", "PR", "Review", "Rebuild",
+                  "Send", "Receive", "Extensions", "Pins"):
+            assert v in labels
+
+    def test_cursor_wraps_down(self):
+        s = nomnom.LauncherScreen()
+        # Move past the end; should wrap to top.
+        for _ in range(len(s.tiles)):
+            s.handle_key(ord("j"))
+        assert s.cursor == 0
+
+    def test_cursor_wraps_up(self):
+        s = nomnom.LauncherScreen()
+        s.handle_key(ord("k"))
+        assert s.cursor == len(s.tiles) - 1
+
+    def test_q_quits(self):
+        s = nomnom.LauncherScreen()
+        assert s.handle_key(ord("q")) == nomnom.ScreenAction.QUIT
+        assert s.handle_key(27) == nomnom.ScreenAction.QUIT  # Esc
+
+    def test_enter_pushes_a_screen(self):
+        s = nomnom.LauncherScreen()
+        result = s.handle_key(10)
+        assert isinstance(result, nomnom.Screen)
+
+
+class TestPlaceholderScreen:
+    def test_q_returns_back(self):
+        s = nomnom.PlaceholderScreen("Test", "body")
+        assert s.handle_key(ord("q")) == nomnom.ScreenAction.BACK
+        assert s.handle_key(27) == nomnom.ScreenAction.BACK
+
+    def test_other_keys_continue(self):
+        s = nomnom.PlaceholderScreen("Test", "body")
+        assert s.handle_key(ord("x")) == nomnom.ScreenAction.CONTINUE
+
+
+class TestRebuildScreen:
+    def _make_bundle(self, tmp_path, repo="r", files=(("a.py", "x\n"),)) -> Path:
+        body = (
+            f"This is a packed representation of selected files from {repo}, "
+            "bundled on 2026-05-23T10:00:00.\n\n"
+        )
+        for rel, content in files:
+            body += f'<file path="{rel}">\n{content}</file>\n\n'
+        p = tmp_path / "bundle.txt"
+        p.write_text(body, encoding="utf-8")
+        return p
+
+    def test_parse_populates_files(self, tmp_path, monkeypatch):
+        bundle = self._make_bundle(tmp_path)
+        monkeypatch.chdir(tmp_path)
+        s = nomnom.RebuildScreen()
+        s.path_buf = str(bundle)
+        s._parse()
+        assert s.step == "preview"
+        assert s.repo_name == "r"
+        assert [rel for rel, _ in s.files] == ["a.py"]
+        assert s.target is not None
+
+    def test_parse_invalid_path_records_error(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        s = nomnom.RebuildScreen()
+        s.path_buf = str(tmp_path / "missing.txt")
+        s._parse()
+        assert s.step == "input"
+        assert "not a file" in s.error
+
+    def test_write_creates_files(self, tmp_path, monkeypatch):
+        bundle = self._make_bundle(tmp_path, files=(("a.py", "hi\n"),))
+        cwd = tmp_path / "out"
+        cwd.mkdir()
+        monkeypatch.chdir(cwd)
+        s = nomnom.RebuildScreen()
+        s.path_buf = str(bundle)
+        s._parse()
+        s._write()
+        assert s.step == "done"
+        assert (cwd / "r" / "a.py").read_text().rstrip("\n") == "hi"
+
+    def test_q_in_input_returns_back(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        s = nomnom.RebuildScreen()
+        assert s.handle_key(ord("q")) == nomnom.ScreenAction.BACK
+
+
+class TestExtensionsScreen:
+    def test_loads_all_four_sections(self):
+        s = nomnom.ExtensionsScreen()
+        labels = [section[0] for section in s.sections]
+        assert labels == [
+            "Text extensions", "Binary extensions",
+            "Known text names", "Secret patterns",
+        ]
+
+    def test_known_text_extension_present(self):
+        s = nomnom.ExtensionsScreen()
+        text_section = next(e for label, e in s.sections if label == "Text extensions")
+        assert ".py" in text_section
+
+    def test_q_returns_back(self):
+        s = nomnom.ExtensionsScreen()
+        assert s.handle_key(ord("q")) == nomnom.ScreenAction.BACK
+
+
+class TestPinsScreen:
+    def test_empty_when_no_peers(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        s = nomnom.PinsScreen()
+        assert s.peers == []
+        assert s.handle_key(ord("q")) == nomnom.ScreenAction.BACK
+
+    def test_drop_removes_pin(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        nomnom._save_known_peer("dev-1", "alice", "aa")
+        nomnom._save_known_peer("dev-2", "bob", "bb")
+        s = nomnom.PinsScreen()
+        assert len(s.peers) == 2
+        s.handle_key(ord("d"))
+        assert len(s.peers) == 1
+        assert "dropped" in s.message
+
+    def test_other_keys_are_inert(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        nomnom._save_known_peer("dev-1", "alice", "aa")
+        s = nomnom.PinsScreen()
+        assert s.handle_key(ord("x")) == nomnom.ScreenAction.CONTINUE
+
+
+class TestNomnomError:
+    def test_require_git_repo_raises_on_non_repo(self, tmp_path):
+        # tmp_path is not a git repo.
+        with pytest.raises(nomnom.NomnomError):
+            nomnom._require_git_repo(tmp_path)
+
+    def test_require_gh_raises_when_missing(self, monkeypatch):
+        monkeypatch.setattr(nomnom.shutil, "which", lambda _x: None)
+        with pytest.raises(nomnom.NomnomError):
+            nomnom._require_gh()
+
+
+# ---------- preview pane ----------
+
+class TestRenderPreview:
+    def test_text_head(self, tmp_path):
+        p = tmp_path / "a.py"
+        p.write_text("line1\nline2\nline3\nline4\n")
+        out = nomnom.render_preview(p, max_lines=3, max_cols=80)
+        assert out == ["line1", "line2", "line3"]
+
+    def test_binary_returns_stats_only(self, tmp_path):
+        p = tmp_path / "blob.png"
+        p.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 100)
+        out = nomnom.render_preview(p, max_lines=10, max_cols=80)
+        assert len(out) == 1
+        assert "binary" in out[0]
+
+    def test_oversize_returns_stats_only(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(nomnom, "PREVIEW_MAX_BYTES", 10)
+        p = tmp_path / "big.txt"
+        p.write_text("a" * 100)
+        out = nomnom.render_preview(p, max_lines=10, max_cols=80)
+        assert len(out) == 1
+        assert "too large" in out[0]
+
+    def test_missing_file_returns_unreadable(self, tmp_path):
+        out = nomnom.render_preview(tmp_path / "nope.txt", max_lines=10, max_cols=80)
+        assert out == ["(unreadable)"]
+
+    def test_truncation_respects_max_cols(self, tmp_path):
+        p = tmp_path / "long.txt"
+        p.write_text("a" * 200 + "\n")
+        out = nomnom.render_preview(p, max_lines=1, max_cols=20)
+        assert len(out) == 1
+        assert len(out[0]) <= 20
+
+    def test_empty_file_returns_empty_label(self, tmp_path):
+        p = tmp_path / "empty.txt"
+        p.write_text("")
+        out = nomnom.render_preview(p, max_lines=5, max_cols=40)
+        assert out == ["(empty)"]
+
+
+# ---------- scripted bundle CLI (--all / --include / --stdout) ----------
+
+NOMNOM_PATH = Path(__file__).resolve().parent.parent / "nomnom.py"
+
+
+class TestScriptedBundle:
+    def test_all_stdout_emits_bundle_to_stdout(self, tmp_path):
+        make_repo(tmp_path, {"a.py": "print('a')\n", "b.py": "print('b')\n"})
+        r = subprocess.run(
+            [sys.executable, str(NOMNOM_PATH), "--all", "--stdout", str(tmp_path)],
+            capture_output=True, text=True, check=True,
+        )
+        assert "<file path=\"a.py\">" in r.stdout
+        assert "<file path=\"b.py\">" in r.stdout
+        assert "wrote " in r.stderr
+
+    def test_all_writes_file_to_cwd(self, tmp_path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        make_repo(repo, {"a.py": "print('a')\n"})
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        r = subprocess.run(
+            [sys.executable, str(NOMNOM_PATH), "--all", str(repo)],
+            capture_output=True, text=True, cwd=out_dir, check=True,
+        )
+        bundles = list(out_dir.glob("repo-*.txt"))
+        assert len(bundles) == 1
+        body = bundles[0].read_text()
+        assert "<file path=\"a.py\">" in body
+        assert "wrote " in r.stderr
+
+    def test_include_filters_via_all_stdout(self, tmp_path):
+        make_repo(tmp_path, {
+            "src": {"a.py": "py\n", "b.js": "js\n"},
+            "test_a.py": "t\n",
+        })
+        r = subprocess.run(
+            [sys.executable, str(NOMNOM_PATH), "--all", "--stdout",
+             "--include", "*.py", "--exclude", "test_*", str(tmp_path)],
+            capture_output=True, text=True, check=True,
+        )
+        assert "src/a.py" in r.stdout
+        assert "src/b.js" not in r.stdout
+        assert "test_a.py" not in r.stdout
+
+    def test_no_match_exits_cleanly(self, tmp_path):
+        make_repo(tmp_path, {"a.js": "js\n"})
+        r = subprocess.run(
+            [sys.executable, str(NOMNOM_PATH), "--all", "--stdout",
+             "--include", "*.py", str(tmp_path)],
+            capture_output=True, text=True,
+        )
+        assert r.returncode == 0
+        assert "no files matched" in r.stderr
+        assert r.stdout == ""
+
+    def test_non_tty_without_flags_errors(self, tmp_path):
+        make_repo(tmp_path, {"a.py": "x\n"})
+        r = subprocess.run(
+            [sys.executable, str(NOMNOM_PATH), str(tmp_path)],
+            capture_output=True, text=True,
+            stdin=subprocess.DEVNULL,
+        )
+        assert r.returncode == 1
+        assert "needs a TTY" in r.stderr
 
 
 # ---------- is_binary extension shortcuts ----------
@@ -888,7 +1224,7 @@ class TestCommitBundle:
         out_dir = tmp_path / "out"
         out_dir.mkdir()
         monkeypatch.chdir(out_dir)
-        rc = nomnom.cmd_commit(str(repo), copy=False)
+        rc = nomnom.cmd_commit(str(repo))
         assert rc == 0
 
         bundles = list(out_dir.glob("myrepo-main-commit-*.txt"))
@@ -906,7 +1242,7 @@ class TestCommitBundle:
         repo = tmp_path / "clean"
         make_git_repo(repo, initial={"a.txt": "hi\n"})
         monkeypatch.chdir(tmp_path)
-        rc = nomnom.cmd_commit(str(repo), copy=False)
+        rc = nomnom.cmd_commit(str(repo))
         assert rc == 1
         err = capsys.readouterr().err
         assert "nothing to commit" in err
@@ -917,7 +1253,7 @@ class TestCommitBundle:
         make_git_repo(repo, initial={"a.txt": "hi\n"})
         (repo / "new.txt").write_text("new\n")
         monkeypatch.chdir(tmp_path)
-        rc = nomnom.cmd_commit(str(repo), copy=False)
+        rc = nomnom.cmd_commit(str(repo))
         assert rc == 1
 
     def test_detached_head_uses_sha_in_filename(
@@ -936,36 +1272,48 @@ class TestCommitBundle:
         out_dir = tmp_path / "out"
         out_dir.mkdir()
         monkeypatch.chdir(out_dir)
-        rc = nomnom.cmd_commit(str(repo), copy=False)
+        rc = nomnom.cmd_commit(str(repo))
         assert rc == 0
         bundles = list(out_dir.glob("dh-*-commit-*.txt"))
         assert len(bundles) == 1
         # Short SHA is 7 hex chars; filename infix should not be "main".
         assert "main-commit" not in bundles[0].name
 
-    def test_not_a_git_repo_errors(self, tmp_path, monkeypatch, capsys):
+    def test_not_a_git_repo_errors(self, tmp_path, monkeypatch):
         plain = tmp_path / "plain"
         plain.mkdir()
         monkeypatch.chdir(tmp_path)
-        with pytest.raises(SystemExit) as exc:
-            nomnom.cmd_commit(str(plain), copy=False)
-        assert exc.value.code == 1
-        assert "not a git repository" in capsys.readouterr().err
+        with pytest.raises(nomnom.NomnomError, match="not a git repository"):
+            nomnom.cmd_commit(str(plain))
+
+    def test_stdout_destination_pipes_bundle(self, tmp_path, monkeypatch, capsys):
+        repo = tmp_path / "r"
+        make_git_repo(repo, initial={"a.txt": "1\n"})
+        (repo / "a.txt").write_text("2\n")  # creates unstaged diff
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        monkeypatch.chdir(out_dir)
+        rc = nomnom.cmd_commit(str(repo), destination=nomnom.Destination.STDOUT)
+        assert rc == 0
+        captured = capsys.readouterr()
+        assert '<section name="git_status">' in captured.out
+        # No file written when piping.
+        assert list(out_dir.glob("r-*-commit-*.txt")) == []
+        # Status info goes to stderr now.
+        assert "wrote" in captured.err
 
 
 # ---------- cmd_pr ----------
 
 class TestPrBundle:
-    def test_missing_gh_errors(self, tmp_path, monkeypatch, capsys):
+    def test_missing_gh_errors(self, tmp_path, monkeypatch):
         repo = tmp_path / "p"
         make_git_repo(repo, initial={"a.txt": "1\n"})
         monkeypatch.setattr(nomnom.shutil, "which",
                             lambda name: None if name == "gh" else "/bin/git")
         monkeypatch.chdir(tmp_path)
-        with pytest.raises(SystemExit) as exc:
-            nomnom.cmd_pr(str(repo), copy=False, base=None)
-        assert exc.value.code == 1
-        assert "requires gh" in capsys.readouterr().err
+        with pytest.raises(nomnom.NomnomError, match="requires gh"):
+            nomnom.cmd_pr(str(repo), base=None)
 
     def test_happy_path_no_existing_pr(self, tmp_path, monkeypatch):
         repo = tmp_path / "p"
@@ -989,7 +1337,7 @@ class TestPrBundle:
         out_dir = tmp_path / "out"
         out_dir.mkdir()
         monkeypatch.chdir(out_dir)
-        rc = nomnom.cmd_pr(str(repo), copy=False, base=None)
+        rc = nomnom.cmd_pr(str(repo), base=None)
         assert rc == 0
         bundles = list(out_dir.glob("p-feature-pr-*.txt"))
         assert len(bundles) == 1
@@ -1027,7 +1375,7 @@ class TestPrBundle:
         out_dir = tmp_path / "out"
         out_dir.mkdir()
         monkeypatch.chdir(out_dir)
-        rc = nomnom.cmd_pr(str(repo), copy=False, base=None)
+        rc = nomnom.cmd_pr(str(repo), base=None)
         assert rc == 0
         text = next(out_dir.glob("p-feature-pr-*.txt")).read_text()
         assert "#42: Add feature" in text
@@ -1062,7 +1410,7 @@ class TestPrBundle:
         out_dir = tmp_path / "out"
         out_dir.mkdir()
         monkeypatch.chdir(out_dir)
-        rc = nomnom.cmd_pr(str(repo), copy=False, base="develop")
+        rc = nomnom.cmd_pr(str(repo), base="develop")
         assert rc == 0
         text = next(out_dir.glob("p-feature-pr-*.txt")).read_text()
         assert "base:   develop" in text
@@ -1078,7 +1426,7 @@ class TestPrBundle:
         monkeypatch.setattr(nomnom.shutil, "which",
                             lambda name: f"/usr/bin/{name}")
         monkeypatch.chdir(tmp_path)
-        rc = nomnom.cmd_pr(str(repo), copy=False, base="main")
+        rc = nomnom.cmd_pr(str(repo), base="main")
         assert rc == 1
         assert "detached" in capsys.readouterr().err
 
@@ -1105,7 +1453,7 @@ class TestPrBundle:
         out_dir = tmp_path / "out"
         out_dir.mkdir()
         monkeypatch.chdir(out_dir)
-        rc = nomnom.cmd_pr(str(repo), copy=False, base=None)
+        rc = nomnom.cmd_pr(str(repo), base=None)
         assert rc == 0
         text = next(out_dir.glob("p-feature-pr-*.txt")).read_text()
         # First 500 chars of body kept, rest replaced with ellipsis.
@@ -1163,7 +1511,7 @@ def _minimal_pr_payload(number: int = 1) -> str:
 
 
 class TestReviewBundle:
-    def test_missing_gh_errors(self, tmp_path, monkeypatch, capsys):
+    def test_missing_gh_errors(self, tmp_path, monkeypatch):
         repo = tmp_path / "p"
         make_git_repo(repo, initial={"a.txt": "1\n"})
         monkeypatch.setattr(
@@ -1171,12 +1519,10 @@ class TestReviewBundle:
             lambda name: None if name == "gh" else "/bin/git",
         )
         monkeypatch.chdir(tmp_path)
-        with pytest.raises(SystemExit) as exc:
+        with pytest.raises(nomnom.NomnomError, match="requires gh"):
             nomnom.cmd_review(
-                str(repo), pr_number=1, copy=False, include_diff=False,
+                str(repo), pr_number=1, include_diff=False,
             )
-        assert exc.value.code == 1
-        assert "requires gh" in capsys.readouterr().err
 
     def test_invalid_pr_number_errors(self, tmp_path, monkeypatch, capsys):
         repo = tmp_path / "p"
@@ -1185,7 +1531,7 @@ class TestReviewBundle:
                             lambda name: f"/usr/bin/{name}")
         monkeypatch.chdir(tmp_path)
         rc = nomnom.cmd_review(
-            str(repo), pr_number=0, copy=False, include_diff=False,
+            str(repo), pr_number=0, include_diff=False,
         )
         assert rc == 1
         assert "must be positive" in capsys.readouterr().err
@@ -1208,7 +1554,7 @@ class TestReviewBundle:
         monkeypatch.setattr(nomnom, "_run", stub)
         monkeypatch.chdir(tmp_path)
         rc = nomnom.cmd_review(
-            str(repo), pr_number=42, copy=False, include_diff=False,
+            str(repo), pr_number=42, include_diff=False,
         )
         assert rc == 1
         err = capsys.readouterr().err
@@ -1233,7 +1579,7 @@ class TestReviewBundle:
         monkeypatch.setattr(nomnom, "_run", stub)
         monkeypatch.chdir(tmp_path)
         rc = nomnom.cmd_review(
-            str(repo), pr_number=1, copy=False, include_diff=False,
+            str(repo), pr_number=1, include_diff=False,
         )
         assert rc == 1
         assert "no remote configured" in capsys.readouterr().err
@@ -1257,7 +1603,7 @@ class TestReviewBundle:
         out_dir.mkdir()
         monkeypatch.chdir(out_dir)
         rc = nomnom.cmd_review(
-            str(repo), pr_number=7, copy=False, include_diff=False,
+            str(repo), pr_number=7, include_diff=False,
         )
         assert rc == 0
         bundles = list(out_dir.glob("p-pr-7-review-*.txt"))
@@ -1366,7 +1712,7 @@ class TestReviewBundle:
         out_dir.mkdir()
         monkeypatch.chdir(out_dir)
         rc = nomnom.cmd_review(
-            str(repo), pr_number=99, copy=False, include_diff=False,
+            str(repo), pr_number=99, include_diff=False,
         )
         assert rc == 0
         text = next(out_dir.glob("p-pr-99-review-*.txt")).read_text()
@@ -1444,7 +1790,7 @@ class TestReviewBundle:
         out_dir.mkdir()
         monkeypatch.chdir(out_dir)
         nomnom.cmd_review(
-            str(repo), pr_number=5, copy=False, include_diff=False,
+            str(repo), pr_number=5, include_diff=False,
         )
         text = next(out_dir.glob("p-pr-5-review-*.txt")).read_text()
         i_a10 = text.index("## src/a.py:10")
@@ -1485,7 +1831,7 @@ class TestReviewBundle:
         out_dir.mkdir()
         monkeypatch.chdir(out_dir)
         nomnom.cmd_review(
-            str(repo), pr_number=8, copy=False, include_diff=False,
+            str(repo), pr_number=8, include_diff=False,
         )
         text = next(out_dir.glob("p-pr-8-review-*.txt")).read_text()
         assert "ready_for_review" in text
@@ -1517,7 +1863,7 @@ class TestReviewBundle:
         out_dir.mkdir()
         monkeypatch.chdir(out_dir)
         nomnom.cmd_review(
-            str(repo), pr_number=1, copy=False, include_diff=False,
+            str(repo), pr_number=1, include_diff=False,
         )
         assert diff_called == []
         text = next(out_dir.glob("p-pr-1-review-*.txt")).read_text()
@@ -1545,7 +1891,7 @@ class TestReviewBundle:
         out_dir.mkdir()
         monkeypatch.chdir(out_dir)
         nomnom.cmd_review(
-            str(repo), pr_number=2, copy=False, include_diff=True,
+            str(repo), pr_number=2, include_diff=True,
         )
         assert len(diff_called) == 1
         text = next(out_dir.glob("p-pr-2-review-*.txt")).read_text()
@@ -1577,7 +1923,8 @@ class TestReviewBundle:
         out_dir.mkdir()
         monkeypatch.chdir(out_dir)
         rc = nomnom.cmd_review(
-            str(repo), pr_number=3, copy=True, include_diff=False,
+            str(repo), pr_number=3, include_diff=False,
+            destination=nomnom.Destination.CLIPBOARD,
         )
         assert rc == 0
         assert list(out_dir.glob("p-pr-3-review-*.txt")) == []
@@ -2106,6 +2453,59 @@ class TestTofu:
             raise AssertionError("should not prompt for a matching key")
         monkeypatch.setattr("builtins.input", boom)
         assert nomnom._tofu_check_join({"id": "H", "name": "host", "ik": "aa"})
+
+    def test_trust_new_auto_accepts_changed_key(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        nomnom._save_known_peer("H", "host", "aa")
+        peer = {"id": "H", "name": "host", "ik": "bb"}
+
+        def boom(*a):
+            raise AssertionError("trust_new should bypass the prompt")
+        monkeypatch.setattr("builtins.input", boom)
+        assert nomnom._tofu_check_join(peer, trust_new=True) is True
+
+
+class TestPeerFilter:
+    def _peer(self, **kw):
+        base = {"id": "abc123def456", "name": "alice-mbp", "ip": "10.0.0.2",
+                "port": 1, "role": "send", "tok": "t", "ik": "aa", "ek": "bb"}
+        base.update(kw)
+        return base
+
+    def test_matches_by_name(self):
+        assert nomnom._peer_matches(self._peer(), "alice-mbp")
+        assert nomnom._peer_matches(self._peer(), "ALICE-MBP")
+
+    def test_matches_by_device_id_prefix(self):
+        assert nomnom._peer_matches(self._peer(), "abc123")
+        assert nomnom._peer_matches(self._peer(), "abc123def456")
+
+    def test_no_match_returns_false(self):
+        assert not nomnom._peer_matches(self._peer(), "bob")
+
+    def test_choose_with_filter_skips_prompt(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        peers = [self._peer(), self._peer(id="zzz", name="bob")]
+
+        def boom(*a):
+            raise AssertionError("peer_filter should skip the prompt")
+        monkeypatch.setattr("builtins.input", boom)
+        picked = nomnom._lan_choose(peers, "receiver(s)", peer_filter="bob")
+        assert picked["name"] == "bob"
+
+    def test_choose_filter_no_match_errors(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        peers = [self._peer()]
+        picked = nomnom._lan_choose(peers, "receiver(s)", peer_filter="nobody")
+        assert picked is None
+        assert "matched no" in capsys.readouterr().err
+
+    def test_choose_filter_ambiguous_errors(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        peers = [self._peer(), self._peer(id="abc999")]  # both prefix abc
+        picked = nomnom._lan_choose(peers, "receiver(s)", peer_filter="abc")
+        assert picked is None
+        assert "ambiguous" in capsys.readouterr().err
 
 
 class TestLanBeacon:

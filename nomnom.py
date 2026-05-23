@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import ast
 import curses
+import enum
 import fnmatch
 import hashlib
 import json
@@ -25,6 +26,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from typing import NamedTuple
 
 try:
     locale.setlocale(locale.LC_ALL, "")
@@ -40,7 +42,6 @@ JUNK_DIRS = {
 }
 LARGE_FILE_BYTES = 1_000_000
 BINARY_SNIFF_BYTES = 8192
-CACHE_DIR_NAME = "nomnom"
 
 # --- nomnom:extensions (auto-managed; edit with `nomnom register`) ---
 TEXT_EXTENSIONS = {
@@ -286,6 +287,36 @@ class GitignoreMatcher:
         return ignored
 
 
+def _build_pattern_matcher(patterns: list[str]) -> GitignoreMatcher:
+    """Build a GitignoreMatcher from CLI --include / --exclude patterns.
+
+    Trailing slashes are stripped but the rule still applies to files
+    under that directory (unlike .gitignore's dir-only semantics, since a
+    walker would never descend; here we're filtering a flat list). A
+    leading `!` negates."""
+    rules: list[GitignoreRule] = []
+    for raw in patterns:
+        line = raw.strip()
+        if not line:
+            continue
+        negated = line.startswith("!")
+        if negated:
+            line = line[1:]
+        if line.endswith("/"):
+            line = line[:-1]
+        anchored = "/" in line
+        if line.startswith("/"):
+            line = line[1:]
+        if not line:
+            continue
+        try:
+            regex = _glob_to_regex(line, anchored)
+        except re.error:
+            continue
+        rules.append(GitignoreRule(line, negated, False, "", regex))
+    return GitignoreMatcher(rules)
+
+
 def load_gitignore(root: Path) -> GitignoreMatcher:
     rules: list[GitignoreRule] = []
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
@@ -426,6 +457,48 @@ def scan_repo(
 
     walk(root, "")
     return items
+
+
+def apply_include_exclude(
+    items: list[ScanItem],
+    includes: list[str],
+    excludes: list[str],
+) -> list[ScanItem]:
+    """Filter scan items by gitignore-style --include / --exclude patterns.
+
+    A file passes if it matches some include pattern (or includes is
+    empty) and matches no exclude pattern. Directories are then re-derived
+    from the surviving files' parents, so the tree builder still sees a
+    valid parent chain."""
+    if not includes and not excludes:
+        return items
+    inc = _build_pattern_matcher(includes) if includes else None
+    exc = _build_pattern_matcher(excludes) if excludes else None
+
+    keep_files: set[str] = set()
+    for it in items:
+        if it.is_dir:
+            continue
+        if inc is not None and not inc.is_ignored(it.rel, False):
+            continue
+        if exc is not None and exc.is_ignored(it.rel, False):
+            continue
+        keep_files.add(it.rel)
+
+    needed_dirs: set[str] = set()
+    for rel in keep_files:
+        parts = rel.split("/")
+        for i in range(1, len(parts)):
+            needed_dirs.add("/".join(parts[:i]))
+
+    out: list[ScanItem] = []
+    for it in items:
+        if it.is_dir:
+            if it.rel in needed_dirs:
+                out.append(it)
+        elif it.rel in keep_files:
+            out.append(it)
+    return out
 
 
 def collect_stats(
@@ -632,15 +705,141 @@ def _apply_filter_key(ch: int, filter_active: bool, filter_buf: str) -> tuple[bo
     return filter_active, filter_buf
 
 
-def pick(nodes: list[Node]) -> set[str] | None:
-    """Curses checkbox-tree picker. Returns set of checked file rels, or None on cancel."""
+class Destination(enum.IntEnum):
+    FILE = 0
+    CLIPBOARD = 1
+    STDOUT = 2
+    SEND = 3
+
+
+_DESTINATION_LABELS = {
+    Destination.FILE: "file",
+    Destination.CLIPBOARD: "clipboard",
+    Destination.STDOUT: "stdout",
+    Destination.SEND: "send",
+}
+
+
+def cycle_destination(d: Destination) -> Destination:
+    return Destination((int(d) + 1) % len(Destination))
+
+
+def compute_summary(nodes: list[Node]) -> tuple[int, int, int]:
+    """(file_count, total_bytes, approx_tokens) over checked non-dir nodes."""
+    count = 0
+    total_bytes = 0
+    for n in nodes:
+        if n.is_dir or not n.checked:
+            continue
+        count += 1
+        total_bytes += n.size
+    return count, total_bytes, total_bytes // 4
+
+
+def format_footer(
+    dest: Destination,
+    include_tree: bool,
+    summary: tuple[int, int, int],
+    width: int,
+) -> str:
+    """Render the picker's summary/toggle row, truncated to width.
+
+    Layout: `selected: N files | <size> ~<tok>   dest: X  tree: on|off`.
+    On narrow widths, drop the size/token block first, then the dest/tree
+    block; the selected-count is the last to go."""
+    files, total_bytes, approx_tokens = summary
+    left = f"selected: {files} files"
+    stats = f" | {_fmt_size(total_bytes)} ~{_fmt_tokens(approx_tokens)}"
+    right = (
+        f"dest: {_DESTINATION_LABELS[dest]}  "
+        f"tree: {'on' if include_tree else 'off'}"
+    )
+    full_left = left + stats
+    gap = "  "
+    if len(full_left) + len(gap) + len(right) <= width:
+        pad = width - len(full_left) - len(right)
+        return full_left + " " * pad + right
+    if len(left) + len(gap) + len(right) <= width:
+        pad = width - len(left) - len(right)
+        return left + " " * pad + right
+    if len(full_left) <= width:
+        return full_left
+    return left[:width]
+
+
+class PickResult(NamedTuple):
+    selected: set[str]
+    destination: Destination
+    include_tree: bool
+
+
+PREVIEW_MAX_BYTES = 2_000_000
+PREVIEW_MIN_TERMINAL_WIDTH = 100
+
+
+def render_preview(
+    path: Path | None,
+    max_lines: int,
+    max_cols: int,
+) -> list[str]:
+    """Pure helper: return up to max_lines preview lines for `path`.
+
+    - Binary / too-large / unreadable files return a one-line stats label.
+    - Text files return their first chunk, decoded with errors="replace"
+      and clipped to max_cols per line.
+    - Lines are not padded; the caller handles column alignment."""
+    if path is None or max_lines <= 0 or max_cols <= 0:
+        return []
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return [_clip("(unreadable)", max_cols)]
+    if is_binary(path):
+        return [_clip(f"(binary, {_fmt_size(size)})", max_cols)]
+    if size > PREVIEW_MAX_BYTES:
+        return [_clip(f"(too large to preview, {_fmt_size(size)})", max_cols)]
+    try:
+        raw = path.read_bytes()[: min(8192, max_lines * max_cols * 2)]
+    except OSError:
+        return [_clip("(unreadable)", max_cols)]
+    text = raw.decode("utf-8", errors="replace")
+    if not text:
+        return [_clip("(empty)", max_cols)]
+    lines = text.splitlines() or [""]
+    return [_clip(line, max_cols) for line in lines[:max_lines]]
+
+
+def _clip(s: str, width: int) -> str:
+    if width <= 0:
+        return ""
+    if len(s) <= width:
+        return s
+    if width <= 1:
+        return s[:width]
+    return s[: width - 1] + "…"
+
+
+def pick(
+    nodes: list[Node],
+    root: Path | None = None,
+    initial_destination: Destination = Destination.FILE,
+    initial_include_tree: bool = True,
+) -> PickResult | None:
+    """Curses checkbox-tree picker. Returns PickResult, or None on cancel.
+
+    When `root` is given, the picker shows a preview pane on wide
+    terminals (>= PREVIEW_MIN_TERMINAL_WIDTH cols). Press `p` to hide
+    or show the preview."""
     if not nodes:
-        return set()
+        return PickResult(set(), initial_destination, initial_include_tree)
 
     cancelled = False
+    destination = initial_destination
+    include_tree = initial_include_tree
+    preview_visible = root is not None
 
     def _picker(stdscr) -> None:
-        nonlocal cancelled
+        nonlocal cancelled, destination, include_tree, preview_visible
         curses.curs_set(0)
         stdscr.keypad(True)
         try:
@@ -655,6 +854,7 @@ def pick(nodes: list[Node]) -> set[str] | None:
         filter_active = False
         filter_buf = ""
         sort_mode = "alpha"
+        preview_cache: dict[tuple[int, int, int], list[str]] = {}
 
         def _sort_key(n: Node):
             return (-n.size, n.name)
@@ -691,11 +891,24 @@ def pick(nodes: list[Node]) -> set[str] | None:
             cursor_pos = visible.index(cursor_ni)
 
             h, w = stdscr.getmaxyx()
-            list_h = max(1, h - 2)
+            list_h = max(1, h - 3)
             if cursor_pos < viewport:
                 viewport = cursor_pos
             elif cursor_pos >= viewport + list_h:
                 viewport = cursor_pos - list_h + 1
+
+            show_preview = (
+                preview_visible
+                and root is not None
+                and w >= PREVIEW_MIN_TERMINAL_WIDTH
+            )
+            if show_preview:
+                tree_w = max(40, int(w * 0.6))
+                preview_x = tree_w + 1
+                preview_w = max(0, w - preview_x)
+            else:
+                tree_w = w
+                preview_x = preview_w = 0
 
             stdscr.erase()
             for row in range(list_h):
@@ -727,7 +940,7 @@ def pick(nodes: list[Node]) -> set[str] | None:
                     )
                 chosen_suffix = ""
                 gap = 2
-                avail = w - 1
+                avail = tree_w - 1
                 for cand in stat_variants:
                     if len(prefix) + gap + len(cand) <= avail:
                         chosen_suffix = cand
@@ -754,22 +967,42 @@ def pick(nodes: list[Node]) -> set[str] | None:
                 except curses.error:
                     pass
 
-            checked_count = sum(1 for n in nodes if n.checked and not n.is_dir)
+            if show_preview and preview_w > 0:
+                cur_node = nodes[cursor_ni]
+                preview_lines: list[str]
+                if cur_node.is_dir or root is None:
+                    preview_lines = []
+                else:
+                    cache_key = (cursor_ni, list_h, preview_w)
+                    cached = preview_cache.get(cache_key)
+                    if cached is None:
+                        cached = render_preview(
+                            root / cur_node.rel, list_h, preview_w,
+                        )
+                        preview_cache[cache_key] = cached
+                    preview_lines = cached
+                for row, line in enumerate(preview_lines[:list_h]):
+                    try:
+                        stdscr.addstr(row, preview_x, line, theme["dim"])
+                    except curses.error:
+                        pass
+
+            summary = compute_summary(nodes)
+            if h >= 3:
+                footer = format_footer(destination, include_tree, summary, max(1, w - 1))
+                try:
+                    stdscr.addstr(h - 3, 0, footer, theme["dim"])
+                except curses.error:
+                    pass
             if filter_active or filter_buf:
                 try:
                     stdscr.addstr(h - 2, 0, "/ ", theme["filter"])
                     stdscr.addstr(filter_buf[: max(0, w - 3)], theme["filter"])
                 except curses.error:
                     pass
-            else:
-                info = f"selected: {checked_count} files"
-                try:
-                    stdscr.addstr(h - 2, 0, info[: w - 1], theme["dim"])
-                except curses.error:
-                    pass
             status = (
-                "space:toggle  ->/<-:expand  /:filter  E/C:expand/collapse all  "
-                "a:toggle-visible  s:sort  enter:done  q:quit"
+                "space:toggle  /:filter  d:dest  t:tree  p:preview  "
+                "s:sort  a:toggle-visible  enter:write  q:quit"
             )
             try:
                 stdscr.addstr(h - 1, 0, status[: w - 1], theme["dim"])
@@ -852,6 +1085,12 @@ def pick(nodes: list[Node]) -> set[str] | None:
                     cascade_check(nodes, v, any_unchecked)
             elif ch == ord("s"):
                 sort_mode = "size" if sort_mode == "alpha" else "alpha"
+            elif ch == ord("d"):
+                destination = cycle_destination(destination)
+            elif ch == ord("t"):
+                include_tree = not include_tree
+            elif ch == ord("p"):
+                preview_visible = not preview_visible
             elif ch in (10, 13):
                 return
             elif ch in (ord("q"), 3):
@@ -865,46 +1104,11 @@ def pick(nodes: list[Node]) -> set[str] | None:
 
     if cancelled:
         return None
-    return {n.rel for n in nodes if n.checked and not n.is_dir}
-
-
-# ---------- last selection ----------
-
-def _cache_path_for(root: Path) -> Path:
-    abs_root = str(root.resolve())
-    digest = hashlib.sha1(abs_root.encode("utf-8")).hexdigest()
-    return Path.home() / ".cache" / CACHE_DIR_NAME / f"{digest}.json"
-
-
-def load_last_selection(root: Path) -> list[str] | None:
-    p = _cache_path_for(root)
-    if not p.exists():
-        return None
-    try:
-        data = json.loads(p.read_text(encoding="utf-8"))
-        if data.get("repo_path") != str(root.resolve()):
-            return None
-        sel = data.get("selected")
-        if isinstance(sel, list) and all(isinstance(x, str) for x in sel):
-            return sel
-    except (OSError, json.JSONDecodeError):
-        pass
-    return None
-
-
-def save_last_selection(root: Path, selected: list[str]) -> None:
-    try:
-        p = _cache_path_for(root)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(
-            json.dumps(
-                {"repo_path": str(root.resolve()), "selected": sorted(selected)},
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
-    except OSError:
-        pass
+    return PickResult(
+        selected={n.rel for n in nodes if n.checked and not n.is_dir},
+        destination=destination,
+        include_tree=include_tree,
+    )
 
 
 # ---------- output ----------
@@ -1114,11 +1318,17 @@ def _run(cmd: list[str], cwd: Path) -> tuple[int, str, str]:
     return proc.returncode, proc.stdout, proc.stderr
 
 
+class NomnomError(Exception):
+    """Raised when a precondition fails. Carries a user-readable message.
+
+    Catch at the CLI dispatcher to print + exit non-zero; catch at TUI
+    entry points to render the message in a modal."""
+
+
 def _require_git_repo(root: Path) -> None:
     rc, _, _ = _run(["git", "rev-parse", "--show-toplevel"], root)
     if rc != 0:
-        print(f"error: not a git repository: {root}", file=sys.stderr)
-        sys.exit(1)
+        raise NomnomError(f"not a git repository: {root}")
 
 
 def _current_branch(root: Path) -> str | None:
@@ -1155,12 +1365,9 @@ def _changed_files(root: Path, base: str | None) -> list[str]:
 
 def _require_gh() -> None:
     if shutil.which("gh") is None:
-        print(
-            "error: pr requires gh (https://cli.github.com). "
-            "install it and retry.",
-            file=sys.stderr,
+        raise NomnomError(
+            "pr requires gh (https://cli.github.com). install it and retry."
         )
-        sys.exit(1)
 
 
 def _default_base_branch(root: Path) -> str:
@@ -1209,30 +1416,39 @@ def _emit_git_bundle(
     branch_label: str,
     sections: list[tuple[str, str]],
     tree: str | None,
-    copy: bool,
+    destination: Destination,
 ) -> int:
     output = render_git_bundle(repo_name, kind, branch_label, sections, tree)
     size = len(output)
-    print()
-    print(f"  sections: {len(sections)}")
-    print(f"  size:     {size:,} bytes")
 
-    if copy:
+    if destination == Destination.STDOUT:
+        sys.stdout.write(output)
+        sys.stdout.flush()
+        print(f"wrote {size:,} bytes to stdout.", file=sys.stderr)
+        return 0
+
+    print(file=sys.stderr)
+    print(f"  sections: {len(sections)}", file=sys.stderr)
+    print(f"  size:     {size:,} bytes", file=sys.stderr)
+
+    if destination == Destination.CLIPBOARD:
         clip = detect_clipboard_cmd()
         if clip:
-            print(f"  output:   clipboard via {clip[0]}")
+            print(f"  output:   clipboard via {clip[0]}", file=sys.stderr)
         else:
-            print("  output:   clipboard (no tool found; will fall back to file)")
+            print("  output:   clipboard (no tool found; will fall back to file)",
+                  file=sys.stderr)
     else:
         out_path = pick_git_output_path(repo_name, branch_label, kind)
-        print(f"  output:   {out_path}")
+        print(f"  output:   {out_path}", file=sys.stderr)
     if size > GIT_BUNDLE_WARN_BYTES:
-        print(f"  warn:     bundle exceeds {GIT_BUNDLE_WARN_BYTES:,} bytes")
-    print()
+        print(f"  warn:     bundle exceeds {GIT_BUNDLE_WARN_BYTES:,} bytes",
+              file=sys.stderr)
+    print(file=sys.stderr)
 
-    if copy:
+    if destination == Destination.CLIPBOARD:
         if copy_to_clipboard(output):
-            print(f"copied {size:,} bytes to clipboard.")
+            print(f"copied {size:,} bytes to clipboard.", file=sys.stderr)
             return 0
         print(
             "no clipboard tool found (pbcopy/wl-copy/xclip/xsel); "
@@ -1246,22 +1462,11 @@ def _emit_git_bundle(
     except OSError as e:
         print(f"error writing output: {e}", file=sys.stderr)
         return 1
-    print(f"wrote {out_path}")
+    print(f"wrote {out_path}", file=sys.stderr)
     return 0
 
 
 # ---------- prompts ----------
-
-def confirm(prompt: str, default: bool = True) -> bool:
-    suffix = "[Y/n]" if default else "[y/N]"
-    try:
-        ans = input(f"{prompt} {suffix} ").strip().lower()
-    except EOFError:
-        return default
-    if not ans:
-        return default
-    return ans in ("y", "yes")
-
 
 # ---------- self-editing register / unregister ----------
 
@@ -1400,7 +1605,7 @@ def cmd_register(
     return 0
 
 
-def cmd_commit(repo: str, copy: bool) -> int:
+def cmd_commit(repo: str, destination: Destination = Destination.FILE) -> int:
     root = Path(repo).expanduser().resolve()
     if not root.is_dir():
         print(f"error: not a directory: {root}", file=sys.stderr)
@@ -1455,11 +1660,11 @@ def cmd_commit(repo: str, copy: bool) -> int:
     tree = render_ascii_tree(changed, repo_name) if changed else None
 
     return _emit_git_bundle(
-        repo_name, "commit", branch_label, sections, tree, copy,
+        repo_name, "commit", branch_label, sections, tree, destination,
     )
 
 
-def cmd_pr(repo: str, copy: bool, base: str | None) -> int:
+def cmd_pr(repo: str, base: str | None, destination: Destination = Destination.FILE) -> int:
     _require_gh()
     root = Path(repo).expanduser().resolve()
     if not root.is_dir():
@@ -1556,7 +1761,7 @@ def cmd_pr(repo: str, copy: bool, base: str | None) -> int:
     tree = render_ascii_tree(changed, repo_name) if changed else None
 
     return _emit_git_bundle(
-        repo_name, "pr", branch, sections, tree, copy,
+        repo_name, "pr", branch, sections, tree, destination,
     )
 
 
@@ -1785,7 +1990,8 @@ def _section(name: str, body: str) -> tuple[str, str]:
 
 
 def cmd_review(
-    repo: str, pr_number: int, copy: bool, include_diff: bool,
+    repo: str, pr_number: int, include_diff: bool,
+    destination: Destination = Destination.FILE,
 ) -> int:
     _require_gh()
     root = Path(repo).expanduser().resolve()
@@ -1921,7 +2127,7 @@ def cmd_review(
 
     branch_label = f"pr-{pr_number}"
     return _emit_git_bundle(
-        repo_name, "review", branch_label, sections, tree, copy,
+        repo_name, "review", branch_label, sections, tree, destination,
     )
 
 
@@ -2704,8 +2910,13 @@ def _tofu_decision(device_id: str, ik_hex: str) -> str:
     return "match" if pinned == ik_hex else "changed"
 
 
-def _tofu_confirm_change(name: str, old_hex, new_hex: str) -> bool:
-    """Warn that a known peer's identity key changed and ask to continue."""
+def _tofu_confirm_change(
+    name: str, old_hex, new_hex: str, *, trust_new: bool = False,
+) -> bool:
+    """Warn that a known peer's identity key changed and ask to continue.
+
+    With `trust_new=True`, the change is auto-accepted with a stderr note —
+    used by `--trust-new` and by callers running in non-interactive mode."""
     print("", file=sys.stderr)
     print(f"  WARNING: the identity key for {name!r} has CHANGED.",
           file=sys.stderr)
@@ -2716,6 +2927,9 @@ def _tofu_confirm_change(name: str, old_hex, new_hex: str) -> bool:
     if old_hex:
         print(f"    pinned:  {_ik_fingerprint(old_hex)}", file=sys.stderr)
     print(f"    offered: {_ik_fingerprint(new_hex)}", file=sys.stderr)
+    if trust_new:
+        print("  auto-trusting (--trust-new).", file=sys.stderr)
+        return True
     try:
         ans = input("  trust the new key and continue? [y/N]: ").strip().lower()
     except EOFError:
@@ -2723,21 +2937,59 @@ def _tofu_confirm_change(name: str, old_hex, new_hex: str) -> bool:
     return ans in ("y", "yes")
 
 
-def _tofu_check_join(peer: dict) -> bool:
+def _tofu_check_join(peer: dict, *, trust_new: bool = False) -> bool:
     """Joiner-side TOFU gate: prompt if the picked peer's key changed."""
     if _tofu_decision(peer["id"], peer["ik"]) == "changed":
-        return _tofu_confirm_change(peer["name"], _known_peer_ik(peer["id"]),
-                                    peer["ik"])
+        return _tofu_confirm_change(
+            peer["name"], _known_peer_ik(peer["id"]), peer["ik"],
+            trust_new=trust_new,
+        )
     return True
 
 
-def _lan_choose(found: list, what: str) -> dict | None:
-    """Print a numbered list of `found` peers and let the user pick one.
+def _peer_matches(peer: dict, needle: str) -> bool:
+    """Match a discovered peer against a `--peer` filter.
 
-    Each peer is tagged from its TOFU status: a brand-new device, a known one,
-    or one whose identity key has changed (a warning).
-    """
+    A match is a case-insensitive equality (or prefix) on either the
+    advertised name or the device id."""
+    needle = needle.strip().lower()
+    if not needle:
+        return False
+    name = (peer.get("name") or "").lower()
+    pid = (peer.get("id") or "").lower()
+    return needle == name or needle == pid or pid.startswith(needle)
+
+
+def _lan_choose(
+    found: list, what: str, *, peer_filter: str | None = None,
+) -> dict | None:
+    """Pick a peer from a discovered list.
+
+    With `peer_filter`, auto-select the matching peer (no prompt). Errors
+    to stderr and returns None when no peer (or multiple) match.
+
+    Without `peer_filter`, prints a numbered list and reads a 1-based
+    index from stdin. Each peer is tagged from its TOFU status."""
     found = sorted(found, key=lambda b: b["name"])
+    if peer_filter is not None:
+        matches = [p for p in found if _peer_matches(p, peer_filter)]
+        if not matches:
+            names = ", ".join(repr(p["name"]) for p in found) or "(none)"
+            print(
+                f"error: --peer {peer_filter!r} matched no discovered "
+                f"{what}: {names}",
+                file=sys.stderr,
+            )
+            return None
+        if len(matches) > 1:
+            names = ", ".join(repr(p["name"]) for p in matches)
+            print(
+                f"error: --peer {peer_filter!r} is ambiguous, matches: {names}",
+                file=sys.stderr,
+            )
+            return None
+        return matches[0]
+
     print(f"found {len(found)} {what}:", file=sys.stderr)
     for i, b in enumerate(found, 1):
         decision = _tofu_decision(b["id"], b["ik"])
@@ -2907,27 +3159,18 @@ def _pin_from_state(state: dict) -> None:
                          state["peer_ik"])
 
 
-def cmd_encrypt(path: str, *, host: str | None = None,
-                timeout: float = 0.0) -> int:
-    """Send a file to another machine on the same Wi-Fi (nothing hits disk).
+def _lan_send_bytes(
+    name: str, data: bytes, *,
+    host: str | None = None,
+    timeout: float = 0.0,
+    peer_filter: str | None = None,
+    trust_new: bool = False,
+) -> int:
+    """Send a `data` buffer (no disk read) to a LAN peer under the name `name`.
 
-    If a receiver is already waiting, pick it from the list and upload. If
-    none is waiting, host the file and wait for a receiver to fetch it. The
-    transfer is encrypted under a fresh session key (triple-DH); the peer's
-    identity is checked against the TOFU pin.
-    """
-    p = Path(path).expanduser()
-    if not p.is_file():
-        print(f"error: not a file: {p}", file=sys.stderr)
-        return 1
-    try:
-        data = p.read_bytes()
-    except OSError as e:
-        print(f"error: cannot read {p}: {e}", file=sys.stderr)
-        return 1
+    Encapsulates the join-or-host LAN flow shared by `cmd_encrypt` and the
+    bundle-picker's SEND destination."""
     identity = _load_identity()
-    # Short, fixed probe to see if a peer is already waiting; the wait
-    # `timeout` applies only once we host.
     try:
         waiting = _lan_discover("recv", discover_timeout=_LAN_DISCOVER_TIMEOUT,
                                 bind_host=host or "")
@@ -2936,11 +3179,10 @@ def cmd_encrypt(path: str, *, host: str | None = None,
         return 1
 
     if waiting:
-        # Join a waiting receiver and upload.
-        peer = _lan_choose(waiting, "receiver(s)")
+        peer = _lan_choose(waiting, "receiver(s)", peer_filter=peer_filter)
         if peer is None:
             return 1
-        if not _tofu_check_join(peer):
+        if not _tofu_check_join(peer, trust_new=trust_new):
             print("aborted (identity not trusted).", file=sys.stderr)
             return 1
         try:
@@ -2949,7 +3191,7 @@ def cmd_encrypt(path: str, *, host: str | None = None,
             print(f"error: {peer['name']} advertised an invalid key",
                   file=sys.stderr)
             return 1
-        blob = encrypt_bytes(data, p.name, key.hex())
+        blob = encrypt_bytes(data, name, key.hex())
         try:
             _lan_upload_blob(peer["ip"], peer["port"], peer["tok"], blob,
                              identity, ek_pub_hex)
@@ -2958,14 +3200,12 @@ def cmd_encrypt(path: str, *, host: str | None = None,
                   file=sys.stderr)
             return 1
         _save_known_peer(peer["id"], peer["name"], peer["ik"])
-        print(f"sent {p.name} ({len(data):,} bytes) to {peer['name']}.",
+        print(f"sent {name} ({len(data):,} bytes) to {peer['name']}.",
               file=sys.stderr)
         return 0
 
-    # Nobody waiting: host the file and let a receiver fetch it. The handler
-    # derives the session key per requester; we encrypt the blob under it.
     def make_blob(session_key):
-        return encrypt_bytes(data, p.name, session_key.hex())
+        return encrypt_bytes(data, name, session_key.hex())
 
     state = _lan_host(
         role="send",
@@ -2980,12 +3220,49 @@ def cmd_encrypt(path: str, *, host: str | None = None,
         return 1
     _pin_from_state(state)
     peer_name = state.get("peer_name") or state.get("peer")
-    print(f"sent {p.name} ({len(data):,} bytes) to {peer_name}.",
+    print(f"sent {name} ({len(data):,} bytes) to {peer_name}.",
           file=sys.stderr)
     return 0
 
 
-def cmd_decrypt(*, host: str | None = None, timeout: float = 0.0) -> int:
+def cmd_encrypt(
+    path: str, *,
+    host: str | None = None,
+    timeout: float = 0.0,
+    peer_filter: str | None = None,
+    trust_new: bool = False,
+) -> int:
+    """Send a file to another machine on the same Wi-Fi (nothing hits disk).
+
+    If a receiver is already waiting, pick it from the list and upload. If
+    none is waiting, host the file and wait for a receiver to fetch it. The
+    transfer is encrypted under a fresh session key (triple-DH); the peer's
+    identity is checked against the TOFU pin.
+
+    `peer_filter` matches a name or device id (case-insensitive, prefix
+    allowed) and skips the interactive pick. `trust_new=True` auto-accepts
+    changed identity keys (use with care; pairs with `--trust-new`).
+    """
+    p = Path(path).expanduser()
+    if not p.is_file():
+        print(f"error: not a file: {p}", file=sys.stderr)
+        return 1
+    try:
+        data = p.read_bytes()
+    except OSError as e:
+        print(f"error: cannot read {p}: {e}", file=sys.stderr)
+        return 1
+    return _lan_send_bytes(
+        p.name, data,
+        host=host, timeout=timeout,
+        peer_filter=peer_filter, trust_new=trust_new,
+    )
+
+
+def cmd_decrypt(
+    *, host: str | None = None, timeout: float = 0.0,
+    peer_filter: str | None = None, trust_new: bool = False,
+) -> int:
     """Receive a file from another machine, writing it into the cwd.
 
     If a sender is already hosting, pick it from the list and fetch. If none
@@ -3004,10 +3281,10 @@ def cmd_decrypt(*, host: str | None = None, timeout: float = 0.0) -> int:
 
     if waiting:
         # Join a waiting sender and fetch.
-        peer = _lan_choose(waiting, "sender(s)")
+        peer = _lan_choose(waiting, "sender(s)", peer_filter=peer_filter)
         if peer is None:
             return 1
-        if not _tofu_check_join(peer):
+        if not _tofu_check_join(peer, trust_new=trust_new):
             print("aborted (identity not trusted).", file=sys.stderr)
             return 1
         try:
@@ -3051,6 +3328,540 @@ def cmd_decrypt(*, host: str | None = None, timeout: float = 0.0) -> int:
     return rc
 
 
+# ---------- TUI app shell ----------
+
+class ScreenAction(enum.Enum):
+    CONTINUE = "continue"
+    BACK = "back"
+    QUIT = "quit"
+
+
+class Screen:
+    """Base class for TUI screens. Subclasses override render/handle_key.
+
+    Returning another Screen instance from handle_key pushes it onto the
+    stack. ScreenAction.BACK pops, ScreenAction.QUIT exits the app,
+    ScreenAction.CONTINUE redraws."""
+
+    title: str = "nomnom"
+    help_lines: list[str] = []
+
+    def render(self, stdscr) -> None:  # pragma: no cover - curses I/O
+        raise NotImplementedError
+
+    def handle_key(self, ch: int):  # -> ScreenAction | Screen  # pragma: no cover
+        raise NotImplementedError
+
+
+def show_help_modal(stdscr, lines: list[str]) -> None:  # pragma: no cover
+    """Centered modal listing keybindings. Closes on any key."""
+    h, w = stdscr.getmaxyx()
+    rows = [" nomnom keys ".center(40, "─"), *lines, "─" * 40, " press any key to close "]
+    box_w = min(w - 2, max(len(r) for r in rows) + 2)
+    box_h = min(h - 2, len(rows) + 2)
+    y0 = max(0, (h - box_h) // 2)
+    x0 = max(0, (w - box_w) // 2)
+    for i in range(box_h):
+        try:
+            stdscr.addstr(y0 + i, x0, " " * box_w, curses.A_REVERSE)
+        except curses.error:
+            pass
+    for i, line in enumerate(rows[: box_h - 1]):
+        try:
+            stdscr.addstr(y0 + 1 + i, x0 + 1, line[: box_w - 2], curses.A_REVERSE)
+        except curses.error:
+            pass
+    stdscr.refresh()
+    stdscr.getch()
+
+
+def run_app(initial: Screen) -> None:  # pragma: no cover - curses I/O
+    """Drive a stack of Screen instances until empty or QUIT."""
+    def _loop(stdscr):
+        curses.curs_set(0)
+        stdscr.keypad(True)
+        stack: list[Screen] = [initial]
+        while stack:
+            current = stack[-1]
+            stdscr.erase()
+            current.render(stdscr)
+            stdscr.refresh()
+            ch = stdscr.getch()
+            if ch == curses.KEY_RESIZE:
+                continue
+            if ch == ord("?"):
+                show_help_modal(stdscr, current.help_lines)
+                continue
+            result = current.handle_key(ch)
+            if isinstance(result, Screen):
+                stack.append(result)
+            elif result == ScreenAction.BACK:
+                stack.pop()
+            elif result == ScreenAction.QUIT:
+                return
+    curses.wrapper(_loop)
+
+
+class LauncherScreen(Screen):
+    title = "nomnom"
+    help_lines = [
+        "j/k or ↑/↓   move",
+        "Enter        open selected verb",
+        "q            quit",
+    ]
+
+    def __init__(self) -> None:
+        self.cursor = 0
+        self.tiles: list[tuple[str, str]] = [
+            ("Bundle",     "Pick files and write a bundle .txt"),
+            ("Commit",     "Bundle staged/unstaged diffs + recent commits"),
+            ("PR",         "Bundle commits since base + diff for an LLM"),
+            ("Review",     "Bundle a PR's meta, diff, and comments"),
+            ("Rebuild",    "Reconstruct a file tree from a bundle .txt"),
+            ("Send",       "Encrypt a file and send over the LAN"),
+            ("Receive",    "Wait for an incoming LAN transfer"),
+            ("Extensions", "Edit the text/binary/name/secret lists"),
+            ("Pins",       "Manage TOFU-pinned LAN peers"),
+        ]
+
+    def render(self, stdscr) -> None:  # pragma: no cover - curses I/O
+        theme = _setup_theme()
+        h, w = stdscr.getmaxyx()
+        header = " nomnom — feed your repo to the LLM "
+        try:
+            stdscr.addstr(0, 0, header.ljust(max(1, w - 1)), theme["filter"])
+        except curses.error:
+            pass
+        for i, (label, desc) in enumerate(self.tiles):
+            row = 2 + i
+            if row >= h - 1:
+                break
+            attr = theme["cursor"] if i == self.cursor else theme["dim"]
+            line = f"  {label:<12}  {desc}"
+            try:
+                stdscr.addstr(row, 0, line[: max(1, w - 1)], attr)
+            except curses.error:
+                pass
+        try:
+            stdscr.addstr(
+                h - 1, 0,
+                "j/k:move  enter:open  ?:help  q:quit"[: max(1, w - 1)],
+                theme["dim"],
+            )
+        except curses.error:
+            pass
+
+    def handle_key(self, ch: int):
+        if ch in (curses.KEY_DOWN, ord("j")):
+            self.cursor = (self.cursor + 1) % len(self.tiles)
+            return ScreenAction.CONTINUE
+        if ch in (curses.KEY_UP, ord("k")):
+            self.cursor = (self.cursor - 1) % len(self.tiles)
+            return ScreenAction.CONTINUE
+        if ch in (ord("q"), 3, 27):
+            return ScreenAction.QUIT
+        if ch in (10, 13):
+            return _launcher_open(self.tiles[self.cursor][0])
+        return ScreenAction.CONTINUE
+
+
+def _launcher_open(verb: str):
+    """Map a launcher tile label to either a Screen to push, or a TODO note.
+
+    Slices 5-8 replace the placeholder rows with real screens."""
+    if verb == "Extensions":
+        return ExtensionsScreen()
+    if verb == "Pins":
+        return PinsScreen()
+    if verb == "Rebuild":
+        return RebuildScreen()
+    if verb == "Bundle":
+        return PlaceholderScreen(
+            "Bundle",
+            "Run `nomnom .` from a shell to open the picker. "
+            "Launching the picker from inside the app shell is wired up in a "
+            "follow-up slice.",
+        )
+    return PlaceholderScreen(
+        verb,
+        f"`nomnom {verb.lower()}` works from the shell. A dedicated TUI "
+        "screen for this verb arrives in a follow-up slice.",
+    )
+
+
+class PlaceholderScreen(Screen):
+    help_lines = ["Esc / q     back to launcher"]
+
+    def __init__(self, title: str, body: str) -> None:
+        self.title = title
+        self.body = body
+
+    def render(self, stdscr) -> None:  # pragma: no cover - curses I/O
+        theme = _setup_theme()
+        h, w = stdscr.getmaxyx()
+        try:
+            stdscr.addstr(0, 0, f" {self.title} ".ljust(max(1, w - 1)), theme["filter"])
+        except curses.error:
+            pass
+        for i, line in enumerate(_wrap(self.body, max(10, w - 4))):
+            row = 2 + i
+            if row >= h - 1:
+                break
+            try:
+                stdscr.addstr(row, 2, line, 0)
+            except curses.error:
+                pass
+        try:
+            stdscr.addstr(
+                h - 1, 0, "esc/q:back  ?:help"[: max(1, w - 1)], theme["dim"],
+            )
+        except curses.error:
+            pass
+
+    def handle_key(self, ch: int):
+        if ch in (ord("q"), 3, 27):
+            return ScreenAction.BACK
+        return ScreenAction.CONTINUE
+
+
+class RebuildScreen(Screen):
+    """Three-step rebuild flow inside the TUI: enter path, preview, confirm.
+
+    Step 1 ('input'): user types a bundle path. Enter parses it.
+    Step 2 ('preview'): tree of files to write + target dir; Enter writes,
+                        Esc returns to step 1.
+    Step 3 ('done'):    write succeeded or failed; Esc back to launcher."""
+
+    title = "Rebuild"
+    help_lines = [
+        "type a bundle path; enter to parse",
+        "in preview: enter to write, esc to re-enter the path",
+        "esc / q from input mode returns to launcher",
+    ]
+
+    def __init__(self) -> None:
+        self.step = "input"
+        self.path_buf = ""
+        self.error = ""
+        self.bundle_text = ""
+        self.repo_name = ""
+        self.files: list[tuple[str, str]] = []
+        self.target: Path | None = None
+        self.message = ""
+
+    def _parse(self) -> None:
+        p = Path(self.path_buf.strip()).expanduser()
+        if not p.is_file():
+            self.error = f"not a file: {p}"
+            return
+        try:
+            text = p.read_text(encoding="utf-8", errors="replace")
+        except OSError as e:
+            self.error = f"cannot read {p}: {e}"
+            return
+        try:
+            repo_name, files = parse_bundle(text)
+        except ValueError as e:
+            self.error = str(e)
+            return
+        self.bundle_text = text
+        self.repo_name = repo_name
+        self.files = files
+        self.target = pick_target_dir(Path.cwd(), repo_name)
+        self.error = ""
+        self.step = "preview"
+
+    def _write(self) -> None:
+        assert self.target is not None
+        target_resolved = self.target.resolve()
+        try:
+            self.target.mkdir(parents=True)
+        except OSError as e:
+            self.error = f"cannot create {self.target}: {e}"
+            self.step = "done"
+            return
+        for rel, content in self.files:
+            dest = (self.target / rel).resolve()
+            try:
+                dest.relative_to(target_resolved)
+            except ValueError:
+                self.error = f"refusing to write outside target: {rel!r}"
+                self.step = "done"
+                return
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                dest.write_text(content, encoding="utf-8")
+            except OSError as e:
+                self.error = f"cannot write {dest}: {e}"
+                self.step = "done"
+                return
+        self.message = (
+            f"wrote {len(self.files)} files into "
+            f"{self.target.relative_to(Path.cwd()) if self.target.is_relative_to(Path.cwd()) else self.target}"
+        )
+        self.step = "done"
+
+    def render(self, stdscr) -> None:  # pragma: no cover - curses I/O
+        theme = _setup_theme()
+        h, w = stdscr.getmaxyx()
+        try:
+            stdscr.addstr(0, 0, f" {self.title} ".ljust(max(1, w - 1)),
+                          theme["filter"])
+        except curses.error:
+            pass
+        if self.step == "input":
+            try:
+                stdscr.addstr(2, 2, "Bundle path:", theme["dim"])
+                stdscr.addstr(3, 2, "> " + self.path_buf, 0)
+            except curses.error:
+                pass
+            if self.error:
+                try:
+                    stdscr.addstr(5, 2, f"error: {self.error}", theme["dim"])
+                except curses.error:
+                    pass
+            footer = "enter:parse  esc/q:back  ?:help"
+        elif self.step == "preview":
+            tree = render_ascii_tree([rel for rel, _ in self.files], self.repo_name)
+            lines = tree.splitlines()
+            try:
+                stdscr.addstr(2, 2, f"target: {self.target}", theme["dim"])
+                stdscr.addstr(3, 2, f"files:  {len(self.files)}", theme["dim"])
+            except curses.error:
+                pass
+            for i, line in enumerate(lines):
+                if 5 + i >= h - 2:
+                    break
+                try:
+                    stdscr.addstr(5 + i, 2, line[: max(1, w - 3)], 0)
+                except curses.error:
+                    pass
+            footer = "enter:write  esc:re-enter path  ?:help"
+        else:
+            try:
+                stdscr.addstr(2, 2,
+                              self.error and f"error: {self.error}" or self.message,
+                              theme["dim"])
+            except curses.error:
+                pass
+            footer = "esc/q:back"
+        try:
+            stdscr.addstr(h - 1, 0, footer[: max(1, w - 1)], theme["dim"])
+        except curses.error:
+            pass
+
+    def handle_key(self, ch: int):
+        if self.step == "input":
+            if ch in (ord("q"), 3, 27):
+                return ScreenAction.BACK
+            if ch in (10, 13):
+                self._parse()
+                return ScreenAction.CONTINUE
+            if ch in (curses.KEY_BACKSPACE, 127, 8):
+                self.path_buf = self.path_buf[:-1]
+                return ScreenAction.CONTINUE
+            if 32 <= ch < 127:
+                self.path_buf += chr(ch)
+            return ScreenAction.CONTINUE
+        if self.step == "preview":
+            if ch in (10, 13):
+                self._write()
+                return ScreenAction.CONTINUE
+            if ch in (ord("q"), 3, 27):
+                self.step = "input"
+                self.bundle_text = ""
+                self.repo_name = ""
+                self.files = []
+                self.target = None
+            return ScreenAction.CONTINUE
+        # done
+        if ch in (ord("q"), 3, 27, 10, 13):
+            return ScreenAction.BACK
+        return ScreenAction.CONTINUE
+
+
+class ExtensionsScreen(Screen):
+    """Read-only view of the four auto-managed extension lists.
+
+    Editing still happens via `nomnom register / unregister` on the CLI; the
+    screen surfaces the current state so users can see what's active without
+    grepping nomnom.py."""
+
+    title = "Extensions"
+    help_lines = [
+        "j/k or ↑/↓   move between sections",
+        "esc / q      back to launcher",
+        "",
+        "edit via CLI:",
+        "  nomnom register text .pyx",
+        "  nomnom register binary .lockb",
+        "  nomnom register name MODULE.bazel",
+        "  nomnom register secret '*.creds'",
+        "  nomnom unregister <kind> <value>",
+    ]
+
+    def __init__(self) -> None:
+        self.cursor = 0
+        self.sections = self._load_sections()
+
+    @staticmethod
+    def _load_sections() -> list[tuple[str, list[str]]]:
+        return [
+            ("Text extensions",   sorted(TEXT_EXTENSIONS)),
+            ("Binary extensions", sorted(BINARY_EXTENSIONS)),
+            ("Known text names",  sorted(KNOWN_TEXT_NAMES)),
+            ("Secret patterns",   sorted(SECRET_PATTERNS)),
+        ]
+
+    def render(self, stdscr) -> None:  # pragma: no cover - curses I/O
+        theme = _setup_theme()
+        h, w = stdscr.getmaxyx()
+        try:
+            stdscr.addstr(0, 0, f" {self.title} ".ljust(max(1, w - 1)),
+                          theme["filter"])
+        except curses.error:
+            pass
+        row = 2
+        for si, (label, entries) in enumerate(self.sections):
+            if row >= h - 1:
+                break
+            attr = theme["cursor"] if si == self.cursor else theme["dim"]
+            head = f"  {label}  ({len(entries)})"
+            try:
+                stdscr.addstr(row, 0, head[: max(1, w - 1)], attr)
+            except curses.error:
+                pass
+            row += 1
+            line = "    " + "  ".join(entries)
+            try:
+                stdscr.addstr(row, 0, line[: max(1, w - 1)], 0)
+            except curses.error:
+                pass
+            row += 2
+        try:
+            stdscr.addstr(
+                h - 1, 0,
+                "j/k:section  esc/q:back  ?:help"[: max(1, w - 1)],
+                theme["dim"],
+            )
+        except curses.error:
+            pass
+
+    def handle_key(self, ch: int):
+        if ch in (ord("q"), 3, 27):
+            return ScreenAction.BACK
+        if ch in (curses.KEY_DOWN, ord("j")):
+            self.cursor = (self.cursor + 1) % len(self.sections)
+            return ScreenAction.CONTINUE
+        if ch in (curses.KEY_UP, ord("k")):
+            self.cursor = (self.cursor - 1) % len(self.sections)
+            return ScreenAction.CONTINUE
+        return ScreenAction.CONTINUE
+
+
+class PinsScreen(Screen):
+    """List TOFU-pinned LAN peers; `d` drops the cursored pin."""
+
+    title = "TOFU pins"
+    help_lines = [
+        "j/k or ↑/↓   move",
+        "d            drop cursored pin (confirms)",
+        "esc / q      back to launcher",
+    ]
+
+    def __init__(self) -> None:
+        self.cursor = 0
+        self.message = ""
+        self.peers = self._load_peers()
+
+    @staticmethod
+    def _load_peers() -> list[tuple[str, str, str]]:
+        """Return (device_id, name, fingerprint), sorted by name."""
+        peers = _load_known_peers()
+        out: list[tuple[str, str, str]] = []
+        for pid, rec in peers.items():
+            name = rec.get("name") or pid
+            ik = rec.get("ik_pub") or ""
+            out.append((pid, name, _ik_fingerprint(ik)))
+        out.sort(key=lambda r: (r[1].lower(), r[0]))
+        return out
+
+    def render(self, stdscr) -> None:  # pragma: no cover - curses I/O
+        theme = _setup_theme()
+        h, w = stdscr.getmaxyx()
+        try:
+            stdscr.addstr(0, 0, f" {self.title} ".ljust(max(1, w - 1)),
+                          theme["filter"])
+        except curses.error:
+            pass
+        if not self.peers:
+            try:
+                stdscr.addstr(2, 2, "(no pinned peers yet)", theme["dim"])
+            except curses.error:
+                pass
+        for i, (pid, name, fp) in enumerate(self.peers):
+            row = 2 + i
+            if row >= h - 2:
+                break
+            attr = theme["cursor"] if i == self.cursor else 0
+            line = f"  {name:<20}  {fp}  {pid[:16]}"
+            try:
+                stdscr.addstr(row, 0, line[: max(1, w - 1)], attr)
+            except curses.error:
+                pass
+        if self.message:
+            try:
+                stdscr.addstr(h - 2, 0, self.message[: max(1, w - 1)],
+                              theme["dim"])
+            except curses.error:
+                pass
+        try:
+            stdscr.addstr(
+                h - 1, 0,
+                "j/k:move  d:drop  esc/q:back  ?:help"[: max(1, w - 1)],
+                theme["dim"],
+            )
+        except curses.error:
+            pass
+
+    def handle_key(self, ch: int):
+        if ch in (ord("q"), 3, 27):
+            return ScreenAction.BACK
+        if not self.peers:
+            return ScreenAction.CONTINUE
+        if ch in (curses.KEY_DOWN, ord("j")):
+            self.cursor = (self.cursor + 1) % len(self.peers)
+        elif ch in (curses.KEY_UP, ord("k")):
+            self.cursor = (self.cursor - 1) % len(self.peers)
+        elif ch == ord("d"):
+            pid, name, _fp = self.peers[self.cursor]
+            dropped = _forget_peer(pid)
+            self.peers = self._load_peers()
+            if self.cursor >= len(self.peers) and self.peers:
+                self.cursor = len(self.peers) - 1
+            self.message = f"dropped {', '.join(dropped) or name}."
+        return ScreenAction.CONTINUE
+
+
+def _wrap(text: str, width: int) -> list[str]:
+    """Simple word-wrap; preserves paragraph order, drops nothing."""
+    if width <= 0:
+        return [text]
+    out: list[str] = []
+    for para in text.split("\n"):
+        line = ""
+        for word in para.split():
+            cand = (line + " " + word).strip()
+            if len(cand) <= width:
+                line = cand
+            else:
+                if line:
+                    out.append(line)
+                line = word
+        out.append(line)
+    return out
+
+
 # ---------- main ----------
 
 def _build_subcommand_parser(verb: str) -> argparse.ArgumentParser:
@@ -3073,6 +3884,27 @@ def _build_subcommand_parser(verb: str) -> argparse.ArgumentParser:
     return sub
 
 
+def _add_destination_flags(sub: argparse.ArgumentParser) -> None:
+    """Attach `--clipboard` / `--stdout` to a verb parser; default is FILE."""
+    grp = sub.add_mutually_exclusive_group()
+    grp.add_argument(
+        "--clipboard", action="store_true",
+        help="Copy output to the system clipboard instead of writing a file.",
+    )
+    grp.add_argument(
+        "--stdout", action="store_true",
+        help="Pipe output to stdout (script-friendly, no TTY required).",
+    )
+
+
+def _destination_from_args(args) -> Destination:
+    if getattr(args, "stdout", False):
+        return Destination.STDOUT
+    if getattr(args, "clipboard", False):
+        return Destination.CLIPBOARD
+    return Destination.FILE
+
+
 def _build_commit_parser() -> argparse.ArgumentParser:
     sub = argparse.ArgumentParser(
         prog="nomnom commit",
@@ -3085,10 +3917,7 @@ def _build_commit_parser() -> argparse.ArgumentParser:
         "repo", nargs="?", default=".",
         help="Path to the project repo (default: current directory).",
     )
-    sub.add_argument(
-        "--copy", action="store_true",
-        help="Copy output to the system clipboard instead of writing a file.",
-    )
+    _add_destination_flags(sub)
     return sub
 
 
@@ -3104,10 +3933,7 @@ def _build_pr_parser() -> argparse.ArgumentParser:
         "repo", nargs="?", default=".",
         help="Path to the project repo (default: current directory).",
     )
-    sub.add_argument(
-        "--copy", action="store_true",
-        help="Copy output to the system clipboard instead of writing a file.",
-    )
+    _add_destination_flags(sub)
     sub.add_argument(
         "--base", default=None,
         help="Base branch to diff against (default: gh repo default branch).",
@@ -3132,10 +3958,7 @@ def _build_review_parser() -> argparse.ArgumentParser:
         "repo", nargs="?", default=".",
         help="Path to the project repo (default: current directory).",
     )
-    sub.add_argument(
-        "--copy", action="store_true",
-        help="Copy output to the system clipboard instead of writing a file.",
-    )
+    _add_destination_flags(sub)
     sub.add_argument(
         "--diff", action="store_true",
         help=(
@@ -3201,6 +4024,13 @@ def _build_encrypt_parser() -> argparse.ArgumentParser:
                      help="Seconds to wait while hosting (0.0 = forever). "
                           "Discovery uses a fixed probe window and is not "
                           "controlled by this flag.")
+    sub.add_argument("--peer", default=None,
+                     help="Skip the peer prompt and target this peer "
+                          "(name or device id; case-insensitive, prefix ok). "
+                          "Errors if no peer (or multiple) match.")
+    sub.add_argument("--trust-new", action="store_true",
+                     help="Auto-accept first-use and changed identity keys "
+                          "(no TOFU prompt). Use with care.")
     return sub
 
 
@@ -3222,25 +4052,50 @@ def _build_decrypt_parser() -> argparse.ArgumentParser:
                      help="Seconds to wait while hosting (0.0 = forever). "
                           "Discovery uses a fixed probe window and is not "
                           "controlled by this flag.")
+    sub.add_argument("--peer", default=None,
+                     help="Skip the peer prompt and target this peer "
+                          "(name or device id; case-insensitive, prefix ok). "
+                          "Errors if no peer (or multiple) match.")
+    sub.add_argument("--trust-new", action="store_true",
+                     help="Auto-accept first-use and changed identity keys "
+                          "(no TOFU prompt). Use with care.")
     return sub
 
 
 def _dispatch_subcommand(argv: list[str]) -> int:
+    try:
+        return _dispatch_subcommand_inner(argv)
+    except NomnomError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+
+
+def _dispatch_subcommand_inner(argv: list[str]) -> int:
     # Mixing argparse subparsers with the optional `repo` positional confuses
     # argparse's positional matcher, so we sniff the verb and dispatch by hand.
+    if "--copy" in argv[1:]:
+        print(
+            "error: --copy was removed. Use --clipboard for the same effect, "
+            "or --stdout | pbcopy to pipe.",
+            file=sys.stderr,
+        )
+        return 2
     verb = argv[0]
     if verb in ("register", "unregister"):
         args = _build_subcommand_parser(verb).parse_args(argv[1:])
         return cmd_register(args.kind, args.values, remove=(verb == "unregister"))
     if verb == "commit":
         args = _build_commit_parser().parse_args(argv[1:])
-        return cmd_commit(args.repo, args.copy)
+        return cmd_commit(args.repo, destination=_destination_from_args(args))
     if verb == "pr":
         args = _build_pr_parser().parse_args(argv[1:])
-        return cmd_pr(args.repo, args.copy, args.base)
+        return cmd_pr(args.repo, args.base, destination=_destination_from_args(args))
     if verb == "review":
         args = _build_review_parser().parse_args(argv[1:])
-        return cmd_review(args.repo, args.pr_number, args.copy, args.diff)
+        return cmd_review(
+            args.repo, args.pr_number, args.diff,
+            destination=_destination_from_args(args),
+        )
     if verb == "rebuild":
         args = _build_rebuild_parser().parse_args(argv[1:])
         return cmd_rebuild(args.bundle, args.name)
@@ -3249,10 +4104,16 @@ def _dispatch_subcommand(argv: list[str]) -> int:
         return cmd_forget(args.peer)
     if verb == "encrypt":
         args = _build_encrypt_parser().parse_args(argv[1:])
-        return cmd_encrypt(args.file, host=args.host, timeout=args.timeout)
+        return cmd_encrypt(
+            args.file, host=args.host, timeout=args.timeout,
+            peer_filter=args.peer, trust_new=args.trust_new,
+        )
     if verb == "decrypt":
         args = _build_decrypt_parser().parse_args(argv[1:])
-        return cmd_decrypt(host=args.host, timeout=args.timeout)
+        return cmd_decrypt(
+            host=args.host, timeout=args.timeout,
+            peer_filter=args.peer, trust_new=args.trust_new,
+        )
     print(f"error: unknown subcommand: {verb}", file=sys.stderr)
     return 2
 
@@ -3266,6 +4127,23 @@ SUBCOMMANDS = (
 def main() -> int:
     if len(sys.argv) >= 2 and sys.argv[1] in SUBCOMMANDS:
         return _dispatch_subcommand(sys.argv[1:])
+
+    if len(sys.argv) == 1 and sys.stdin.isatty() and sys.stdout.isatty():
+        try:
+            run_app(LauncherScreen())
+        except NomnomError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+        return 0
+
+    if "--copy" in sys.argv[1:]:
+        print(
+            "error: --copy was removed. Press `d` in the picker to cycle to "
+            "the clipboard destination, or pipe `--stdout` into pbcopy/"
+            "wl-copy/xclip.",
+            file=sys.stderr,
+        )
+        return 2
 
     parser = argparse.ArgumentParser(
         description="nomnom: feed your repo to the LLM, one .txt snack at a time.",
@@ -3285,8 +4163,24 @@ def main() -> int:
         help="Path to the project repo (default: current directory).",
     )
     parser.add_argument(
-        "--copy", action="store_true",
-        help="Copy output to the system clipboard instead of writing a file.",
+        "--all", action="store_true",
+        help="Skip the picker and bundle every scanned file. Combine with "
+             "--include / --exclude to script a filtered bundle.",
+    )
+    parser.add_argument(
+        "--include", action="append", default=[], metavar="GLOB",
+        help="Gitignore-style include pattern (repeatable). Without --all/"
+             "--stdout, matching files are pre-selected in the picker.",
+    )
+    parser.add_argument(
+        "--exclude", action="append", default=[], metavar="GLOB",
+        help="Gitignore-style exclude pattern (repeatable). Applied after "
+             "--include.",
+    )
+    parser.add_argument(
+        "--stdout", action="store_true",
+        help="Skip the picker and write the bundle to stdout. Implies a "
+             "fully-scriptable run (no TTY required).",
     )
     parser.add_argument(
         "--include-secrets", action="store_true",
@@ -3313,6 +4207,15 @@ def main() -> int:
         print(f"error: cannot derive a repo name from {root}", file=sys.stderr)
         return 1
 
+    skip_picker = args.all or args.stdout
+    if not skip_picker and not (sys.stdin.isatty() and sys.stdout.isatty()):
+        print(
+            "error: nomnom needs a TTY for the interactive picker. "
+            "Use --all / --include / --stdout to script.",
+            file=sys.stderr,
+        )
+        return 1
+
     repo_name = root.name
     print(f"scanning {root} ...", file=sys.stderr)
     gi = GitignoreMatcher([]) if args.include_ignored else load_gitignore(root)
@@ -3324,93 +4227,72 @@ def main() -> int:
     print(f"  {len(file_items)} files, {sum(1 for it in items if it.is_dir)} dirs",
           file=sys.stderr)
 
-    selected: list[str] | None = None
-    last = load_last_selection(root)
-    if last:
-        file_rels = {it.rel for it in items if not it.is_dir}
-        present = [p for p in last if p in file_rels]
-        if present and confirm(f"reuse last selection ({len(present)} files)?", default=True):
-            selected = sorted(present)
+    matched_rels: set[str] | None = None
+    if args.include or args.exclude:
+        filtered = apply_include_exclude(items, args.include, args.exclude)
+        matched_rels = {it.rel for it in filtered if not it.is_dir}
+        if not matched_rels:
+            print("no files matched --include / --exclude.", file=sys.stderr)
+            return 0
 
-    if selected is None:
+    if skip_picker:
+        if matched_rels is not None:
+            selected = sorted(matched_rels)
+        else:
+            selected = sorted(it.rel for it in file_items)
+        include_tree = True
+        destination = Destination.STDOUT if args.stdout else Destination.FILE
+    else:
         print("reading file stats...", file=sys.stderr)
         t0 = time.monotonic()
         stats = collect_stats(root, items)
         print(f"  done ({time.monotonic() - t0:.1f}s).", file=sys.stderr)
         nodes = build_tree(items, stats=stats)
-        result = pick(nodes)
+        if matched_rels is not None:
+            for n in nodes:
+                if not n.is_dir and n.rel in matched_rels:
+                    n.checked = True
+        result = pick(nodes, root=root)
         if result is None:
             print("cancelled.", file=sys.stderr)
             return 130
-        if not result:
+        if not result.selected:
             print("no files selected.", file=sys.stderr)
             return 0
-        selected = sorted(result)
+        selected = sorted(result.selected)
+        include_tree = result.include_tree
+        destination = result.destination
 
-    include_tree = confirm("include file tree in output?", default=True)
     tree_str = render_ascii_tree(selected, repo_name) if include_tree else None
-
-    total_bytes = 0
-    large: list[tuple[str, int]] = []
-    for rel in selected:
-        p = root / rel
-        try:
-            sz = p.stat().st_size
-        except OSError:
-            sz = 0
-        total_bytes += sz
-        if sz > LARGE_FILE_BYTES:
-            large.append((rel, sz))
-
-    out_path = pick_output_path(repo_name) if not args.copy else None
-    approx_tokens = total_bytes // 4
-
-    print()
-    print(f"  files:   {len(selected)}")
-    print(f"  size:    {_fmt_size(total_bytes)}")
-    print(f"  ~tokens: {_fmt_tokens(approx_tokens)} (rough chars/4 estimate)")
-    if args.copy:
-        clip = detect_clipboard_cmd()
-        if clip:
-            print(f"  output:  clipboard via {clip[0]}")
-        else:
-            print("  output:  clipboard (no tool found; will fall back to file)")
-    else:
-        print(f"  output:  {out_path}")
-    if large:
-        print(f"  large:   {len(large)} file(s) over {_fmt_size(LARGE_FILE_BYTES)}:")
-        for rel, sz in large[:5]:
-            print(f"           - {rel} ({_fmt_size(sz)})")
-        if len(large) > 5:
-            print(f"           ... and {len(large) - 5} more")
-    print()
-    try:
-        input("press enter to write, Ctrl-C to cancel: ")
-    except (EOFError, KeyboardInterrupt):
-        print("\ncancelled.", file=sys.stderr)
-        return 130
-
     output = render_output(repo_name, root, selected, tree_str)
 
-    if args.copy:
+    if destination == Destination.STDOUT:
+        sys.stdout.write(output)
+        sys.stdout.flush()
+        print(f"wrote {len(output):,} bytes to stdout.", file=sys.stderr)
+        return 0
+
+    if destination == Destination.SEND:
+        name = f"{repo_name}-{datetime.now().strftime('%Y%m%d-%H%M%S')}.txt"
+        return _lan_send_bytes(name, output.encode("utf-8"))
+
+    if destination == Destination.CLIPBOARD:
         if copy_to_clipboard(output):
-            save_last_selection(root, selected)
-            print(f"copied {len(output):,} bytes to clipboard.")
+            print(f"copied {len(output):,} bytes to clipboard.", file=sys.stderr)
             return 0
         print(
             "no clipboard tool found (pbcopy/wl-copy/xclip/xsel); "
             "falling back to a file.",
             file=sys.stderr,
         )
-        out_path = pick_output_path(repo_name)
 
+    out_path = pick_output_path(repo_name)
     try:
         out_path.write_text(output, encoding="utf-8")
     except OSError as e:
         print(f"error writing output: {e}", file=sys.stderr)
         return 1
-    save_last_selection(root, selected)
-    print(f"wrote {out_path}")
+    print(f"wrote {out_path}", file=sys.stderr)
     return 0
 
 
