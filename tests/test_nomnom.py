@@ -91,6 +91,21 @@ class TestGlobToRegex:
         regex = nomnom._glob_to_regex("build", anchored=True)
         assert regex.match("build/x.txt")
 
+    @pytest.mark.parametrize("pattern,path,expected", [
+        # `[!...]` is gitignore-style negation; translates to Python `[^...]`.
+        ("foo[!12]", "foo3", True),
+        ("foo[!12]", "foo1", False),
+        ("foo[!12]", "foo2", False),
+        ("[!a-c]", "d", True),
+        ("[!a-c]", "b", False),
+        # Regression: literal char-class still works after the translation.
+        ("foo[12]", "foo1", True),
+        ("foo[12]", "foo3", False),
+    ])
+    def test_bracket_negation(self, pattern, path, expected):
+        regex = nomnom._glob_to_regex(pattern, anchored=True)
+        assert bool(regex.match(path)) is expected
+
 
 class TestGitignoreMatcher:
     def test_simple_glob_unanchored(self, tmp_path):
@@ -339,6 +354,20 @@ class TestCascadeCheck:
         assert nodes[5].checked is True
         assert all(n.checked is False for n in nodes[:5])
 
+    def test_cascade_check_iterative_no_recursion_error(self):
+        # Realistic repos aren't this deep, but the iterative implementation
+        # should not hit Python's recursion limit on a 2000-deep chain.
+        items = [nomnom.ScanItem(rel=f"d{i}", is_dir=True) for i in range(1)]
+        # Build a 2000-deep linear path: d0/d0/.../d0
+        path_parts: list[str] = []
+        items = []
+        for i in range(2000):
+            path_parts.append(f"d{i}")
+            items.append(nomnom.ScanItem(rel="/".join(path_parts), is_dir=True))
+        nodes = nomnom.build_tree(items)
+        nomnom.cascade_check(nodes, 0, True)
+        assert all(n.checked for n in nodes)
+
 
 # ---------- render_ascii_tree ----------
 
@@ -402,6 +431,42 @@ class TestRenderOutput:
     def test_read_error_inlined(self, tmp_path):
         out = nomnom.render_output("r", tmp_path, ["does-not-exist.py"], None)
         assert "<<read error" in out
+
+
+# ---------- _unique_path ----------
+
+class TestUniquePath:
+    def test_returns_base_when_free(self, tmp_path):
+        base = tmp_path / "foo.txt"
+        assert nomnom._unique_path(base) == base
+
+    def test_appends_minus_n_on_collision(self, tmp_path):
+        base = tmp_path / "foo.txt"
+        base.touch()
+        assert nomnom._unique_path(base) == tmp_path / "foo-1.txt"
+        (tmp_path / "foo-1.txt").touch()
+        assert nomnom._unique_path(base) == tmp_path / "foo-2.txt"
+
+    def test_respects_start_param(self, tmp_path):
+        # File-output callers start at 2 so the first collision suffix is `-2`,
+        # not `-1`. The directory callers start at 1.
+        base = tmp_path / "out.txt"
+        base.touch()
+        assert nomnom._unique_path(base, start=2) == tmp_path / "out-2.txt"
+
+    def test_no_suffix_path(self, tmp_path):
+        # Directory-style: no extension, suffix is "".
+        base = tmp_path / "repo"
+        base.mkdir()
+        assert nomnom._unique_path(base, start=1) == tmp_path / "repo-1"
+
+    def test_keeps_compound_suffix_as_simple_suffix(self, tmp_path):
+        # Path.with_name uses .suffix (single trailing .ext) — confirm this
+        # is acceptable for our callers (none rely on `.tar.gz`-style names).
+        base = tmp_path / "x.tar.gz"
+        base.touch()
+        # The suffix is `.gz` and the stem is `x.tar`; collision yields x.tar-1.gz.
+        assert nomnom._unique_path(base) == tmp_path / "x.tar-1.gz"
 
 
 # ---------- pick_output_path ----------
@@ -744,15 +809,17 @@ class TestExtensionsScreen:
         s.handle_key(ord("z"))
         assert s.add_buf == ".xyz"
 
-    def test_add_dispatches_to_cmd_register(self, monkeypatch):
+    def test_add_dispatches_to_register_values(self, monkeypatch):
         called: dict = {}
 
-        def fake_register(kind, values, remove=False, path=None):
+        def fake_register(kind, values, *, remove=False, path=None):
             called["kind"] = kind
             called["values"] = list(values)
             called["remove"] = remove
-            return 0
-        monkeypatch.setattr(nomnom, "cmd_register", fake_register)
+            return nomnom.RegisterResult(
+                target_name="TEXT_EXTENSIONS", added=list(values), wrote=True,
+            )
+        monkeypatch.setattr(nomnom, "register_values", fake_register)
         # Make _load_sections cheap so it doesn't reflect real globals.
         monkeypatch.setattr(
             nomnom.ExtensionsScreen, "_load_sections",
@@ -792,12 +859,14 @@ class TestExtensionsScreen:
         # has stdscr.)
         removed: dict = {}
 
-        def fake_register(kind, values, remove=False, path=None):
+        def fake_register(kind, values, *, remove=False, path=None):
             removed["kind"] = kind
             removed["values"] = list(values)
             removed["remove"] = remove
-            return 0
-        monkeypatch.setattr(nomnom, "cmd_register", fake_register)
+            return nomnom.RegisterResult(
+                target_name="TEXT_EXTENSIONS", removed=list(values), wrote=True,
+            )
+        monkeypatch.setattr(nomnom, "register_values", fake_register)
         monkeypatch.setattr(
             nomnom.ExtensionsScreen, "_load_sections",
             classmethod(lambda cls: [
@@ -1265,6 +1334,28 @@ class TestNomnomError:
             nomnom._require_gh()
 
 
+# ---------- _resolve_git_repo ----------
+
+class TestResolveGitRepo:
+    def test_raises_on_not_a_directory(self, tmp_path):
+        missing = tmp_path / "nope"
+        with pytest.raises(nomnom.NomnomError, match="not a directory"):
+            nomnom._resolve_git_repo(str(missing))
+
+    def test_raises_on_non_git_directory(self, tmp_path):
+        # A real dir but no .git — _require_git_repo should raise.
+        with pytest.raises(nomnom.NomnomError, match="not a git repository"):
+            nomnom._resolve_git_repo(str(tmp_path))
+
+    def test_returns_path_and_name_on_happy_path(self, tmp_path):
+        repo = tmp_path / "myrepo"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=str(repo), check=True)
+        root, name = nomnom._resolve_git_repo(str(repo))
+        assert root == repo.resolve()
+        assert name == "myrepo"
+
+
 # ---------- preview pane ----------
 
 class TestRenderPreview:
@@ -1568,6 +1659,69 @@ def make_fixture(
     return p
 
 
+class TestRegisterValues:
+    """Direct tests of the structured-API surface. The cmd_register tests below
+    exercise the printing wrapper; this class pins the underlying contract."""
+
+    def test_adds_new_value(self, tmp_path):
+        p = make_fixture(tmp_path)
+        result = nomnom.register_values("text", [".new"], path=p)
+        assert result.added == [".new"]
+        assert result.removed == []
+        assert result.no_ops == []
+        assert result.conflicts == []
+        assert result.wrote is True
+        assert result.target_name == "TEXT_EXTENSIONS"
+
+    def test_add_existing_is_no_op(self, tmp_path):
+        p = make_fixture(tmp_path)
+        before = p.read_bytes()
+        result = nomnom.register_values("text", [".py"], path=p)
+        assert result.added == []
+        assert result.no_ops == [".py"]
+        assert result.wrote is False
+        assert p.read_bytes() == before  # untouched
+
+    def test_remove_existing(self, tmp_path):
+        p = make_fixture(tmp_path, text={".py", ".rs"})
+        result = nomnom.register_values("text", [".rs"], remove=True, path=p)
+        assert result.removed == [".rs"]
+        assert result.wrote is True
+
+    def test_remove_missing_is_no_op(self, tmp_path):
+        p = make_fixture(tmp_path)
+        before = p.read_bytes()
+        result = nomnom.register_values("text", [".never"], remove=True, path=p)
+        assert result.removed == []
+        assert result.no_ops == [".never"]
+        assert result.wrote is False
+        assert p.read_bytes() == before
+
+    def test_conflict_returns_early_no_write(self, tmp_path):
+        p = make_fixture(tmp_path, text={".py"}, binary={".png"})
+        before = p.read_bytes()
+        result = nomnom.register_values("text", [".png"], path=p)
+        assert result.conflicts == [(".png", "binary")]
+        assert result.added == []
+        assert result.wrote is False
+        assert p.read_bytes() == before
+
+    def test_secret_kind_is_list_preserves_order(self, tmp_path):
+        p = make_fixture(tmp_path, secrets=[".env", "*.pem"])
+        result = nomnom.register_values("secret", ["*.creds"], path=p)
+        assert result.added == ["*.creds"]
+        # The list-kind preserves insertion order in the rewritten block.
+        content = p.read_text()
+        assert content.index("'.env',") < content.index("'*.pem',") < content.index("'*.creds',")
+
+    def test_multi_value_mixes_added_and_no_ops(self, tmp_path):
+        p = make_fixture(tmp_path, text={".py"})
+        result = nomnom.register_values("text", [".py", ".new"], path=p)
+        assert result.no_ops == [".py"]
+        assert result.added == [".new"]
+        assert result.wrote is True
+
+
 class TestRegister:
     def test_register_text_adds_and_sorts(self, tmp_path):
         p = make_fixture(tmp_path)
@@ -1773,23 +1927,21 @@ class TestCommitBundle:
         assert "<file_tree>" in text
         assert "a.txt" in text and "b.txt" in text
 
-    def test_no_changes_errors(self, tmp_path, monkeypatch, capsys):
+    def test_no_changes_errors(self, tmp_path, monkeypatch):
         repo = tmp_path / "clean"
         make_git_repo(repo, initial={"a.txt": "hi\n"})
         monkeypatch.chdir(tmp_path)
-        rc = nomnom.cmd_commit(str(repo))
-        assert rc == 1
-        err = capsys.readouterr().err
-        assert "nothing to commit" in err
+        with pytest.raises(nomnom.NomnomError, match="nothing to commit"):
+            nomnom.cmd_commit(str(repo))
 
-    def test_untracked_only_errors(self, tmp_path, monkeypatch, capsys):
+    def test_untracked_only_errors(self, tmp_path, monkeypatch):
         # Per spec: untracked-only doesn't qualify as "something to commit".
         repo = tmp_path / "ut"
         make_git_repo(repo, initial={"a.txt": "hi\n"})
         (repo / "new.txt").write_text("new\n")
         monkeypatch.chdir(tmp_path)
-        rc = nomnom.cmd_commit(str(repo))
-        assert rc == 1
+        with pytest.raises(nomnom.NomnomError, match="nothing to commit"):
+            nomnom.cmd_commit(str(repo))
 
     def test_detached_head_uses_sha_in_filename(
         self, tmp_path, monkeypatch,
@@ -1950,7 +2102,7 @@ class TestPrBundle:
         text = next(out_dir.glob("p-feature-pr-*.txt")).read_text()
         assert "base:   develop" in text
 
-    def test_detached_head_errors(self, tmp_path, monkeypatch, capsys):
+    def test_detached_head_errors(self, tmp_path, monkeypatch):
         repo = tmp_path / "p"
         make_git_repo(repo, initial={"a.txt": "1\n"})
         (repo / "a.txt").write_text("2\n")
@@ -1961,9 +2113,8 @@ class TestPrBundle:
         monkeypatch.setattr(nomnom.shutil, "which",
                             lambda name: f"/usr/bin/{name}")
         monkeypatch.chdir(tmp_path)
-        rc = nomnom.cmd_pr(str(repo), base="main")
-        assert rc == 1
-        assert "detached" in capsys.readouterr().err
+        with pytest.raises(nomnom.NomnomError, match="detached"):
+            nomnom.cmd_pr(str(repo), base="main")
 
     def test_recent_merged_pr_body_truncation(self, tmp_path, monkeypatch):
         repo = tmp_path / "p"
@@ -2059,21 +2210,18 @@ class TestReviewBundle:
                 str(repo), pr_number=1, include_diff=False,
             )
 
-    def test_invalid_pr_number_errors(self, tmp_path, monkeypatch, capsys):
+    def test_invalid_pr_number_errors(self, tmp_path, monkeypatch):
         repo = tmp_path / "p"
         make_git_repo(repo, initial={"a.txt": "1\n"})
         monkeypatch.setattr(nomnom.shutil, "which",
                             lambda name: f"/usr/bin/{name}")
         monkeypatch.chdir(tmp_path)
-        rc = nomnom.cmd_review(
-            str(repo), pr_number=0, include_diff=False,
-        )
-        assert rc == 1
-        assert "must be positive" in capsys.readouterr().err
+        with pytest.raises(nomnom.NomnomError, match="must be positive"):
+            nomnom.cmd_review(
+                str(repo), pr_number=0, include_diff=False,
+            )
 
-    def test_pr_not_found_surfaces_gh_stderr(
-        self, tmp_path, monkeypatch, capsys,
-    ):
+    def test_pr_not_found_surfaces_gh_stderr(self, tmp_path, monkeypatch):
         repo = tmp_path / "p"
         make_git_repo(repo, initial={"a.txt": "1\n"})
         monkeypatch.setattr(nomnom.shutil, "which",
@@ -2088,17 +2236,15 @@ class TestReviewBundle:
         )
         monkeypatch.setattr(nomnom, "_run", stub)
         monkeypatch.chdir(tmp_path)
-        rc = nomnom.cmd_review(
-            str(repo), pr_number=42, include_diff=False,
-        )
-        assert rc == 1
-        err = capsys.readouterr().err
-        assert "no pull request" in err
-        assert "#42" in err
+        with pytest.raises(nomnom.NomnomError) as ei:
+            nomnom.cmd_review(
+                str(repo), pr_number=42, include_diff=False,
+            )
+        msg = str(ei.value)
+        assert "no pull request" in msg
+        assert "#42" in msg
 
-    def test_repo_view_failure_surfaces_error(
-        self, tmp_path, monkeypatch, capsys,
-    ):
+    def test_repo_view_failure_surfaces_error(self, tmp_path, monkeypatch):
         repo = tmp_path / "p"
         make_git_repo(repo, initial={"a.txt": "1\n"})
         monkeypatch.setattr(nomnom.shutil, "which",
@@ -2113,11 +2259,10 @@ class TestReviewBundle:
         )
         monkeypatch.setattr(nomnom, "_run", stub)
         monkeypatch.chdir(tmp_path)
-        rc = nomnom.cmd_review(
-            str(repo), pr_number=1, include_diff=False,
-        )
-        assert rc == 1
-        assert "no remote configured" in capsys.readouterr().err
+        with pytest.raises(nomnom.NomnomError, match="no remote configured"):
+            nomnom.cmd_review(
+                str(repo), pr_number=1, include_diff=False,
+            )
 
     def test_happy_path_minimal_pr(self, tmp_path, monkeypatch):
         repo = tmp_path / "p"

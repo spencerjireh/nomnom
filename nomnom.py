@@ -14,17 +14,22 @@ import curses
 import enum
 import fnmatch
 import hashlib
+import hmac
+import http.server
 import io
 import json
 import locale
 import os
 import re
+import secrets
 import shutil
 import socket
 import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -42,8 +47,8 @@ JUNK_DIRS = {
     "target", ".mypy_cache", ".pytest_cache", ".ruff_cache",
     ".idea", ".vscode", ".cache", ".gradle",
 }
-LARGE_FILE_BYTES = 1_000_000
 BINARY_SNIFF_BYTES = 8192
+APPROX_BYTES_PER_TOKEN = 4
 
 # --- nomnom:extensions (auto-managed; edit with `nomnom register`) ---
 TEXT_EXTENSIONS = {
@@ -226,10 +231,10 @@ class GitignoreRule:
     negated: bool
     dir_only: bool
     base: str
-    regex: "re.Pattern[str]"
+    regex: re.Pattern[str]
 
 
-def _glob_to_regex(pattern: str, anchored: bool) -> "re.Pattern[str]":
+def _glob_to_regex(pattern: str, anchored: bool) -> re.Pattern[str]:
     out = ["^"]
     if not anchored:
         out.append("(?:.*/)?")
@@ -255,7 +260,10 @@ def _glob_to_regex(pattern: str, anchored: bool) -> "re.Pattern[str]":
             if j == -1:
                 out.append(re.escape(c))
             else:
-                out.append(pattern[i:j + 1])
+                inner = pattern[i + 1:j]
+                if inner.startswith("!"):
+                    inner = "^" + inner[1:]
+                out.append("[" + inner + "]")
                 i = j + 1
                 continue
         elif c == "/":
@@ -521,7 +529,7 @@ def collect_stats(
         loc = content.count("\n")
         if content and not content.endswith("\n"):
             loc += 1
-        tokens = len(content) // 4
+        tokens = len(content) // APPROX_BYTES_PER_TOKEN
         out[it.rel] = (size, loc, tokens)
     return out
 
@@ -651,9 +659,11 @@ def visible_indices(nodes: list[Node], sort_key=None) -> list[int]:
 
 
 def cascade_check(nodes: list[Node], idx: int, value: bool) -> None:
-    nodes[idx].checked = value
-    for c in nodes[idx].children:
-        cascade_check(nodes, c, value)
+    stack = [idx]
+    while stack:
+        i = stack.pop()
+        nodes[i].checked = value
+        stack.extend(nodes[i].children)
 
 
 # ---------- picker ----------
@@ -747,7 +757,7 @@ def compute_summary(nodes: list[Node]) -> tuple[int, int, int]:
             continue
         count += 1
         total_bytes += n.size
-    return count, total_bytes, total_bytes // 4
+    return count, total_bytes, total_bytes // APPROX_BYTES_PER_TOKEN
 
 
 def format_footer(
@@ -896,32 +906,19 @@ def _picker_ui(
         else:
             visible = visible_indices(nodes, sort_key=sk)
 
-        if not visible:
-            stdscr.erase()
-            stdscr.addstr(0, 0, "(no matches)")
-            stdscr.addstr(1, 0, f"/ {filter_buf}", curses.A_DIM)
-            stdscr.refresh()
-            ch = stdscr.getch()
-            if filter_active or filter_buf:
-                filter_active, filter_buf = _apply_filter_key(
-                    ch, filter_active, filter_buf
-                )
-                continue
-            if ch in (ord("q"), 3):
-                cancelled = True
-                break
-            continue
-
-        if cursor_ni not in visible:
-            cursor_ni = visible[0]
-        cursor_pos = visible.index(cursor_ni)
-
         h, w = stdscr.getmaxyx()
         list_h = max(1, h - 3)
-        if cursor_pos < viewport:
-            viewport = cursor_pos
-        elif cursor_pos >= viewport + list_h:
-            viewport = cursor_pos - list_h + 1
+        if visible:
+            if cursor_ni not in visible:
+                cursor_ni = visible[0]
+            cursor_pos = visible.index(cursor_ni)
+            if cursor_pos < viewport:
+                viewport = cursor_pos
+            elif cursor_pos >= viewport + list_h:
+                viewport = cursor_pos - list_h + 1
+        else:
+            cursor_pos = 0
+            viewport = 0
 
         show_preview = (
             preview_visible
@@ -937,6 +934,11 @@ def _picker_ui(
             preview_x = preview_w = 0
 
         stdscr.erase()
+        if not visible:
+            try:
+                stdscr.addstr(0, 0, "(no matches)", theme["dim"])
+            except curses.error:
+                pass
         for row in range(list_h):
             vi = viewport + row
             if vi >= len(visible):
@@ -1064,30 +1066,30 @@ def _picker_ui(
                         cascade_check(nodes, cursor_ni, not n.checked)
             continue
 
-        if ch in (curses.KEY_DOWN, ord("j")):
+        if visible and ch in (curses.KEY_DOWN, ord("j")):
             cursor_pos = min(cursor_pos + 1, len(visible) - 1)
             cursor_ni = visible[cursor_pos]
-        elif ch in (curses.KEY_UP, ord("k")):
+        elif visible and ch in (curses.KEY_UP, ord("k")):
             cursor_pos = max(cursor_pos - 1, 0)
             cursor_ni = visible[cursor_pos]
-        elif ch == curses.KEY_NPAGE:
+        elif visible and ch == curses.KEY_NPAGE:
             cursor_pos = min(cursor_pos + list_h, len(visible) - 1)
             cursor_ni = visible[cursor_pos]
-        elif ch == curses.KEY_PPAGE:
+        elif visible and ch == curses.KEY_PPAGE:
             cursor_pos = max(cursor_pos - list_h, 0)
             cursor_ni = visible[cursor_pos]
-        elif ch in (curses.KEY_HOME, ord("g")):
+        elif visible and ch in (curses.KEY_HOME, ord("g")):
             cursor_pos = 0
             cursor_ni = visible[0]
-        elif ch in (curses.KEY_END, ord("G")):
+        elif visible and ch in (curses.KEY_END, ord("G")):
             cursor_pos = len(visible) - 1
             cursor_ni = visible[cursor_pos]
-        elif ch == ord(" "):
+        elif visible and ch == ord(" "):
             cascade_check(nodes, cursor_ni, not nodes[cursor_ni].checked)
-        elif ch in (curses.KEY_RIGHT, ord("l")):
+        elif visible and ch in (curses.KEY_RIGHT, ord("l")):
             if nodes[cursor_ni].is_dir:
                 nodes[cursor_ni].expanded = True
-        elif ch in (curses.KEY_LEFT, ord("h")):
+        elif visible and ch in (curses.KEY_LEFT, ord("h")):
             n = nodes[cursor_ni]
             if n.is_dir and n.expanded:
                 n.expanded = False
@@ -1214,17 +1216,26 @@ def render_output(
     return "\n".join(parts)
 
 
-def pick_output_path(repo_name: str) -> Path:
-    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-    base = Path.cwd() / f"{repo_name}-{ts}.txt"
+def _unique_path(base: Path, *, start: int = 1) -> Path:
+    """Return `base` if free, else `base` with `-{n}` inserted before the suffix.
+
+    `start` is the first index tried on collision. The four pick-* helpers use
+    different starts (file outputs begin at 2 — `foo-2.txt`; rebuild target
+    dirs begin at 1 — `foo-1`)."""
     if not base.exists():
         return base
-    n = 2
+    stem, suffix = base.stem, base.suffix
+    n = start
     while True:
-        candidate = base.with_name(f"{repo_name}-{ts}-{n}.txt")
+        candidate = base.with_name(f"{stem}-{n}{suffix}")
         if not candidate.exists():
             return candidate
         n += 1
+
+
+def pick_output_path(repo_name: str) -> Path:
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    return _unique_path(Path.cwd() / f"{repo_name}-{ts}.txt", start=2)
 
 
 def _slug(s: str) -> str:
@@ -1237,15 +1248,7 @@ def _slug(s: str) -> str:
 def pick_git_output_path(repo_name: str, branch_label: str, kind: str) -> Path:
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
     stem = f"{_slug(repo_name)}-{_slug(branch_label)}-{kind}-{ts}"
-    base = Path.cwd() / f"{stem}.txt"
-    if not base.exists():
-        return base
-    n = 2
-    while True:
-        candidate = base.with_name(f"{stem}-{n}.txt")
-        if not candidate.exists():
-            return candidate
-        n += 1
+    return _unique_path(Path.cwd() / f"{stem}.txt", start=2)
 
 
 _REBUILD_FILE_HEADER_RE = re.compile(
@@ -1339,15 +1342,7 @@ def _validate_rebuild_path(rel: str) -> None:
 
 
 def pick_target_dir(cwd: Path, name: str) -> Path:
-    base = cwd / name
-    if not base.exists():
-        return base
-    n = 1
-    while True:
-        candidate = cwd / f"{name}-{n}"
-        if not candidate.exists():
-            return candidate
-        n += 1
+    return _unique_path(cwd / name, start=1)
 
 
 # ---------- git/gh helpers ----------
@@ -1376,6 +1371,20 @@ def _require_git_repo(root: Path) -> None:
     rc, _, _ = _run(["git", "rev-parse", "--show-toplevel"], root)
     if rc != 0:
         raise NomnomError(f"not a git repository: {root}")
+
+
+def _resolve_git_repo(repo: str) -> tuple[Path, str]:
+    """Resolve a user-supplied repo path to (absolute_path, repo_name).
+
+    Raises `NomnomError` on bad input so both the CLI dispatcher and the TUI
+    `_execute` modal surface the message uniformly."""
+    root = Path(repo).expanduser().resolve()
+    if not root.is_dir():
+        raise NomnomError(f"not a directory: {root}")
+    if not root.name:
+        raise NomnomError(f"cannot derive a repo name from {root}")
+    _require_git_repo(root)
+    return root, root.name
 
 
 def _current_branch(root: Path) -> str | None:
@@ -1522,13 +1531,17 @@ def _emit_git_bundle(
 
 # ---------- self-editing register / unregister ----------
 
-KIND_TO_NAME = {
-    "text":   "TEXT_EXTENSIONS",
-    "binary": "BINARY_EXTENSIONS",
-    "name":   "KNOWN_TEXT_NAMES",
-    "secret": "SECRET_PATTERNS",
+class _KindSpec(NamedTuple):
+    target_name: str
+    is_list: bool
+
+
+KINDS: dict[str, _KindSpec] = {
+    "text":   _KindSpec("TEXT_EXTENSIONS", False),
+    "binary": _KindSpec("BINARY_EXTENSIONS", False),
+    "name":   _KindSpec("KNOWN_TEXT_NAMES", False),
+    "secret": _KindSpec("SECRET_PATTERNS", True),
 }
-KIND_IS_LIST = {"secret"}
 MARKER_START = "# --- nomnom:extensions"
 MARKER_END = "# --- end nomnom:extensions"
 SELF_PATH = Path(__file__).resolve()
@@ -1565,14 +1578,15 @@ def _parse_block(src_lines: list[str], start: int, end: int) -> dict[str, object
 def _emit_block(values: dict[str, object]) -> str:
     parts: list[str] = []
     first = True
-    for kind, name in KIND_TO_NAME.items():
+    for spec in KINDS.values():
+        name = spec.target_name
         v = values.get(name)
         if v is None:
             continue
         if not first:
             parts.append("\n")
         first = False
-        if kind in KIND_IS_LIST:
+        if spec.is_list:
             items = list(v)
             opener, closer = "[", "]"
         else:
@@ -1592,90 +1606,119 @@ def _write_block(
     path.write_text("".join(new_lines), encoding="utf-8")
 
 
+@dataclass
+class RegisterResult:
+    """Structured outcome of `register_values`.
+
+    Order within each list matches the input order. `wrote` is True iff the
+    marker block was rewritten (i.e. at least one add or remove applied)."""
+    target_name: str
+    added: list[str] = field(default_factory=list)
+    removed: list[str] = field(default_factory=list)
+    no_ops: list[str] = field(default_factory=list)
+    conflicts: list[tuple[str, str]] = field(default_factory=list)  # (value, other_kind)
+    wrote: bool = False
+
+
+def register_values(
+    kind: str,
+    values: list[str],
+    *,
+    remove: bool = False,
+    path: Path | None = None,
+) -> RegisterResult:
+    """Apply add/remove operations to the marker block, returning a structured
+    outcome (no printing). Conflicts are detected up front and cause an
+    early return with `wrote=False` and the file untouched."""
+    p = path if path is not None else SELF_PATH
+    src_lines, start, end = _read_block(p)
+    parsed = _parse_block(src_lines, start, end)
+
+    spec = KINDS[kind]
+    target_name = spec.target_name
+    target = parsed[target_name]
+    is_list = spec.is_list
+    result = RegisterResult(target_name=target_name)
+
+    if not remove:
+        for value in values:
+            for other_kind, other_spec in KINDS.items():
+                if other_kind == kind:
+                    continue
+                if value in parsed.get(other_spec.target_name, ()):
+                    result.conflicts.append((value, other_kind))
+        if result.conflicts:
+            return result
+
+    for value in values:
+        if remove:
+            if value not in target:
+                result.no_ops.append(value)
+                continue
+            if is_list:
+                target.remove(value)
+            else:
+                target.discard(value)
+            result.removed.append(value)
+        else:
+            if value in target:
+                result.no_ops.append(value)
+                continue
+            if is_list:
+                target.append(value)
+            else:
+                target.add(value)
+            result.added.append(value)
+
+    if not (result.added or result.removed):
+        return result
+
+    parsed[target_name] = target
+    _write_block(p, src_lines, start, end, _emit_block(parsed))
+    result.wrote = True
+    return result
+
+
 def cmd_register(
     kind: str,
     values: list[str],
     remove: bool = False,
     path: Path | None = None,
 ) -> int:
+    """Thin CLI wrapper around `register_values`: prints diagnostics, returns rc."""
     p = path if path is not None else SELF_PATH
-    src_lines, start, end = _read_block(p)
-    parsed = _parse_block(src_lines, start, end)
-
-    target_name = KIND_TO_NAME[kind]
-    target = parsed[target_name]
-    is_list = kind in KIND_IS_LIST
-
-    if not remove:
-        conflicts: list[tuple[str, str, str]] = []
-        for value in values:
-            for other_kind, other_name in KIND_TO_NAME.items():
-                if other_name == target_name:
-                    continue
-                if value in parsed.get(other_name, ()):
-                    conflicts.append((value, other_kind, other_name))
-        if conflicts:
-            for value, other_kind, other_name in conflicts:
-                print(
-                    f"error: {value!r} is already in {other_name}. "
-                    f"run `nomnom unregister {other_kind} {value}` first.",
-                    file=sys.stderr,
-                )
-            return 1
-
-    changes: list[tuple[str, str]] = []
-    for value in values:
+    result = register_values(kind, values, remove=remove, path=p)
+    if result.conflicts:
+        for value, other_kind in result.conflicts:
+            other_name = KINDS[other_kind].target_name
+            print(
+                f"error: {value!r} is already in {other_name}. "
+                f"run `nomnom unregister {other_kind} {value}` first.",
+                file=sys.stderr,
+            )
+        return 1
+    for value in result.no_ops:
         if remove:
-            if value not in target:
-                print(f"! {value!r} not in {target_name} (no change)")
-                continue
-            if is_list:
-                target.remove(value)
-            else:
-                target.discard(value)
-            changes.append(("-", value))
+            print(f"! {value!r} not in {result.target_name} (no change)")
         else:
-            if value in target:
-                print(f"! {value!r} already in {target_name} (no change)")
-                continue
-            if is_list:
-                target.append(value)
-            else:
-                target.add(value)
-            changes.append(("+", value))
-
-    if not changes:
+            print(f"! {value!r} already in {result.target_name} (no change)")
+    if not result.wrote:
         return 0
-
-    parsed[target_name] = target
-    new_block = _emit_block(parsed)
-    _write_block(p, src_lines, start, end, new_block)
-    for sign, value in changes:
-        verb = "registered" if sign == "+" else "unregistered"
-        print(f"{sign} {verb} {value!r} in {target_name}")
+    for value in result.added:
+        print(f"+ registered {value!r} in {result.target_name}")
+    for value in result.removed:
+        print(f"- unregistered {value!r} in {result.target_name}")
     print(f"\ndone. review with: git diff {p.name}")
     return 0
 
 
 def cmd_commit(repo: str, destination: Destination = Destination.FILE) -> int:
-    root = Path(repo).expanduser().resolve()
-    if not root.is_dir():
-        print(f"error: not a directory: {root}", file=sys.stderr)
-        return 1
-    if not root.name:
-        print(f"error: cannot derive a repo name from {root}", file=sys.stderr)
-        return 1
-    repo_name = root.name
-    _require_git_repo(root)
+    root, repo_name = _resolve_git_repo(repo)
 
     _, staged_diff, _ = _run(["git", "diff", "--staged"], root)
     _, unstaged_diff, _ = _run(["git", "diff"], root)
     if not staged_diff.strip() and not unstaged_diff.strip():
-        print(
-            "error: nothing to commit (no staged or unstaged changes).",
-            file=sys.stderr,
-        )
-        return 1
+        raise NomnomError("nothing to commit (no staged or unstaged changes).")
 
     branch = _current_branch(root)
     branch_label = branch if branch else _short_sha(root)
@@ -1718,34 +1761,20 @@ def cmd_commit(repo: str, destination: Destination = Destination.FILE) -> int:
 
 def cmd_pr(repo: str, base: str | None, destination: Destination = Destination.FILE) -> int:
     _require_gh()
-    root = Path(repo).expanduser().resolve()
-    if not root.is_dir():
-        print(f"error: not a directory: {root}", file=sys.stderr)
-        return 1
-    if not root.name:
-        print(f"error: cannot derive a repo name from {root}", file=sys.stderr)
-        return 1
-    repo_name = root.name
-    _require_git_repo(root)
+    root, repo_name = _resolve_git_repo(repo)
 
     branch = _current_branch(root)
     if branch is None:
-        print(
-            "error: HEAD is detached; check out a branch before running pr.",
-            file=sys.stderr,
+        raise NomnomError(
+            "HEAD is detached; check out a branch before running pr."
         )
-        return 1
 
     if base is None:
         base = _default_base_branch(root)
 
     rc, log_out, log_err = _run(["git", "log", f"{base}...HEAD"], root)
     if rc != 0:
-        print(
-            f"error: git log {base}...HEAD failed: {log_err.strip()}",
-            file=sys.stderr,
-        )
-        return 1
+        raise NomnomError(f"git log {base}...HEAD failed: {log_err.strip()}")
     _, diff_stat, _ = _run(["git", "diff", f"{base}...HEAD", "--stat"], root)
     _, diff_full, _ = _run(["git", "diff", f"{base}...HEAD"], root)
 
@@ -2046,22 +2075,10 @@ def cmd_review(
     destination: Destination = Destination.FILE,
 ) -> int:
     _require_gh()
-    root = Path(repo).expanduser().resolve()
-    if not root.is_dir():
-        print(f"error: not a directory: {root}", file=sys.stderr)
-        return 1
-    if not root.name:
-        print(f"error: cannot derive a repo name from {root}", file=sys.stderr)
-        return 1
-    repo_name = root.name
-    _require_git_repo(root)
+    root, repo_name = _resolve_git_repo(repo)
 
     if pr_number <= 0:
-        print(
-            f"error: pr number must be positive, got {pr_number}",
-            file=sys.stderr,
-        )
-        return 1
+        raise NomnomError(f"pr number must be positive, got {pr_number}")
 
     rc, owner_repo, err = _run(
         ["gh", "repo", "view", "--json", "nameWithOwner",
@@ -2070,12 +2087,10 @@ def cmd_review(
     )
     owner_repo = owner_repo.strip()
     if rc != 0 or "/" not in owner_repo:
-        print(
-            f"error: could not resolve gh repo: "
-            f"{err.strip() or owner_repo or 'unknown error'}",
-            file=sys.stderr,
+        raise NomnomError(
+            f"could not resolve gh repo: "
+            f"{err.strip() or owner_repo or 'unknown error'}"
         )
-        return 1
     owner, name = owner_repo.split("/", 1)
 
     fields = (
@@ -2087,17 +2102,14 @@ def cmd_review(
         ["gh", "pr", "view", str(pr_number), "--json", fields], root,
     )
     if rc != 0:
-        print(
-            f"error: gh pr view #{pr_number} failed: "
-            f"{err.strip() or 'unknown error'}",
-            file=sys.stderr,
+        raise NomnomError(
+            f"gh pr view #{pr_number} failed: "
+            f"{err.strip() or 'unknown error'}"
         )
-        return 1
     try:
         pr = json.loads(pr_view) if pr_view.strip() else {}
     except json.JSONDecodeError as e:
-        print(f"error: gh pr view returned invalid json: {e}", file=sys.stderr)
-        return 1
+        raise NomnomError(f"gh pr view returned invalid json: {e}") from e
 
     def _api_json(args: list[str]) -> object:
         rc, out, _ = _run(args, root)
@@ -2284,7 +2296,6 @@ def _derive_keys(passphrase: str, salt: bytes) -> tuple[bytes, bytes]:
 
 
 def _stream_xor(enc_key: bytes, nonce: bytes, data: bytes) -> bytes:
-    import hmac
     out = bytearray(len(data))
     block_size = 32  # HMAC-SHA256 output
     counter = 0
@@ -2340,12 +2351,10 @@ def encrypt_bytes(
     `_salt` and `_nonce` are test hooks; production callers leave them None
     so they're freshly random per call.
     """
-    import hmac
-    import secrets as _secrets
     if not passphrase:
         raise ValueError("passphrase must not be empty")
-    salt = _salt if _salt is not None else _secrets.token_bytes(_NMNM_SALT_LEN)
-    nonce = _nonce if _nonce is not None else _secrets.token_bytes(_NMNM_NONCE_LEN)
+    salt = _salt if _salt is not None else secrets.token_bytes(_NMNM_SALT_LEN)
+    nonce = _nonce if _nonce is not None else secrets.token_bytes(_NMNM_NONCE_LEN)
     enc_key, mac_key = _derive_keys(passphrase, salt)
     payload = _pack_payload(name, data)
     ciphertext = _stream_xor(enc_key, nonce, payload)
@@ -2360,7 +2369,6 @@ def decrypt_bytes(blob: bytes, passphrase: str) -> tuple[str, bytes]:
     Returns (original_name, original_bytes). Raises ValueError on any
     structural problem, wrong passphrase, or tampering.
     """
-    import hmac
     if len(blob) < _NMNM_HEADER_LEN:
         raise ValueError("ciphertext too short")
     if blob[:len(_NMNM_MAGIC)] != _NMNM_MAGIC:
@@ -2382,17 +2390,7 @@ def decrypt_bytes(blob: bytes, passphrase: str) -> tuple[str, bytes]:
 
 
 def _pick_decrypted_path(parent: Path, name: str) -> Path:
-    base = parent / name
-    if not base.exists():
-        return base
-    stem = base.stem
-    suffix = base.suffix
-    n = 1
-    while True:
-        candidate = parent / f"{stem}-{n}{suffix}"
-        if not candidate.exists():
-            return candidate
-        n += 1
+    return _unique_path(parent / name, start=1)
 
 
 # ---------- LAN transfer ----------
@@ -2448,7 +2446,6 @@ def _load_identity() -> dict:
     Identity is {device_id, name, ik_priv, ik_pub} where ik_* is a long-term
     Diffie-Hellman keypair (hex) used to authenticate transfers under TOFU.
     """
-    import secrets as _secrets
     path = _nomnom_config_dir() / "identity.json"
     ident: dict = {}
     try:
@@ -2459,7 +2456,7 @@ def _load_identity() -> dict:
         pass
     changed = False
     if not ident.get("device_id"):
-        ident["device_id"] = _secrets.token_hex(8)
+        ident["device_id"] = secrets.token_hex(8)
         changed = True
     if not ident.get("name"):
         ident["name"] = socket.gethostname() or "nomnom"
@@ -2548,8 +2545,7 @@ _DH_BYTES = (_DH_P.bit_length() + 7) // 8
 
 
 def _dh_keypair() -> tuple[int, int]:
-    import secrets as _secrets
-    priv = _secrets.randbelow(_DH_P - 3) + 2
+    priv = secrets.randbelow(_DH_P - 3) + 2
     return priv, pow(_DH_G, priv, _DH_P)
 
 
@@ -2755,8 +2751,6 @@ def _lan_make_pull_handler(make_session, make_blob, token: str,
     session key (or None to reject). `make_blob(session_key)` returns the
     ciphertext to send.
     """
-    import http.server
-
     class _PullHandler(http.server.BaseHTTPRequestHandler):
         def log_message(self, *args):
             pass
@@ -2793,8 +2787,6 @@ def _lan_make_push_handler(make_session, state: dict, token: str,
     session key (or None to reject). The raw ciphertext body and the key land
     in `state` for the main thread to decrypt and write.
     """
-    import http.server
-
     class _PushHandler(http.server.BaseHTTPRequestHandler):
         def log_message(self, *args):
             pass
@@ -2849,7 +2841,6 @@ def _lan_serve_one(handler_cls: type, bind_host: str, state: dict,
     Binds to an OS-assigned free port. `on_listen(port)` fires once the
     socket is bound so the caller can start advertising the real port.
     """
-    import http.server
     server = http.server.ThreadingHTTPServer((bind_host, 0), handler_cls)
     server.timeout = 0.5
     if on_listen is not None:
@@ -2875,8 +2866,6 @@ def _lan_identity_headers(identity: dict, ek_pub_hex: str) -> dict:
 
 def _lan_fetch_blob(ip: str, port: int, token: str, identity: dict,
                     ek_pub_hex: str, timeout: float = 30.0) -> bytes:
-    import urllib.error
-    import urllib.request
     url = f"http://{ip}:{port}/{token}"
     req = urllib.request.Request(
         url, headers=_lan_identity_headers(identity, ek_pub_hex))
@@ -2896,8 +2885,6 @@ def _lan_fetch_blob(ip: str, port: int, token: str, identity: dict,
 def _lan_upload_blob(ip: str, port: int, token: str, blob: bytes,
                      identity: dict, ek_pub_hex: str,
                      timeout: float = 30.0) -> None:
-    import urllib.error
-    import urllib.request
     url = f"http://{ip}:{port}/{token}"
     headers = _lan_identity_headers(identity, ek_pub_hex)
     headers["Content-Type"] = "application/octet-stream"
@@ -2920,8 +2907,7 @@ def _lan_upload_blob(ip: str, port: int, token: str, blob: bytes,
 
 
 def _lan_random_token() -> str:
-    import secrets as _secrets
-    return _secrets.token_urlsafe(8)
+    return secrets.token_urlsafe(8)
 
 
 def _lan_warn_firewall() -> None:
@@ -3784,22 +3770,34 @@ class ExtensionsScreen(Screen):
         return self.sections[self.section_cursor]
 
     def _capture_register(self, kind: str, value: str, *, remove: bool) -> int:
-        """Call cmd_register with stderr captured; messages land in self.message
-        (success) or self.error (failure)."""
+        """Apply a register/unregister via the structured `register_values` API
+        and translate the outcome into self.message (info) or self.error."""
         self.message = ""
         self.error = ""
-        out_buf = io.StringIO()
-        err_buf = io.StringIO()
-        with contextlib.redirect_stdout(out_buf), \
-             contextlib.redirect_stderr(err_buf):
-            rc = cmd_register(kind, [value], remove=remove)
-        captured = (err_buf.getvalue() + out_buf.getvalue()).strip()
-        if rc == 0:
-            self.message = captured or (
-                f"removed {value!r}" if remove else f"added {value!r}"
+        result = register_values(kind, [value], remove=remove)
+        if result.conflicts:
+            _, other_kind = result.conflicts[0]
+            other_name = KINDS[other_kind].target_name
+            self.error = (
+                f"{value!r} is already in {other_name}. "
+                f"unregister it from {other_kind} first."
             )
+            rc = 1
+        elif result.added:
+            self.message = f"added {value!r} to {result.target_name}"
+            rc = 0
+        elif result.removed:
+            self.message = f"removed {value!r} from {result.target_name}"
+            rc = 0
+        elif result.no_ops and remove:
+            self.message = f"{value!r} not in {result.target_name} (no change)"
+            rc = 0
+        elif result.no_ops:
+            self.message = f"{value!r} already in {result.target_name} (no change)"
+            rc = 0
         else:
-            self.error = captured or f"register failed (rc={rc})"
+            self.error = "register failed"
+            rc = 1
         self.sections = self._load_sections()
         _, _, entries = self._current()
         if not entries:
@@ -4181,6 +4179,9 @@ class _GitContextScreen(Screen):
     subclass's `_run_cmd` and stores the result for the done panel."""
 
     verb = ""
+    # Field ids that accept free-text input (rendered with `> ` prompt).
+    # Anything else is treated as a read-only status row driven by a hotkey.
+    _TEXT_FIDS: tuple[str, ...] = ("repo",)
 
     def __init__(self) -> None:
         self.step = "inputs"
@@ -4250,16 +4251,13 @@ class _GitContextScreen(Screen):
         if self.step == "inputs":
             row = 2
             for i, (fid, label) in enumerate(self.fields):
-                is_active = (i == self.field_cursor)
-                attr = theme["cursor"] if is_active else theme["dim"]
-                try:
-                    stdscr.addstr(row, 2, label, attr)
-                    stdscr.addstr(row, 2 + len(label) + 2,
-                                  self._field_value(fid)[: max(1, w - 6 - len(label))],
-                                  0)
-                except curses.error:
-                    pass
-                row += 2
+                _text_input_field(
+                    stdscr, row, 2, label, self._field_value(fid), theme,
+                    width=max(1, w - 4),
+                    active=(i == self.field_cursor),
+                    read_only=fid not in self._TEXT_FIDS,
+                )
+                row += 3
             if self.error:
                 try:
                     stdscr.addstr(row, 2, f"error: {self.error}", theme["dim"])
@@ -4339,6 +4337,7 @@ class PRScreen(_GitContextScreen):
 
     title = "PR"
     verb = "PR"
+    _TEXT_FIDS = ("repo", "base")
     help_lines = [
         "tab/arrows  move between fields",
         "type        edit the path or base branch",
@@ -4382,6 +4381,7 @@ class ReviewScreen(_GitContextScreen):
 
     title = "Review"
     verb = "Review"
+    _TEXT_FIDS = ("repo", "pr")
     help_lines = [
         "tab/arrows  move between fields",
         "type        edit fields (PR number is digits-only)",
@@ -4644,16 +4644,25 @@ def _wrap(text: str, width: int) -> list[str]:
 def _text_input_field(
     stdscr, y: int, x: int, label: str, buf: str, theme,
     width: int = -1,
+    *,
+    active: bool = False,
+    read_only: bool = False,
 ) -> None:  # pragma: no cover - curses I/O
-    """Render `label` on row `y` and `> buf` on row `y+1` at column `x`.
+    """Render `label` on row `y` and the value on row `y+1` at column `x`.
 
     Used by every screen that takes a free-text field (path, PR number,
     extension value). The caller owns the input state; this helper only
     draws. Clips long buffers to `width` (use the screen's available
-    columns)."""
+    columns).
+
+    `active=True` highlights the label so the focused row stands out.
+    `read_only=True` drops the leading `> ` prompt — use for status/toggle
+    rows (destination, diff toggle) that the user interacts with via a
+    dedicated key, not by typing."""
     try:
-        stdscr.addstr(y, x, label, theme["dim"])
-        line = "> " + buf
+        label_attr = theme["cursor"] if active else theme["dim"]
+        stdscr.addstr(y, x, label, label_attr)
+        line = buf if read_only else "> " + buf
         if width > 0:
             line = line[:width]
         stdscr.addstr(y + 1, x, line, 0)
@@ -4709,7 +4718,7 @@ def _build_subcommand_parser(verb: str) -> argparse.ArgumentParser:
         ),
     )
     sub.add_argument(
-        "kind", choices=list(KIND_TO_NAME),
+        "kind", choices=list(KINDS),
         help="which list to edit: text | binary | name | secret",
     )
     sub.add_argument(
@@ -4897,66 +4906,83 @@ def _build_decrypt_parser() -> argparse.ArgumentParser:
     return sub
 
 
-def _dispatch_subcommand(argv: list[str]) -> int:
-    try:
-        return _dispatch_subcommand_inner(argv)
-    except NomnomError as e:
-        print(f"error: {e}", file=sys.stderr)
-        return 1
-
-
-def _dispatch_subcommand_inner(argv: list[str]) -> int:
-    # Mixing argparse subparsers with the optional `repo` positional confuses
-    # argparse's positional matcher, so we sniff the verb and dispatch by hand.
-    if "--copy" in argv[1:]:
-        print(
-            "error: --copy was removed. Use --clipboard for the same effect, "
-            "or --stdout | pbcopy to pipe.",
-            file=sys.stderr,
-        )
-        return 2
-    verb = argv[0]
-    if verb in ("register", "unregister"):
-        args = _build_subcommand_parser(verb).parse_args(argv[1:])
-        return cmd_register(args.kind, args.values, remove=(verb == "unregister"))
-    if verb == "commit":
-        args = _build_commit_parser().parse_args(argv[1:])
-        return cmd_commit(args.repo, destination=_destination_from_args(args))
-    if verb == "pr":
-        args = _build_pr_parser().parse_args(argv[1:])
-        return cmd_pr(args.repo, args.base, destination=_destination_from_args(args))
-    if verb == "review":
-        args = _build_review_parser().parse_args(argv[1:])
-        return cmd_review(
-            args.repo, args.pr_number, args.diff,
-            destination=_destination_from_args(args),
-        )
-    if verb == "rebuild":
-        args = _build_rebuild_parser().parse_args(argv[1:])
-        return cmd_rebuild(args.bundle, args.name)
-    if verb == "forget":
-        args = _build_forget_parser().parse_args(argv[1:])
-        return cmd_forget(args.peer)
-    if verb == "encrypt":
-        args = _build_encrypt_parser().parse_args(argv[1:])
-        return cmd_encrypt(
-            args.file, host=args.host, timeout=args.timeout,
-            peer_filter=args.peer, trust_new=args.trust_new,
-        )
-    if verb == "decrypt":
-        args = _build_decrypt_parser().parse_args(argv[1:])
-        return cmd_decrypt(
-            host=args.host, timeout=args.timeout,
-            peer_filter=args.peer, trust_new=args.trust_new,
-        )
-    print(f"error: unknown subcommand: {verb}", file=sys.stderr)
+def _refuse_copy_subcommand() -> int:
+    print(
+        "error: --copy was removed. Use --clipboard for the same effect, "
+        "or --stdout | pbcopy to pipe.",
+        file=sys.stderr,
+    )
     return 2
 
 
-SUBCOMMANDS = (
-    "register", "unregister", "commit", "pr", "review", "rebuild",
-    "encrypt", "decrypt", "forget",
-)
+def _refuse_copy_bare() -> int:
+    print(
+        "error: --copy was removed. Press `d` in the picker to cycle to "
+        "the clipboard destination, or pipe `--stdout` into pbcopy/"
+        "wl-copy/xclip.",
+        file=sys.stderr,
+    )
+    return 2
+
+
+# Verb → (argparser factory, handler). `main()` gates entry on this dict's keys,
+# so the dispatcher does a direct lookup with no fallback branch.
+_DISPATCH = {
+    "register": (
+        lambda: _build_subcommand_parser("register"),
+        lambda a: cmd_register(a.kind, a.values, remove=False),
+    ),
+    "unregister": (
+        lambda: _build_subcommand_parser("unregister"),
+        lambda a: cmd_register(a.kind, a.values, remove=True),
+    ),
+    "commit": (
+        _build_commit_parser,
+        lambda a: cmd_commit(a.repo, destination=_destination_from_args(a)),
+    ),
+    "pr": (
+        _build_pr_parser,
+        lambda a: cmd_pr(a.repo, a.base, destination=_destination_from_args(a)),
+    ),
+    "review": (
+        _build_review_parser,
+        lambda a: cmd_review(a.repo, a.pr_number, a.diff,
+                             destination=_destination_from_args(a)),
+    ),
+    "rebuild": (
+        _build_rebuild_parser,
+        lambda a: cmd_rebuild(a.bundle, a.name),
+    ),
+    "forget": (
+        _build_forget_parser,
+        lambda a: cmd_forget(a.peer),
+    ),
+    "encrypt": (
+        _build_encrypt_parser,
+        lambda a: cmd_encrypt(a.file, host=a.host, timeout=a.timeout,
+                              peer_filter=a.peer, trust_new=a.trust_new),
+    ),
+    "decrypt": (
+        _build_decrypt_parser,
+        lambda a: cmd_decrypt(host=a.host, timeout=a.timeout,
+                              peer_filter=a.peer, trust_new=a.trust_new),
+    ),
+}
+
+SUBCOMMANDS = tuple(_DISPATCH)
+
+
+def _dispatch_subcommand(argv: list[str]) -> int:
+    # Mixing argparse subparsers with the optional `repo` positional confuses
+    # argparse's positional matcher, so we sniff the verb and dispatch by hand.
+    if "--copy" in argv[1:]:
+        return _refuse_copy_subcommand()
+    parser_factory, handler = _DISPATCH[argv[0]]
+    try:
+        return handler(parser_factory().parse_args(argv[1:]))
+    except NomnomError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
 
 
 def _emit_bundle(
@@ -5016,13 +5042,7 @@ def main() -> int:
         return 0
 
     if "--copy" in sys.argv[1:]:
-        print(
-            "error: --copy was removed. Press `d` in the picker to cycle to "
-            "the clipboard destination, or pipe `--stdout` into pbcopy/"
-            "wl-copy/xclip.",
-            file=sys.stderr,
-        )
-        return 2
+        return _refuse_copy_bare()
 
     parser = argparse.ArgumentParser(
         description="nomnom: feed your repo to the LLM, one .txt snack at a time.",
