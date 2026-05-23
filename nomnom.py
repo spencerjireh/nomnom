@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import argparse
 import ast
+import contextlib
 import curses
 import enum
 import fnmatch
 import hashlib
+import io
 import json
 import locale
 import os
@@ -1471,6 +1473,11 @@ def _emit_git_bundle(
         sys.stdout.flush()
         print(f"wrote {size:,} bytes to stdout.", file=sys.stderr)
         return 0
+
+    if destination == Destination.SEND:
+        ts = datetime.now().strftime('%Y%m%d-%H%M%S')
+        name = f"{repo_name}-{branch_label}-{kind}-{ts}.txt"
+        return _lan_send_bytes(name, output.encode("utf-8"))
 
     print(file=sys.stderr)
     print(f"  sections: {len(sections)}", file=sys.stderr)
@@ -3522,6 +3529,12 @@ def _launcher_open(verb: str):
         return RebuildScreen()
     if verb == "Bundle":
         return BundleScreen()
+    if verb == "Commit":
+        return CommitScreen()
+    if verb == "PR":
+        return PRScreen()
+    if verb == "Review":
+        return ReviewScreen()
     return PlaceholderScreen(
         verb,
         f"`nomnom {verb.lower()}` works from the shell. A dedicated TUI "
@@ -4005,6 +4018,272 @@ class BundleScreen(Screen):
         if ch in (ord("q"), 3, 27, 10, 13):
             return ScreenAction.BACK
         return ScreenAction.CONTINUE
+
+
+class _GitContextScreen(Screen):
+    """Shared base for Commit / PR / Review screens.
+
+    State machine: `inputs` → `done`. The inputs step renders a field
+    list driven by `fields`; Tab/arrows cycle the focus, `d` cycles
+    destination from anywhere. Enter captures stdout/stderr around the
+    subclass's `_run_cmd` and stores the result for the done panel."""
+
+    verb = ""
+
+    def __init__(self) -> None:
+        self.step = "inputs"
+        self.field_cursor = 0
+        self.repo_buf = str(Path.cwd())
+        self.destination = Destination.FILE
+        self.error = ""
+        self.output_lines: list[str] = []
+        self.rc = 0
+
+    @property
+    def fields(self) -> list[tuple[str, str]]:
+        """(field_id, label) — drives cursor + rendering."""
+        return [("repo", "Repo path:"), ("dest", "Destination:")]
+
+    def _cycle_dest(self) -> None:
+        self.destination = cycle_destination(
+            self.destination,
+            (Destination.FILE, Destination.CLIPBOARD, Destination.SEND),
+        )
+
+    def _run_cmd(self) -> int:
+        """Subclass hook: dispatch to cmd_commit/pr/review with collected
+        inputs. May raise NomnomError; stdout/stderr are captured by the
+        caller."""
+        raise NotImplementedError
+
+    def _execute(self) -> None:
+        self.error = ""
+        self.output_lines = []
+        out_buf = io.StringIO()
+        err_buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out_buf), \
+                 contextlib.redirect_stderr(err_buf):
+                self.rc = self._run_cmd()
+        except NomnomError as e:
+            self.rc = 1
+            self.error = str(e)
+        captured = (err_buf.getvalue() + out_buf.getvalue()).rstrip("\n")
+        if captured:
+            self.output_lines = captured.splitlines()
+        self.step = "done"
+
+    def _field_value(self, fid: str) -> str:
+        if fid == "repo":
+            return self.repo_buf or "(empty)"
+        if fid == "dest":
+            return _DESTINATION_LABELS[self.destination]
+        return ""
+
+    def _edit_field(self, fid: str, ch: int) -> None:
+        if fid == "repo":
+            if ch in (curses.KEY_BACKSPACE, 127, 8):
+                self.repo_buf = self.repo_buf[:-1]
+            elif 32 <= ch < 127:
+                self.repo_buf += chr(ch)
+
+    def render(self, stdscr) -> None:  # pragma: no cover - curses I/O
+        theme = _setup_theme()
+        h, w = stdscr.getmaxyx()
+        try:
+            stdscr.addstr(0, 0, f" {self.verb} ".ljust(max(1, w - 1)),
+                          theme["filter"])
+        except curses.error:
+            pass
+        if self.step == "inputs":
+            row = 2
+            for i, (fid, label) in enumerate(self.fields):
+                is_active = (i == self.field_cursor)
+                attr = theme["cursor"] if is_active else theme["dim"]
+                try:
+                    stdscr.addstr(row, 2, label, attr)
+                    stdscr.addstr(row, 2 + len(label) + 2,
+                                  self._field_value(fid)[: max(1, w - 6 - len(label))],
+                                  0)
+                except curses.error:
+                    pass
+                row += 2
+            if self.error:
+                try:
+                    stdscr.addstr(row, 2, f"error: {self.error}", theme["dim"])
+                except curses.error:
+                    pass
+            footer = ("tab:next-field  enter:run  d:dest  "
+                      "esc/q:back  ?:help")
+        else:  # done
+            try:
+                rc_attr = theme["dim"] if self.rc == 0 else theme["filter"]
+                stdscr.addstr(2, 2, f"rc: {self.rc}", rc_attr)
+            except curses.error:
+                pass
+            if self.error:
+                try:
+                    stdscr.addstr(3, 2, f"error: {self.error}", theme["dim"])
+                except curses.error:
+                    pass
+            row = 5 if self.error else 4
+            for line in self.output_lines:
+                if row >= h - 1:
+                    break
+                try:
+                    stdscr.addstr(row, 2, line[: max(1, w - 3)], 0)
+                except curses.error:
+                    pass
+                row += 1
+            footer = "esc/q:back  ?:help"
+        try:
+            stdscr.addstr(h - 1, 0, footer[: max(1, w - 1)], theme["dim"])
+        except curses.error:
+            pass
+
+    def handle_key(self, ch: int, stdscr=None):
+        if self.step == "inputs":
+            if ch in (ord("q"), 3, 27):
+                return ScreenAction.BACK
+            if ch in (9, curses.KEY_DOWN):
+                self.field_cursor = (self.field_cursor + 1) % len(self.fields)
+                return ScreenAction.CONTINUE
+            if ch == curses.KEY_UP:
+                self.field_cursor = (self.field_cursor - 1) % len(self.fields)
+                return ScreenAction.CONTINUE
+            if ch == ord("d"):
+                self._cycle_dest()
+                return ScreenAction.CONTINUE
+            if ch in (10, 13):
+                self._execute()
+                return ScreenAction.CONTINUE
+            fid = self.fields[self.field_cursor][0]
+            self._edit_field(fid, ch)
+            return ScreenAction.CONTINUE
+        # done
+        if ch in (ord("q"), 3, 27, 10, 13):
+            return ScreenAction.BACK
+        return ScreenAction.CONTINUE
+
+
+class CommitScreen(_GitContextScreen):
+    """Bundle staged + unstaged diffs + recent commits via `cmd_commit`."""
+
+    title = "Commit"
+    verb = "Commit"
+    help_lines = [
+        "tab/arrows  move between fields",
+        "type        edit the path",
+        "d           cycle destination (file/clipboard/send)",
+        "enter       run; esc/q to go back",
+    ]
+
+    def _run_cmd(self) -> int:
+        return cmd_commit(self.repo_buf.strip(), destination=self.destination)
+
+
+class PRScreen(_GitContextScreen):
+    """Bundle commits-since-base + diff via `cmd_pr`."""
+
+    title = "PR"
+    verb = "PR"
+    help_lines = [
+        "tab/arrows  move between fields",
+        "type        edit the path or base branch",
+        "d           cycle destination (file/clipboard/send)",
+        "enter       run; esc/q to go back",
+    ]
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.base_buf = ""
+
+    @property
+    def fields(self) -> list[tuple[str, str]]:
+        return [
+            ("repo", "Repo path:"),
+            ("base", "Base branch:"),
+            ("dest", "Destination:"),
+        ]
+
+    def _field_value(self, fid: str) -> str:
+        if fid == "base":
+            return self.base_buf or "(default)"
+        return super()._field_value(fid)
+
+    def _edit_field(self, fid: str, ch: int) -> None:
+        if fid == "base":
+            if ch in (curses.KEY_BACKSPACE, 127, 8):
+                self.base_buf = self.base_buf[:-1]
+            elif 32 <= ch < 127:
+                self.base_buf += chr(ch)
+            return
+        super()._edit_field(fid, ch)
+
+    def _run_cmd(self) -> int:
+        base = self.base_buf.strip() or None
+        return cmd_pr(self.repo_buf.strip(), base, destination=self.destination)
+
+
+class ReviewScreen(_GitContextScreen):
+    """Bundle PR meta + diff + threads via `cmd_review`."""
+
+    title = "Review"
+    verb = "Review"
+    help_lines = [
+        "tab/arrows  move between fields",
+        "type        edit fields (PR number is digits-only)",
+        "space       toggle the diff field when focused",
+        "d           cycle destination (file/clipboard/send)",
+        "enter       run; esc/q to go back",
+    ]
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.pr_buf = ""
+        self.include_diff = False
+
+    @property
+    def fields(self) -> list[tuple[str, str]]:
+        return [
+            ("repo", "Repo path:"),
+            ("pr", "PR number:"),
+            ("diff", "Include diff:"),
+            ("dest", "Destination:"),
+        ]
+
+    def _field_value(self, fid: str) -> str:
+        if fid == "pr":
+            return self.pr_buf or "(required)"
+        if fid == "diff":
+            return "yes" if self.include_diff else "no"
+        return super()._field_value(fid)
+
+    def _edit_field(self, fid: str, ch: int) -> None:
+        if fid == "pr":
+            if ch in (curses.KEY_BACKSPACE, 127, 8):
+                self.pr_buf = self.pr_buf[:-1]
+            elif ord("0") <= ch <= ord("9"):
+                self.pr_buf += chr(ch)
+            return
+        if fid == "diff":
+            if ch == ord(" "):
+                self.include_diff = not self.include_diff
+            return
+        super()._edit_field(fid, ch)
+
+    def _run_cmd(self) -> int:
+        pr_text = self.pr_buf.strip()
+        if not pr_text:
+            raise NomnomError("PR number is required")
+        try:
+            n = int(pr_text)
+        except ValueError:
+            raise NomnomError(f"PR number must be an integer: {pr_text!r}")
+        return cmd_review(
+            self.repo_buf.strip(), n, self.include_diff,
+            destination=self.destination,
+        )
 
 
 def _wrap(text: str, width: int) -> list[str]:

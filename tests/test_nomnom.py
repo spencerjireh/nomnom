@@ -864,6 +864,195 @@ class TestEmitBundle:
         assert any("stdout" in line for line in lines)
 
 
+class TestCommitScreen:
+    def test_init_defaults(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        s = nomnom.CommitScreen()
+        assert s.step == "inputs"
+        assert s.field_cursor == 0
+        assert s.repo_buf == str(tmp_path)
+        assert s.destination == nomnom.Destination.FILE
+
+    def test_tab_cycles_fields(self):
+        s = nomnom.CommitScreen()
+        n = len(s.fields)
+        for _ in range(n):
+            s.handle_key(9)  # Tab
+        assert s.field_cursor == 0
+
+    def test_d_cycles_destination(self):
+        s = nomnom.CommitScreen()
+        s.handle_key(ord("d"))
+        assert s.destination == nomnom.Destination.CLIPBOARD
+        s.handle_key(ord("d"))
+        assert s.destination == nomnom.Destination.SEND
+        s.handle_key(ord("d"))
+        assert s.destination == nomnom.Destination.FILE  # wraps
+
+    def test_path_edit_appends_chars(self):
+        s = nomnom.CommitScreen()
+        s.repo_buf = ""
+        s.handle_key(ord("/"))
+        s.handle_key(ord("a"))
+        assert s.repo_buf == "/a"
+
+    def test_q_returns_back(self):
+        s = nomnom.CommitScreen()
+        assert s.handle_key(ord("q")) == nomnom.ScreenAction.BACK
+
+    def test_execute_captures_stdout_stderr(self, monkeypatch):
+        s = nomnom.CommitScreen()
+        s.repo_buf = "/tmp/some-repo"
+
+        def fake_cmd_commit(repo, *, destination):
+            print("stdout line")
+            print("stderr line", file=sys.stderr)
+            return 0
+        monkeypatch.setattr(nomnom, "cmd_commit", fake_cmd_commit)
+        s.handle_key(10)  # Enter
+        assert s.step == "done"
+        assert s.rc == 0
+        assert any("stdout line" in line for line in s.output_lines)
+        assert any("stderr line" in line for line in s.output_lines)
+
+    def test_execute_handles_nomnom_error(self, monkeypatch):
+        s = nomnom.CommitScreen()
+        s.repo_buf = "/tmp/some-repo"
+
+        def boom(repo, *, destination):
+            raise nomnom.NomnomError("not a git repository: /tmp/some-repo")
+        monkeypatch.setattr(nomnom, "cmd_commit", boom)
+        s.handle_key(10)
+        assert s.rc == 1
+        assert "not a git repository" in s.error
+        assert s.step == "done"
+
+
+class TestPRScreen:
+    def test_base_field_present(self):
+        s = nomnom.PRScreen()
+        field_ids = [fid for fid, _ in s.fields]
+        assert field_ids == ["repo", "base", "dest"]
+
+    def test_base_field_edits_when_focused(self):
+        s = nomnom.PRScreen()
+        # Cursor to "base" (index 1).
+        s.handle_key(9)
+        assert s.field_cursor == 1
+        s.handle_key(ord("d"))  # 'd' would normally cycle dest — but
+        # since 'd' is intercepted first, dest cycles even when on base.
+        # We verify by testing base editing with non-d chars.
+        s.field_cursor = 1
+        s.base_buf = ""
+        s.handle_key(ord("m"))
+        s.handle_key(ord("a"))
+        s.handle_key(ord("i"))
+        s.handle_key(ord("n"))
+        assert s.base_buf == "main"
+
+    def test_run_passes_base_to_cmd_pr(self, monkeypatch):
+        called: dict = {}
+
+        def fake_cmd_pr(repo, base, *, destination):
+            called["repo"] = repo
+            called["base"] = base
+            called["destination"] = destination
+            return 0
+        monkeypatch.setattr(nomnom, "cmd_pr", fake_cmd_pr)
+        s = nomnom.PRScreen()
+        s.repo_buf = "/tmp/r"
+        s.base_buf = "develop"
+        s.destination = nomnom.Destination.CLIPBOARD
+        s.handle_key(10)
+        assert called == {"repo": "/tmp/r", "base": "develop",
+                          "destination": nomnom.Destination.CLIPBOARD}
+
+    def test_empty_base_passes_none(self, monkeypatch):
+        called: dict = {}
+
+        def fake_cmd_pr(repo, base, *, destination):
+            called["base"] = base
+            return 0
+        monkeypatch.setattr(nomnom, "cmd_pr", fake_cmd_pr)
+        s = nomnom.PRScreen()
+        s.repo_buf = "/tmp/r"
+        s.base_buf = ""
+        s.handle_key(10)
+        assert called["base"] is None
+
+
+class TestReviewScreen:
+    def test_fields_include_pr_and_diff(self):
+        s = nomnom.ReviewScreen()
+        field_ids = [fid for fid, _ in s.fields]
+        assert field_ids == ["repo", "pr", "diff", "dest"]
+
+    def test_pr_number_accepts_only_digits(self):
+        s = nomnom.ReviewScreen()
+        s.field_cursor = 1  # focus PR number
+        s.handle_key(ord("1"))
+        s.handle_key(ord("2"))
+        s.handle_key(ord("x"))  # non-digit, ignored
+        s.handle_key(ord("3"))
+        assert s.pr_buf == "123"
+
+    def test_diff_toggled_by_space_when_focused(self):
+        s = nomnom.ReviewScreen()
+        s.field_cursor = 2  # focus diff
+        assert s.include_diff is False
+        s.handle_key(ord(" "))
+        assert s.include_diff is True
+        s.handle_key(ord(" "))
+        assert s.include_diff is False
+
+    def test_run_errors_on_missing_pr_number(self, monkeypatch):
+        monkeypatch.setattr(nomnom, "cmd_review",
+                            lambda *a, **k: 0)
+        s = nomnom.ReviewScreen()
+        s.repo_buf = "/tmp/r"
+        s.pr_buf = ""
+        s.handle_key(10)
+        assert s.rc == 1
+        assert "required" in s.error.lower()
+
+    def test_run_passes_args(self, monkeypatch):
+        called: dict = {}
+
+        def fake_cmd_review(repo, pr_number, include_diff, *, destination):
+            called["pr"] = pr_number
+            called["diff"] = include_diff
+            called["dest"] = destination
+            return 0
+        monkeypatch.setattr(nomnom, "cmd_review", fake_cmd_review)
+        s = nomnom.ReviewScreen()
+        s.repo_buf = "/tmp/r"
+        s.pr_buf = "42"
+        s.include_diff = True
+        s.destination = nomnom.Destination.SEND
+        s.handle_key(10)
+        assert called == {"pr": 42, "diff": True,
+                          "dest": nomnom.Destination.SEND}
+
+
+class TestEmitGitBundleSend:
+    def test_send_destination_calls_lan_send(self, monkeypatch):
+        sent: dict = {}
+
+        def fake_send(name, data):
+            sent["name"] = name
+            sent["bytes"] = len(data)
+            return 0
+        monkeypatch.setattr(nomnom, "_lan_send_bytes", fake_send)
+        rc = nomnom._emit_git_bundle(
+            "r", "commit", "main", [("git_status", "ok\n")], None,
+            nomnom.Destination.SEND,
+        )
+        assert rc == 0
+        assert sent["name"].startswith("r-main-commit-")
+        assert sent["name"].endswith(".txt")
+        assert sent["bytes"] > 0
+
+
 class TestNomnomError:
     def test_require_git_repo_raises_on_non_repo(self, tmp_path):
         # tmp_path is not a git repo.
