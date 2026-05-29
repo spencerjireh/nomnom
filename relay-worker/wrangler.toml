@@ -2,6 +2,12 @@ name = "nomnom-relay"
 main = "src/worker.ts"
 compatibility_date = "2025-05-01"
 
+# Custom domain. Requires the zone (spencerjireh.com) to be on Cloudflare;
+# Wrangler provisions the DNS record + SSL cert on deploy.
+routes = [
+  { pattern = "relay.spencerjireh.com", custom_domain = true },
+]
+
 # R2 bucket holds short-lived rendezvous payloads.
 # Create with: npx wrangler r2 bucket create nomnom-relay
 [[r2_buckets]]
