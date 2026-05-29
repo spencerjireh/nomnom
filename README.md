@@ -120,15 +120,16 @@ nomnom relay setup           # paste URL + the passphrase, runs a self-test
 ### Day-to-day
 
 ```sh
-# First contact (no pin yet) — both sides run `pair`:
-nomnom pair report.txt               # sender: posts at the rendezvous
-nomnom pair                          # receiver: long-polls, TOFU-prompts
+# First contact (no pin yet) — both sides run `pair` at the same time:
+nomnom pair                          # identity-only handshake, TOFU on both ends
 
 # Recurring (after pairing, no extra ceremony):
 nomnom decrypt                       # long-polls every pinned peer
 nomnom encrypt report.txt            # auto-targets the single pinned peer
 nomnom encrypt report.txt --to spencer-mac   # disambiguates if many
 ```
+
+`pair` is symmetric: whichever side wins the race at the rendezvous slot becomes the initiator, the other side falls back to responder. Pinning is local, so a one-sided TOFU decline just leaves that side unpinned; the other side times out after 30s with no harm.
 
 `--trust-new` auto-accepts the TOFU prompt (scriptable but loses verification; an audit line is still written to stderr). Max transfer size: 256 MB (capped at 100 MB on Cloudflare's free tier — see relay-worker/README.md).
 
@@ -169,9 +170,11 @@ Anyone who can talk to your relay can land at the rendezvous, so verify the fing
 <details>
 <summary><b>Crypto</b></summary>
 
-Triple-DH over RFC 3526 group 14 derives a fresh session key per transfer (forward secrecy, identity-pinned auth). After first contact, the canonical pair of identity pubkeys is mixed into the key derivation, so a relay-level adversary cannot land on the same key without the long-term pin. For the very first contact, `scrypt(relay_secret, "nomnom-first-contact-v2", N=2^15)` plays the same role — slowing offline brute-force on a human-memorable passphrase so the trust claim narrows to "anyone with the relay secret can initiate pairing; TOFU confirms device identity."
+**Recurring transfers** (encrypt/decrypt to an already-pinned peer): Triple-DH over RFC 3526 group 14 derives a fresh session key per transfer (forward secrecy, identity-pinned auth). The canonical pair of identity pubkeys is mixed into the key derivation, so a relay-level adversary cannot land on the same key without the long-term pin. Three-message handshake over the Worker: sender PUTs init blob → receiver fetches + PUTs response → sender encrypts + PUTs ciphertext → receiver fetches + decrypts.
 
-Three-message handshake over the Worker: sender PUTs init blob → receiver fetches + PUTs response → sender encrypts + PUTs ciphertext → receiver fetches + decrypts. Each slot expires in 5 min on the Worker; bucket lifecycle deletes orphans after 1 day. The Worker's HMAC authenticates clients to your relay; body integrity comes from the AEAD wrapper (encrypt-then-HMAC-SHA256 in counter mode, keys via scrypt).
+**First contact (`pair`)**: identity-only, two-message exchange. Each side PUTs its identity pubkey + device id + name into the per-relay rendezvous slot derived from `scrypt(relay_secret, "nomnom-first-contact-v2", N=2^15)`; the scrypt cost slows offline brute-force on a human-memorable passphrase. No DH, no session key, no payload — the trust claim narrows to "anyone with the relay secret can land at the rendezvous; TOFU confirms device identity." Verify the fingerprint out-of-band if it matters.
+
+Each slot expires in 5 min on the Worker; bucket lifecycle deletes orphans after 1 day. The Worker's HMAC authenticates clients to your relay; body integrity comes from the AEAD wrapper (encrypt-then-HMAC-SHA256 in counter mode, keys via scrypt).
 
 </details>
 
@@ -185,6 +188,23 @@ Three-message handshake over the Worker: sender PUTs init blob → receiver fetc
 | `nomnom relay test` | Round-trip: hits `/health` then PUT + GET a random slot. |
 | `nomnom relay show` | Prints URL; redacts secret. |
 | `nomnom relay clear` | Deletes `~/.config/nomnom/relay.json`. |
+
+</details>
+
+<details>
+<summary><b>Reset all state</b></summary>
+
+`nomnom reset` wipes `~/.config/nomnom/` after a y/N prompt — identity, pinned peers, and relay config in one shot. Refuses on a non-tty stdin so a piped invocation can't accidentally blow it away.
+
+```sh
+nomnom reset
+# about to delete /Users/you/.config/nomnom and 3 entries
+# (identity.json, known_peers.json, relay.json).
+# identity rotation will invalidate every pin on every paired device.
+# proceed? [y/N]: y
+```
+
+After reset the next `nomnom relay setup` regenerates a fresh identity. Other devices that previously paired with you will see a TOFU mismatch on the next transfer; re-pair to re-establish trust.
 
 </details>
 
