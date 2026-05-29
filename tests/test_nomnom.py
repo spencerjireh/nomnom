@@ -3271,22 +3271,6 @@ class TestRelayConfig:
         # second call is a no-op
         assert nomnom._relay_clear_config() is False
 
-    def test_export_import_blob_round_trip(self):
-        cfg = {"url": "https://relay.example.com", "secret": "topsecret"}
-        blob = nomnom._relay_export_blob(cfg)
-        assert blob.startswith("nm1.")
-        restored = nomnom._relay_import_blob(blob)
-        assert restored == cfg
-
-    def test_import_blob_rejects_bad_prefix(self):
-        with pytest.raises(nomnom.NomnomError):
-            nomnom._relay_import_blob("not-a-blob")
-
-    def test_import_blob_rejects_garbage(self):
-        with pytest.raises(nomnom.NomnomError):
-            nomnom._relay_import_blob("nm1.!!!invalid!!!")
-
-
 class TestRelayHmac:
     def test_headers_have_expected_shape(self):
         h = nomnom._relay_hmac_headers("secret-xyz", "PUT", "/slots/abc")

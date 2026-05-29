@@ -2718,7 +2718,6 @@ _RELAY_MAX_BODY = 256 * 1024 * 1024          # 256 MiB; free tier caps at 100 Mi
 _RELAY_DEFAULT_WAIT_MS = 30_000
 _RELAY_REQUEST_TIMEOUT = 35.0                # long-poll cap + a few seconds slack
 _RELAY_USER_AGENT = "nomnom-relay-client/1"
-_RELAY_SETUP_BLOB_PREFIX = "nm1."
 
 _PAIRING_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"  # Crockford base32 (no I/L/O/U)
 
@@ -2834,35 +2833,6 @@ def _relay_clear_config() -> bool:
         return False
     except OSError:
         return False
-
-
-def _relay_export_blob(relay: dict) -> str:
-    """Encode {url, secret, v:1} into the nm1.<base64> share string."""
-    payload = json.dumps({"url": relay["url"], "secret": relay["secret"], "v": 1})
-    return _RELAY_SETUP_BLOB_PREFIX + base64.urlsafe_b64encode(
-        payload.encode("utf-8"),
-    ).rstrip(b"=").decode("ascii")
-
-
-def _relay_import_blob(blob: str) -> dict:
-    """Decode the nm1.<...> share string. Raises NomnomError on bad input."""
-    blob = blob.strip()
-    if not blob.startswith(_RELAY_SETUP_BLOB_PREFIX):
-        raise NomnomError("not a relay-config blob (expected nm1.<...>)")
-    payload = blob[len(_RELAY_SETUP_BLOB_PREFIX):]
-    padded = payload + "=" * (-len(payload) % 4)
-    try:
-        raw = base64.urlsafe_b64decode(padded.encode("ascii"))
-        data = json.loads(raw.decode("utf-8"))
-    except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as e:
-        raise NomnomError(f"malformed relay-config blob: {e}") from e
-    url = data.get("url") if isinstance(data, dict) else None
-    secret = data.get("secret") if isinstance(data, dict) else None
-    if not (isinstance(url, str) and isinstance(secret, str)):
-        raise NomnomError("relay-config blob missing url/secret")
-    if not url.startswith(("http://", "https://")):
-        raise NomnomError("relay-config URL must be http(s)")
-    return {"url": url.rstrip("/"), "secret": secret}
 
 
 # --- HMAC + HTTP ---
@@ -3882,15 +3852,13 @@ def cmd_relay(args) -> int:
     handlers = {
         "setup": _cmd_relay_setup,
         "set": _cmd_relay_set,
-        "export": _cmd_relay_export,
-        "import": _cmd_relay_import,
         "test": _cmd_relay_test,
         "show": _cmd_relay_show,
         "clear": _cmd_relay_clear,
     }
     if action is None:
         sys.stderr.write(
-            "usage: nomnom relay {setup,set,export,import,test,show,clear}\n",
+            "usage: nomnom relay {setup,set,test,show,clear}\n",
         )
         return 2
     return handlers[action](args)
@@ -3991,37 +3959,6 @@ def _cmd_relay_set(args) -> int:
     try:
         _save_relay_config(
             url, args.secret,
-            allow_private=getattr(args, "allow_private", False),
-        )
-    except NomnomError as e:
-        sys.stderr.write(f"error: {e}\n")
-        return 1
-    sys.stderr.write(f"saved to {_relay_config_path()} ({msg})\n")
-    return 0
-
-
-def _cmd_relay_export(_args) -> int:
-    cfg = _load_relay_config()
-    if cfg is None:
-        sys.stderr.write("error: no relay configured.\n")
-        return 1
-    print(_relay_export_blob(cfg))
-    return 0
-
-
-def _cmd_relay_import(args) -> int:
-    try:
-        cfg = _relay_import_blob(args.blob)
-    except NomnomError as e:
-        sys.stderr.write(f"error: {e}\n")
-        return 1
-    rc, msg = _relay_self_test(cfg)
-    if rc != 0:
-        sys.stderr.write(f"error: {msg}\nconfig NOT saved.\n")
-        return 1
-    try:
-        _save_relay_config(
-            cfg["url"], cfg["secret"],
             allow_private=getattr(args, "allow_private", False),
         )
     except NomnomError as e:
@@ -6001,10 +5938,6 @@ def _build_relay_parser() -> argparse.ArgumentParser:
     p_set.add_argument("url", help="Worker URL, e.g. https://relay.workers.dev")
     p_set.add_argument("--secret", required=True, help="Shared HMAC secret.")
     p_set.add_argument("--allow-private", action="store_true", help=private_help)
-    sp.add_parser("export", help="Print a shareable nm1.<...> blob for another Mac.")
-    p_import = sp.add_parser("import", help="Apply config from an nm1.<...> blob.")
-    p_import.add_argument("blob", help="The nm1.<...> string from `relay export`.")
-    p_import.add_argument("--allow-private", action="store_true", help=private_help)
     sp.add_parser("test", help="Round-trip check: hits /health then PUT + GET.")
     sp.add_parser("show", help="Print current config (secret redacted).")
     sp.add_parser("clear", help="Delete relay.json after confirmation.")
