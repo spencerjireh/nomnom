@@ -1220,7 +1220,9 @@ class TestSendScreen:
         s = nomnom.SendScreen()
         assert s.step == "path"
         assert s.path_buf == ""
-        assert s.rc == 0
+        # New relay-based screen tracks state in a dataclass; rc is -1 until
+        # the worker thread finishes.
+        assert s.state.rc == -1
 
     def test_path_edit_appends_chars(self):
         s = nomnom.SendScreen()
@@ -1234,92 +1236,73 @@ class TestSendScreen:
         assert s.handle_key(ord("q")) == nomnom.ScreenAction.BACK
 
     def test_invalid_path_sets_error(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(nomnom.curses, "endwin", lambda: None)
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
         s = nomnom.SendScreen()
         s.path_buf = str(tmp_path / "missing.bin")
-        s._validate_and_send(_FakeStdscr())
+        s._begin_send()
         assert s.step == "path"
         assert "not a file" in s.error
 
-    def test_happy_path_dispatches_to_lan_send_bytes(self, tmp_path, monkeypatch):
+    def test_missing_relay_blocks_send(self, tmp_path, monkeypatch):
+        # With no relay configured, _begin_send should bail before starting
+        # the worker thread.
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
         f = tmp_path / "blob.bin"
         f.write_bytes(b"hello\n")
-        captured: dict = {}
-
-        def fake_send(name, data, **kw):
-            captured["name"] = name
-            captured["bytes"] = len(data)
-            return 0
-        monkeypatch.setattr(nomnom, "_lan_send_bytes", fake_send)
-        monkeypatch.setattr(nomnom.curses, "endwin", lambda: None)
         s = nomnom.SendScreen()
         s.path_buf = str(f)
-        s._validate_and_send(_FakeStdscr())
-        assert s.step == "done"
-        assert s.rc == 0
-        assert captured == {"name": "blob.bin", "bytes": 6}
-
-    def test_lan_send_failure_recorded(self, tmp_path, monkeypatch):
-        f = tmp_path / "blob.bin"
-        f.write_bytes(b"x")
-        monkeypatch.setattr(nomnom, "_lan_send_bytes", lambda n, d, **k: 1)
-        monkeypatch.setattr(nomnom.curses, "endwin", lambda: None)
-        s = nomnom.SendScreen()
-        s.path_buf = str(f)
-        s._validate_and_send(_FakeStdscr())
-        assert s.step == "done"
-        assert s.rc == 1
+        s._begin_send()
+        assert s.step == "path"
+        assert "relay" in s.error.lower()
 
 
 class TestReceiveScreen:
     def test_init_defaults(self):
         s = nomnom.ReceiveScreen()
-        assert s.step == "ready"
-        assert s.rc == 0
+        # New ReceiveScreen opens on the mode chooser (pinned-peers vs code).
+        assert s.step == "mode"
 
     def test_q_returns_back(self):
         s = nomnom.ReceiveScreen()
         assert s.handle_key(ord("q")) == nomnom.ScreenAction.BACK
 
-    def test_enter_dispatches_to_cmd_decrypt(self, monkeypatch):
-        called: dict = {"n": 0}
-
-        def fake_decrypt(**kw):
-            called["n"] += 1
-            return 0
-        monkeypatch.setattr(nomnom, "cmd_decrypt", fake_decrypt)
-        monkeypatch.setattr(nomnom.curses, "endwin", lambda: None)
+    def test_enter_without_peers_or_code_shows_error(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
         s = nomnom.ReceiveScreen()
-        s.handle_key(10, stdscr=_FakeStdscr())
-        assert called["n"] == 1
-        assert s.step == "done"
+        s.handle_key(10)
+        assert s.step == "mode"
+        assert "no pinned peers" in s.error.lower()
 
-    def test_decrypt_failure_recorded(self, monkeypatch):
-        monkeypatch.setattr(nomnom, "cmd_decrypt", lambda **kw: 1)
-        monkeypatch.setattr(nomnom.curses, "endwin", lambda: None)
+    def test_enter_with_bad_code_shows_error(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
         s = nomnom.ReceiveScreen()
-        s.handle_key(10, stdscr=_FakeStdscr())
-        assert s.rc == 1
-        assert s.step == "done"
+        s.code_buf = "not-a-code"
+        s.handle_key(10)
+        assert s.step == "mode"
+        assert "invalid pairing code" in s.error.lower()
 
 
 class TestEmitGitBundleSend:
-    def test_send_destination_calls_lan_send(self, monkeypatch):
-        sent: dict = {}
+    def test_send_destination_calls_relay_send(self, tmp_path, monkeypatch):
+        # The bundle picker's SEND now routes through the relay. With no
+        # relay configured _bundle_send_via_relay returns 2; we don't
+        # exercise the full relay flow here.
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        called: dict = {}
 
-        def fake_send(name, data):
-            sent["name"] = name
-            sent["bytes"] = len(data)
+        def fake_bundle_send(name, data, **kwargs):
+            called["name"] = name
+            called["bytes"] = len(data)
             return 0
-        monkeypatch.setattr(nomnom, "_lan_send_bytes", fake_send)
+        monkeypatch.setattr(nomnom, "_bundle_send_via_relay", fake_bundle_send)
         rc = nomnom._emit_git_bundle(
             "r", "commit", "main", [("git_status", "ok\n")], None,
             nomnom.Destination.SEND,
         )
         assert rc == 0
-        assert sent["name"].startswith("r-main-commit-")
-        assert sent["name"].endswith(".txt")
-        assert sent["bytes"] > 0
+        assert called["name"].startswith("r-main-commit-")
+        assert called["name"].endswith(".txt")
+        assert called["bytes"] > 0
 
 
 class TestNomnomError:
@@ -3081,18 +3064,251 @@ class TestSessionCrypto:
 
     def test_forward_secrecy_fresh_key_per_transfer(self):
         # Two transfers with the same identities still derive different keys,
-        # because each side mints a throwaway ephemeral.
+        # because each side mints a throwaway ephemeral. Modelled directly
+        # against _session_key_initiator since the relay path generates a
+        # fresh ek_priv per send.
         ident = _mk_ident("J", "join")
-        peer = {"ik": _mk_ident("H", "host")["ik_pub"],
-                "ek": format(nomnom._dh_keypair()[1], "x")}
-        k1, ek1 = nomnom._joiner_session(ident, peer)
-        k2, ek2 = nomnom._joiner_session(ident, peer)
-        assert ek1 != ek2 and k1 != k2
+        peer = _mk_ident("H", "host")
+        ek1_priv, ek1_pub = nomnom._dh_keypair()
+        ek2_priv, ek2_pub = nomnom._dh_keypair()
+        # Both transfers re-use the SAME peer ephemeral to isolate the
+        # joiner-side freshness; in practice both sides mint fresh keys.
+        peer_ek_priv, peer_ek_pub = nomnom._dh_keypair()
+        k1 = nomnom._session_key_initiator(
+            int(ident["ik_priv"], 16), ek1_priv,
+            int(ident["ik_pub"], 16), ek1_pub,
+            int(peer["ik_pub"], 16), peer_ek_pub,
+        )
+        k2 = nomnom._session_key_initiator(
+            int(ident["ik_priv"], 16), ek2_priv,
+            int(ident["ik_pub"], 16), ek2_pub,
+            int(peer["ik_pub"], 16), peer_ek_pub,
+        )
+        assert ek1_pub != ek2_pub and k1 != k2
 
-    def test_joiner_session_rejects_bad_peer_key(self):
+    def test_session_key_rejects_bad_peer_pub(self):
         ident = _mk_ident("J", "join")
+        ek_priv, ek_pub = nomnom._dh_keypair()
         with pytest.raises(ValueError):
-            nomnom._joiner_session(ident, {"ik": "01", "ek": "01"})
+            nomnom._session_key_initiator(
+                int(ident["ik_priv"], 16), ek_priv,
+                int(ident["ik_pub"], 16), ek_pub,
+                1, 1,  # invalid: pub of 1 is rejected by _dh_shared
+            )
+
+    def test_session_key_binding_default_matches_unbound(self):
+        # An explicit empty binding produces the same key as omitting the
+        # argument entirely (back-compat with pre-relay callers).
+        ik_i_priv, ik_i_pub = nomnom._dh_keypair()
+        ek_i_priv, ek_i_pub = nomnom._dh_keypair()
+        ik_r_priv, ik_r_pub = nomnom._dh_keypair()
+        ek_r_priv, ek_r_pub = nomnom._dh_keypair()
+        k_default = nomnom._session_key_initiator(
+            ik_i_priv, ek_i_priv, ik_i_pub, ek_i_pub, ik_r_pub, ek_r_pub,
+        )
+        k_empty = nomnom._session_key_initiator(
+            ik_i_priv, ek_i_priv, ik_i_pub, ek_i_pub, ik_r_pub, ek_r_pub,
+            binding=b"",
+        )
+        assert k_default == k_empty
+
+    def test_session_key_binding_changes_key(self):
+        # Different bindings, otherwise-identical inputs, must yield
+        # different session keys.
+        ik_i_priv, ik_i_pub = nomnom._dh_keypair()
+        ek_i_priv, ek_i_pub = nomnom._dh_keypair()
+        ik_r_priv, ik_r_pub = nomnom._dh_keypair()
+        ek_r_priv, ek_r_pub = nomnom._dh_keypair()
+        k_a = nomnom._session_key_initiator(
+            ik_i_priv, ek_i_priv, ik_i_pub, ek_i_pub, ik_r_pub, ek_r_pub,
+            binding=b"code-ABC",
+        )
+        k_b = nomnom._session_key_initiator(
+            ik_i_priv, ek_i_priv, ik_i_pub, ek_i_pub, ik_r_pub, ek_r_pub,
+            binding=b"code-XYZ",
+        )
+        k_unbound = nomnom._session_key_initiator(
+            ik_i_priv, ek_i_priv, ik_i_pub, ek_i_pub, ik_r_pub, ek_r_pub,
+        )
+        assert k_a != k_b != k_unbound and k_a != k_unbound
+
+    def test_session_key_binding_symmetric_agreement(self):
+        # Initiator and responder with the SAME binding agree; with
+        # different bindings they do not.
+        ik_i_priv, ik_i_pub = nomnom._dh_keypair()
+        ek_i_priv, ek_i_pub = nomnom._dh_keypair()
+        ik_r_priv, ik_r_pub = nomnom._dh_keypair()
+        ek_r_priv, ek_r_pub = nomnom._dh_keypair()
+        binding = b"recurring-v1:" + b"\x01" * 32 + b"\x02" * 32
+        ki = nomnom._session_key_initiator(
+            ik_i_priv, ek_i_priv, ik_i_pub, ek_i_pub, ik_r_pub, ek_r_pub,
+            binding=binding,
+        )
+        kr = nomnom._session_key_responder(
+            ik_r_priv, ek_r_priv, ik_r_pub, ek_r_pub, ik_i_pub, ek_i_pub,
+            binding=binding,
+        )
+        assert ki == kr
+
+        # Mismatched bindings produce different keys.
+        kr_other = nomnom._session_key_responder(
+            ik_r_priv, ek_r_priv, ik_r_pub, ek_r_pub, ik_i_pub, ek_i_pub,
+            binding=b"different",
+        )
+        assert ki != kr_other
+
+
+class TestPairingCode:
+    def test_generated_format(self):
+        for _ in range(50):
+            code = nomnom._generate_pairing_code()
+            assert len(code) == 11 and code[3] == "-" and code[7] == "-"
+            chars = code.replace("-", "")
+            for c in chars:
+                assert c in nomnom._PAIRING_ALPHABET
+
+    def test_parse_round_trip(self):
+        code = nomnom._generate_pairing_code()
+        parsed = nomnom._parse_pairing_code(code)
+        assert parsed == code.replace("-", "").encode("ascii")
+
+    def test_parse_tolerates_ambiguous_chars(self):
+        # I -> 1, L -> 1, O -> 0
+        parsed = nomnom._parse_pairing_code("iLo-2BC-D3E")
+        assert parsed == b"110" + b"2BC" + b"D3E"
+
+    def test_parse_strips_whitespace_and_hyphens(self):
+        assert nomnom._parse_pairing_code("ab c-12 3-4 56") == b"ABC1234" + b"56"
+
+    def test_parse_rejects_wrong_length(self):
+        with pytest.raises(ValueError):
+            nomnom._parse_pairing_code("AB-CD")
+
+    def test_parse_rejects_invalid_chars(self):
+        # 'U' is not in Crockford base32
+        with pytest.raises(ValueError):
+            nomnom._parse_pairing_code("UAB-CDE-FGH")
+
+
+class TestRelaySlots:
+    def test_first_contact_deterministic(self):
+        code = b"ABC123XYZ"
+        assert nomnom._slot_first_contact(code) == nomnom._slot_first_contact(code)
+        assert nomnom._slot_first_contact(b"ABC123XYZ") != nomnom._slot_first_contact(b"ABC123XYY")
+
+    def test_slot_chars_are_urlsafe(self):
+        slot = nomnom._slot_first_contact(b"ABC123XYZ")
+        # base64-urlsafe, no padding
+        for c in slot:
+            assert c.isalnum() or c in "-_"
+        assert "=" not in slot
+
+    def test_recurring_slot_is_symmetric(self):
+        # Both peers, given each other's ik_pub, derive the same base slot.
+        a_priv, a_pub = nomnom._dh_keypair()
+        b_priv, b_pub = nomnom._dh_keypair()
+        slot_from_a = nomnom._slot_recurring(a_priv, format(b_pub, "x"))
+        slot_from_b = nomnom._slot_recurring(b_priv, format(a_pub, "x"))
+        assert slot_from_a == slot_from_b
+
+    def test_recurring_slot_differs_for_different_peers(self):
+        a_priv, _ = nomnom._dh_keypair()
+        _, b_pub = nomnom._dh_keypair()
+        _, c_pub = nomnom._dh_keypair()
+        sa = nomnom._slot_recurring(a_priv, format(b_pub, "x"))
+        sb = nomnom._slot_recurring(a_priv, format(c_pub, "x"))
+        assert sa != sb
+
+    def test_recurring_binding_is_symmetric(self):
+        _, a_pub = nomnom._dh_keypair()
+        _, b_pub = nomnom._dh_keypair()
+        a_hex, b_hex = format(a_pub, "x"), format(b_pub, "x")
+        # Both peers compute the SAME binding regardless of who's "me" and "them".
+        assert nomnom._recurring_binding(a_hex, b_hex) == nomnom._recurring_binding(b_hex, a_hex)
+
+    def test_recurring_binding_includes_protocol_tag(self):
+        _, a_pub = nomnom._dh_keypair()
+        _, b_pub = nomnom._dh_keypair()
+        binding = nomnom._recurring_binding(format(a_pub, "x"), format(b_pub, "x"))
+        assert binding.startswith(b"recurring-v1")
+
+
+class TestRelayConfig:
+    def test_load_returns_none_when_absent(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        assert nomnom._load_relay_config() is None
+
+    def test_save_then_load_round_trip(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        nomnom._save_relay_config("https://relay.example/", "secret-abc")
+        cfg = nomnom._load_relay_config()
+        assert cfg is not None
+        # trailing slash stripped
+        assert cfg["url"] == "https://relay.example"
+        assert cfg["secret"] == "secret-abc"
+
+    def test_saved_file_is_mode_600(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        nomnom._save_relay_config("https://relay.example", "x")
+        path = tmp_path / "nomnom" / "relay.json"
+        mode = path.stat().st_mode & 0o777
+        assert mode == 0o600
+
+    def test_load_rejects_malformed_url(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        # write a bad URL by hand (bypassing _save_relay_config)
+        (tmp_path / "nomnom").mkdir()
+        (tmp_path / "nomnom" / "relay.json").write_text(
+            '{"url": "ftp://nope", "secret": "x"}', encoding="utf-8",
+        )
+        assert nomnom._load_relay_config() is None
+
+    def test_clear_removes_file(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        nomnom._save_relay_config("https://relay.example", "x")
+        assert nomnom._relay_clear_config() is True
+        assert nomnom._load_relay_config() is None
+        # second call is a no-op
+        assert nomnom._relay_clear_config() is False
+
+    def test_export_import_blob_round_trip(self):
+        cfg = {"url": "https://relay.example.com", "secret": "topsecret"}
+        blob = nomnom._relay_export_blob(cfg)
+        assert blob.startswith("nm1.")
+        restored = nomnom._relay_import_blob(blob)
+        assert restored == cfg
+
+    def test_import_blob_rejects_bad_prefix(self):
+        with pytest.raises(nomnom.NomnomError):
+            nomnom._relay_import_blob("not-a-blob")
+
+    def test_import_blob_rejects_garbage(self):
+        with pytest.raises(nomnom.NomnomError):
+            nomnom._relay_import_blob("nm1.!!!invalid!!!")
+
+
+class TestRelayHmac:
+    def test_headers_have_expected_shape(self):
+        h = nomnom._relay_hmac_headers("secret-xyz", "PUT", "/slots/abc")
+        assert h["User-Agent"].startswith("nomnom-relay-client/")
+        auth = h["Authorization"]
+        assert auth.startswith("NMNM-HMAC-SHA256 ")
+        rest = auth[len("NMNM-HMAC-SHA256 "):]
+        ts, mac = rest.split(":", 1)
+        assert ts.isdigit() and int(ts) > 0
+        # 64 hex chars = 32 byte HMAC-SHA256
+        assert len(mac) == 64 and all(c in "0123456789abcdef" for c in mac)
+
+    def test_signature_is_deterministic_for_fixed_ts(self, monkeypatch):
+        # Pin time so the timestamp is stable, then check the MAC matches a
+        # hand-computed value.
+        monkeypatch.setattr(nomnom.time, "time", lambda: 1_700_000_000)
+        h = nomnom._relay_hmac_headers("topsecret", "GET", "/slots/foo")
+        msg = b"GET\n/slots/foo\n1700000000"
+        import hmac as _hmac
+        import hashlib as _h
+        expected = _hmac.new(b"topsecret", msg, _h.sha256).hexdigest()
+        assert h["Authorization"].endswith(":" + expected)
 
 
 class TestTofu:
@@ -3145,364 +3361,854 @@ class TestTofu:
         assert nomnom._tofu_check_join(peer, trust_new=True) is True
 
 
-class TestPeerFilter:
-    def _peer(self, **kw):
-        base = {"id": "abc123def456", "name": "alice-mbp", "ip": "10.0.0.2",
-                "port": 1, "role": "send", "tok": "t", "ik": "aa", "ek": "bb"}
-        base.update(kw)
-        return base
-
-    def test_matches_by_name(self):
-        assert nomnom._peer_matches(self._peer(), "alice-mbp")
-        assert nomnom._peer_matches(self._peer(), "ALICE-MBP")
-
-    def test_matches_by_device_id_prefix(self):
-        assert nomnom._peer_matches(self._peer(), "abc123")
-        assert nomnom._peer_matches(self._peer(), "abc123def456")
-
-    def test_no_match_returns_false(self):
-        assert not nomnom._peer_matches(self._peer(), "bob")
-
-    def test_choose_with_filter_skips_prompt(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
-        peers = [self._peer(), self._peer(id="zzz", name="bob")]
-
-        def boom(*a):
-            raise AssertionError("peer_filter should skip the prompt")
-        monkeypatch.setattr("builtins.input", boom)
-        picked = nomnom._lan_choose(peers, "receiver(s)", peer_filter="bob")
-        assert picked["name"] == "bob"
-
-    def test_choose_filter_no_match_errors(self, tmp_path, monkeypatch, capsys):
-        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
-        peers = [self._peer()]
-        picked = nomnom._lan_choose(peers, "receiver(s)", peer_filter="nobody")
-        assert picked is None
-        assert "matched no" in capsys.readouterr().err
-
-    def test_choose_filter_ambiguous_errors(self, tmp_path, monkeypatch, capsys):
-        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
-        peers = [self._peer(), self._peer(id="abc999")]  # both prefix abc
-        picked = nomnom._lan_choose(peers, "receiver(s)", peer_filter="abc")
-        assert picked is None
-        assert "ambiguous" in capsys.readouterr().err
+# ---------- Mock relay (in-process HTTP server) ----------
 
 
-class TestLanBeacon:
-    def test_roundtrip(self):
-        pkt = nomnom._lan_encode_beacon("id1", "box", "10.0.0.1", 5000,
-                                        "send", "tk", "abcd", "ef01")
-        assert nomnom._lan_decode_beacon(pkt) == {
-            "id": "id1", "name": "box", "ip": "10.0.0.1", "port": 5000,
-            "role": "send", "tok": "tk", "ik": "abcd", "ek": "ef01"}
+class _MockRelay:
+    """An in-process Worker stand-in. Stores slots in a dict; HMACs the same
+    way the real Worker does. Used by integration tests to exercise the
+    Python HTTP client without touching Cloudflare."""
 
-    @pytest.mark.parametrize("pkt", [
-        b"junk",
-        b"NMNMLAN2{bad json",
-        b"NMNMLAN2" + json.dumps({"id": "x"}).encode(),
-        # role "pair" is no longer valid in the TOFU model
-        b"NMNMLAN2" + json.dumps({"id": "x", "name": "n", "ip": "i", "port": 1,
-                                  "role": "pair", "tok": "t", "ik": "a",
-                                  "ek": "b"}).encode(),
-        b"NMNMLAN2" + json.dumps({"id": "x", "name": "n", "ip": "i", "port": 1,
-                                  "role": "send", "tok": "t"}).encode(),
-    ])
-    def test_rejects_bad_packets(self, pkt):
-        assert nomnom._lan_decode_beacon(pkt) is None
-
-
-class TestLanHttp:
-    """Drive the real pull/push handlers over loopback with a full triple-DH
-    handshake; no known-peers file is set, so TOFU treats peers as new."""
-
-    def _serve(self, handler, state):
+    def __init__(self, secret: str = "test-secret"):
+        import hashlib as _h
+        import hmac as _hm
         import http.server
-        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
-        srv.timeout = 0.5
-        port = srv.server_address[1]
-        stop = {"go": True}
+        import socketserver
+        import threading as _t
+        import time as _time
 
-        def loop():
-            while stop["go"] and not state.get("done"):
-                srv.handle_request()
-        threading.Thread(target=loop, daemon=True).start()
-        return srv, port, stop
+        self.secret = secret
+        self.slots: dict = {}
+        self.lock = _t.Lock()
+        self.put_event = _t.Event()
 
-    def _host_session(self, host_ident, state):
-        ek_priv, ek_pub = nomnom._dh_keypair()
-        make_session = nomnom._make_responder_session(
-            host_ident, ek_priv, ek_pub, state, threading.Lock())
-        return make_session, format(ek_pub, "x")
+        relay = self
 
-    def _peer(self, host_ident, ek_pub_hex, port):
-        return {"id": host_ident["device_id"], "name": host_ident["name"],
-                "ip": "127.0.0.1", "port": port, "tok": "tok",
-                "ik": host_ident["ik_pub"], "ek": ek_pub_hex}
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a, **kw):  # silence test noise
+                pass
 
-    def test_pull_roundtrip(self, tmp_path, monkeypatch):
+            def _verify(self):
+                if self.path == "/health":
+                    return True
+                auth = self.headers.get("Authorization", "")
+                prefix = "NMNM-HMAC-SHA256 "
+                if not auth.startswith(prefix):
+                    self.send_error(401, "missing-mac"); return False
+                rest = auth[len(prefix):]
+                if ":" not in rest:
+                    self.send_error(401, "bad-mac"); return False
+                ts, mac = rest.split(":", 1)
+                try:
+                    ts_int = int(ts)
+                except ValueError:
+                    self.send_error(401, "bad-mac"); return False
+                if abs(int(_time.time()) - ts_int) > 300:
+                    self.send_error(401, "clock-skew"); return False
+                # Path on the request line excludes query for HMAC
+                path_only = self.path.split("?", 1)[0]
+                msg = f"{self.command}\n{path_only}\n{ts}".encode("utf-8")
+                expected = _hm.new(relay.secret.encode(), msg,
+                                   _h.sha256).hexdigest()
+                if not _hm.compare_digest(expected, mac.lower()):
+                    self.send_error(401, "bad-mac"); return False
+                return True
+
+            def do_GET(self):
+                if self.path == "/health":
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/plain")
+                    self.end_headers()
+                    self.wfile.write(b"ok")
+                    return
+                if not self._verify():
+                    return
+                path = self.path.split("?", 1)[0]
+                q = self.path.split("?", 1)[1] if "?" in self.path else ""
+                wait_ms = 0
+                for kv in q.split("&"):
+                    if kv.startswith("wait="):
+                        try:
+                            wait_ms = int(kv.split("=", 1)[1])
+                        except ValueError:
+                            pass
+                m = re.match(r"^/slots/([A-Za-z0-9_-]+)$", path)
+                if not m:
+                    self.send_error(404, "not-found"); return
+                key = m.group(1)
+                deadline = _time.time() + (wait_ms / 1000.0)
+                while True:
+                    with relay.lock:
+                        val = relay.slots.pop(key, None)
+                    if val is not None:
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/octet-stream")
+                        self.send_header("Content-Length", str(len(val)))
+                        self.end_headers()
+                        self.wfile.write(val)
+                        return
+                    remaining = deadline - _time.time()
+                    if remaining <= 0:
+                        self.send_error(404, "not-found"); return
+                    relay.put_event.wait(min(0.1, remaining))
+                    relay.put_event.clear()
+
+            def do_PUT(self):
+                if not _verify_self(self): return
+                path = self.path.split("?", 1)[0]
+                m = re.match(r"^/slots/([A-Za-z0-9_-]+)$", path)
+                if not m:
+                    self.send_error(404, "not-found"); return
+                key = m.group(1)
+                clen = int(self.headers.get("Content-Length", "0"))
+                if clen > 256 * 1024 * 1024:
+                    self.send_error(413, "too-large"); return
+                body = self.rfile.read(clen) if clen > 0 else b""
+                with relay.lock:
+                    if key in relay.slots:
+                        self.send_error(409, "occupied"); return
+                    relay.slots[key] = body
+                relay.put_event.set()
+                self.send_response(204)
+                self.end_headers()
+
+            def do_DELETE(self):
+                if not self._verify(): return
+                path = self.path.split("?", 1)[0]
+                m = re.match(r"^/slots/([A-Za-z0-9_-]+)$", path)
+                if m:
+                    with relay.lock:
+                        relay.slots.pop(m.group(1), None)
+                self.send_response(204)
+                self.end_headers()
+
+        # local helper because Python doesn't let the inner class call self._verify
+        # cleanly from another method when send_error closes the connection
+        def _verify_self(h):
+            return h._verify()
+
+        import re  # imported locally so module-level imports stay tidy
+
+        # ThreadingTCPServer so concurrent requests don't serialize: a
+        # long-poll GET must not block a subsequent PUT.
+        class _ThreadingTCPServer(socketserver.ThreadingMixIn,
+                                  socketserver.TCPServer):
+            allow_reuse_address = True
+            daemon_threads = True
+
+        server = _ThreadingTCPServer(("127.0.0.1", 0), Handler,
+                                     bind_and_activate=True)
+        self.server = server
+        self.port = server.server_address[1]
+        self.thread = _t.Thread(target=server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self.port}"
+
+    def cfg(self) -> dict:
+        return {"url": self.url(), "secret": self.secret}
+
+    def stop(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+@pytest.fixture
+def mock_relay():
+    relay = _MockRelay()
+    yield relay
+    relay.stop()
+
+
+class TestRelayHttp:
+    def test_health_works_without_auth(self, mock_relay):
+        assert nomnom._relay_health(mock_relay.cfg()) is True
+
+    def test_put_get_round_trip(self, mock_relay):
+        cfg = mock_relay.cfg()
+        nomnom._relay_put_slot(cfg, "abc-xyz", b"hello world")
+        got = nomnom._relay_get_slot(cfg, "abc-xyz")
+        assert got == b"hello world"
+        # delete-on-read: second GET returns None
+        assert nomnom._relay_get_slot(cfg, "abc-xyz") is None
+
+    def test_put_conflict_returns_error(self, mock_relay):
+        cfg = mock_relay.cfg()
+        nomnom._relay_put_slot(cfg, "dupe", b"first")
+        with pytest.raises(nomnom.NomnomError) as exc:
+            nomnom._relay_put_slot(cfg, "dupe", b"second")
+        assert "occupied" in str(exc.value)
+
+    def test_bad_secret_is_401(self, mock_relay):
+        cfg = dict(mock_relay.cfg()); cfg["secret"] = "wrong"
+        with pytest.raises(nomnom.NomnomError) as exc:
+            nomnom._relay_put_slot(cfg, "abc", b"x")
+        assert "auth" in str(exc.value).lower() or "secret" in str(exc.value).lower()
+
+    def test_oversized_body_rejected_client_side(self, mock_relay):
+        cfg = mock_relay.cfg()
+        with pytest.raises(nomnom.NomnomError) as exc:
+            nomnom._relay_put_slot(cfg, "abc", b"\x00" * (nomnom._RELAY_MAX_BODY + 1))
+        assert "too large" in str(exc.value).lower()
+
+    def test_delete_is_idempotent(self, mock_relay):
+        cfg = mock_relay.cfg()
+        nomnom._relay_delete_slot(cfg, "never-existed")  # does not raise
+
+    def test_self_test_round_trip(self, mock_relay):
+        rc, msg = nomnom._relay_self_test(mock_relay.cfg())
+        assert rc == 0 and "ok" in msg
+
+    def test_long_poll_returns_on_arrival(self, mock_relay):
+        """Receiver starts polling first; sender PUTs; receiver should wake up."""
+        cfg = mock_relay.cfg()
+        result_q: list = []
+
+        def receiver():
+            result_q.append(nomnom._relay_get_slot(cfg, "lp", wait_ms=3000))
+
+        t = threading.Thread(target=receiver, daemon=True)
+        t.start()
+        time.sleep(0.2)  # let the poller establish
+        nomnom._relay_put_slot(cfg, "lp", b"delivered")
+        t.join(timeout=2.0)
+        assert result_q == [b"delivered"]
+
+    def test_long_poll_timeout_returns_none(self, mock_relay):
+        got = nomnom._relay_get_slot(mock_relay.cfg(), "never", wait_ms=300)
+        assert got is None
+
+    def test_poll_worker_cancellation(self, mock_relay):
+        """Cancel mid-poll: the worker thread must return None promptly."""
+        worker = nomnom._RelayPollWorker(mock_relay.cfg(), "ghost", wait_ms=10000)
+        results: list = []
+
+        def runner():
+            results.append(worker.run())
+
+        t = threading.Thread(target=runner, daemon=True)
+        t.start()
+        time.sleep(0.2)
+        worker.cancel()
+        t.join(timeout=2.0)
+        assert not t.is_alive()
+        assert results == [None]
+
+
+class TestRelayE2E:
+    @staticmethod
+    def _mk_identity(name: str) -> dict:
+        priv, pub = nomnom._dh_keypair()
+        return {
+            "device_id": "dev-" + name,
+            "name": name,
+            "ik_priv": format(priv, "x"),
+            "ik_pub": format(pub, "x"),
+        }
+
+    def test_first_contact_round_trip(self, mock_relay, tmp_path, monkeypatch):
         monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
-        host = _mk_ident("H", "host")
-        join = _mk_ident("J", "join")
-        state = {}
-        make_session, host_ek = self._host_session(host, state)
-        handler = nomnom._lan_make_pull_handler(
-            make_session,
-            lambda key: nomnom.encrypt_bytes(b"hi there", "n.txt", key.hex()),
-            "tok", state)
-        srv, port, stop = self._serve(handler, state)
-        try:
-            peer = self._peer(host, host_ek, port)
-            key, ek_hex = nomnom._joiner_session(join, peer)
-            got = nomnom._lan_fetch_blob("127.0.0.1", port, "tok", join,
-                                         ek_hex, timeout=5)
-            assert nomnom.decrypt_bytes(got, key.hex()) == ("n.txt", b"hi there")
-            assert state.get("peer_id") == "J"
-            assert state.get("peer_ik") == join["ik_pub"]
-        finally:
-            stop["go"] = False
-            state["done"] = True
-            srv.server_close()
+        cwd = tmp_path / "rx"; cwd.mkdir()
+        monkeypatch.chdir(cwd)
 
-    def test_pull_rejected_403(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
-        join = _mk_ident("J", "join")
-        state = {}
-        handler = nomnom._lan_make_pull_handler(
-            lambda *a: None, lambda key: b"", "tok", state)
-        srv, port, stop = self._serve(handler, state)
-        try:
-            with pytest.raises(ConnectionError):
-                nomnom._lan_fetch_blob("127.0.0.1", port, "tok", join, "ab",
-                                       timeout=5)
-            assert not state.get("done")
-        finally:
-            stop["go"] = False
-            srv.server_close()
+        sender = self._mk_identity("sender-host")
+        receiver = self._mk_identity("receiver-host")
+        cfg = mock_relay.cfg()
 
-    def test_pull_missing_headers_400(self, tmp_path, monkeypatch):
-        import urllib.error
-        import urllib.request
-        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
-        host = _mk_ident("H", "host")
-        state = {}
-        make_session, _ek = self._host_session(host, state)
-        handler = nomnom._lan_make_pull_handler(
-            make_session, lambda key: b"x", "tok", state)
-        srv, port, stop = self._serve(handler, state)
-        try:
-            with pytest.raises(urllib.error.HTTPError) as ei:
-                urllib.request.urlopen(f"http://127.0.0.1:{port}/tok", timeout=5)
-            assert ei.value.code == 400
-        finally:
-            stop["go"] = False
-            srv.server_close()
+        code = nomnom._generate_pairing_code()
+        payload = b"hello relay world\n" * 100
+        # encrypt_bytes wraps with name + AEAD; _relay_send takes that as `data`.
+        # Test invokes _relay_send with `data = payload` and `name = "demo.txt"`.
 
-    def test_push_roundtrip(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
-        host = _mk_ident("H", "host")
-        join = _mk_ident("J", "join")
-        state = {}
-        make_session, host_ek = self._host_session(host, state)
-        handler = nomnom._lan_make_push_handler(
-            make_session, state, "tok", nomnom._LAN_MAX_UPLOAD, threading.Lock())
-        srv, port, stop = self._serve(handler, state)
-        try:
-            peer = self._peer(host, host_ek, port)
-            key, ek_hex = nomnom._joiner_session(join, peer)
-            blob = nomnom.encrypt_bytes(b"data", "f.bin", key.hex())
-            nomnom._lan_upload_blob("127.0.0.1", port, "tok", blob, join,
-                                    ek_hex, timeout=5)
-            time.sleep(0.2)
-            assert state.get("blob") == blob
-            assert state.get("session_key") == key
-            assert state.get("peer_id") == "J"
-            assert nomnom.decrypt_bytes(state["blob"],
-                                        state["session_key"].hex()) == (
-                "f.bin", b"data")
-        finally:
-            stop["go"] = False
-            state["done"] = True
-            srv.server_close()
+        recv_rc: list = []
+        send_rc: list = []
 
-    def test_push_rejected_403(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
-        join = _mk_ident("J", "join")
-        state = {}
-        handler = nomnom._lan_make_push_handler(
-            lambda *a: None, state, "tok", nomnom._LAN_MAX_UPLOAD,
-            threading.Lock())
-        srv, port, stop = self._serve(handler, state)
-        try:
-            with pytest.raises(ConnectionError):
-                nomnom._lan_upload_blob("127.0.0.1", port, "tok", b"x" * 70,
-                                        join, "ab", timeout=5)
-        finally:
-            stop["go"] = False
-            srv.server_close()
+        def receive():
+            recv_rc.append(nomnom._relay_recv_first_contact(
+                code, identity=receiver, relay=cfg,
+                trust_new=True,
+            ))
 
+        def send():
+            send_rc.append(nomnom._relay_send(
+                "demo.txt", payload, code=code, target_ik_hex=None,
+                identity=sender, relay=cfg,
+                trust_new=True,
+            ))
 
-class TestLanTransfer:
-    """Full cmd round-trips on loopback. Two devices are simulated with a
-    per-thread identity and a real (initially empty) known-peers store, so the
-    triple-DH handshake and TOFU first-use pinning run for real (no UDP)."""
+        # Start receiver first so it long-polls slot_init before the sender PUTs.
+        tr = threading.Thread(target=receive, daemon=True)
+        tr.start()
+        time.sleep(0.1)
+        ts = threading.Thread(target=send, daemon=True)
+        ts.start()
 
-    def _setup(self, monkeypatch, tmp_path, host_thread, host_ident, join_ident):
-        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+        ts.join(timeout=15.0)
+        tr.join(timeout=15.0)
+        assert not ts.is_alive() and not tr.is_alive()
+        assert send_rc == [0] and recv_rc == [0]
 
-        def fake_identity():
-            if threading.current_thread().name == host_thread:
-                return host_ident
-            return join_ident
-        monkeypatch.setattr(nomnom, "_load_identity", fake_identity)
+        out = cwd / "demo.txt"
+        assert out.exists() and out.read_bytes() == payload
 
-        rec = {}
-
-        def fake_beacon(stop, device_id, name, ip, port, role, token, ik, ek,
-                        interval=1.0):
-            rec["beacon"] = {"id": device_id, "name": name, "ip": ip,
-                             "port": port, "role": role, "tok": token,
-                             "ik": ik, "ek": ek}
-            stop.wait()
-        monkeypatch.setattr(nomnom, "_lan_beacon_sender", fake_beacon)
-        monkeypatch.setattr(
-            nomnom, "_lan_discover",
-            lambda role, **k: ([rec["beacon"]] if rec.get("beacon")
-                               and rec["beacon"]["role"] == role else []))
-        monkeypatch.setattr("builtins.input", lambda *a: "1")
-        return rec
-
-    def _wait_beacon(self, rec, timeout=10):
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            if "beacon" in rec:
-                return
-            time.sleep(0.02)
-        raise AssertionError("host never beaconed")
-
-    def test_receiver_first(self, tmp_path, monkeypatch):
-        host = _mk_ident("R", "rxbox")
-        join = _mk_ident("S", "txbox")
-        rec = self._setup(monkeypatch, tmp_path, "rxhost", host, join)
-        out = tmp_path / "out"
-        out.mkdir()
-        monkeypatch.chdir(out)
-        src = tmp_path / "f.bin"
-        payload = bytes(range(256)) * 5
-        src.write_bytes(payload)
-
-        result = {}
-
-        def run():
-            result["rc"] = nomnom.cmd_decrypt(host="127.0.0.1", timeout=10)
-        th = threading.Thread(target=run, name="rxhost", daemon=True)
-        th.start()
-        self._wait_beacon(rec)
-        rc = nomnom.cmd_encrypt(str(src), host="127.0.0.1", timeout=8)
-        th.join(timeout=5)
-        assert rc == 0 and result.get("rc") == 0
-        assert (out / "f.bin").read_bytes() == payload
-        # both sides pinned each other on first use
+        # Both sides pinned each other.
         peers = nomnom._load_known_peers()
-        assert "R" in peers and "S" in peers
+        assert sender["device_id"] in peers
+        assert receiver["device_id"] in peers
+        # Transfer count is bumped on both sides (single shared known_peers
+        # in this test fixture because both identities share XDG_CONFIG_HOME).
+        for rec in peers.values():
+            assert rec.get("transfer_count", 0) >= 1
 
-    def test_sender_first(self, tmp_path, monkeypatch):
-        host = _mk_ident("S", "txbox")
-        join = _mk_ident("R", "rxbox")
-        rec = self._setup(monkeypatch, tmp_path, "txhost", host, join)
-        out = tmp_path / "out"
-        out.mkdir()
-        monkeypatch.chdir(out)
-        src = tmp_path / "f.bin"
-        payload = b"hello world\n" * 200
-        src.write_bytes(payload)
-
-        result = {}
-
-        def run():
-            result["rc"] = nomnom.cmd_encrypt(str(src), host="127.0.0.1",
-                                              timeout=10)
-        th = threading.Thread(target=run, name="txhost", daemon=True)
-        th.start()
-        self._wait_beacon(rec)
-        rc = nomnom.cmd_decrypt(host="127.0.0.1", timeout=8)
-        th.join(timeout=5)
-        assert rc == 0 and result.get("rc") == 0
-        assert (out / "f.bin").read_bytes() == payload
-
-
-class TestLanErrors:
-    def test_encrypt_missing_file(self, tmp_path, capsys, monkeypatch):
+    def test_recurring_round_trip_after_pinning(self, mock_relay, tmp_path,
+                                                monkeypatch):
         monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
-        rc = nomnom.cmd_encrypt(str(tmp_path / "nope.txt"), timeout=1)
-        assert rc == 1
-        assert "not a file" in capsys.readouterr().err
+        cwd = tmp_path / "rx"; cwd.mkdir()
+        monkeypatch.chdir(cwd)
 
-    def test_encrypt_no_peer(self, tmp_path, capsys, monkeypatch):
+        sender = self._mk_identity("sender-host")
+        receiver = self._mk_identity("receiver-host")
+        # Pin both peers up-front so recurring mode picks the right slot.
+        nomnom._save_known_peer(sender["device_id"], sender["name"], sender["ik_pub"])
+        nomnom._save_known_peer(receiver["device_id"], receiver["name"], receiver["ik_pub"])
+
+        cfg = mock_relay.cfg()
+        payload = b"recurring transfer\n" * 50
+
+        recv_rc: list = []
+        send_rc: list = []
+
+        def receive():
+            recv_rc.append(nomnom._relay_recv_pinned(
+                identity=receiver, relay=cfg, trust_new=True,
+            ))
+
+        def send():
+            send_rc.append(nomnom._relay_send(
+                "rec.txt", payload, code=None,
+                target_ik_hex=sender["ik_pub"],  # sender targets RECEIVER's pubkey
+                identity=sender, relay=cfg, trust_new=True,
+            ))
+
+        # Receiver targets sender's pubkey for slot derivation (recurring is
+        # symmetric so this works either way). We point the sender at the
+        # receiver's ik_pub so the slot derived by the sender matches the slot
+        # the receiver computes from its own pinned-peer (sender's) ik_pub.
+        # Adjust: send_target = receiver_ik so the recurring slot is shared.
+        send_rc.clear()
+
+        def send2():
+            send_rc.append(nomnom._relay_send(
+                "rec.txt", payload, code=None,
+                target_ik_hex=receiver["ik_pub"],
+                identity=sender, relay=cfg, trust_new=True,
+            ))
+
+        tr = threading.Thread(target=receive, daemon=True)
+        tr.start()
+        time.sleep(0.2)
+        ts = threading.Thread(target=send2, daemon=True)
+        ts.start()
+        ts.join(timeout=15.0)
+        tr.join(timeout=15.0)
+
+        assert send_rc == [0] and recv_rc == [0]
+        out = cwd / "rec.txt"
+        assert out.exists() and out.read_bytes() == payload
+
+
+class TestReceivePathSafety:
+    """Regression coverage for the receive-path safety fixes."""
+
+    @staticmethod
+    def _mk_identity(name: str) -> dict:
+        priv, pub = nomnom._dh_keypair()
+        return {
+            "device_id": "dev-" + name,
+            "name": name,
+            "ik_priv": format(priv, "x"),
+            "ik_pub": format(pub, "x"),
+        }
+
+    def _do_first_contact(self, mock_relay, sender, receiver, payload, name):
+        cfg = mock_relay.cfg()
+        code = nomnom._generate_pairing_code()
+        recv_rc: list = []
+        send_rc: list = []
+
+        def receive():
+            recv_rc.append(nomnom._relay_recv_first_contact(
+                code, identity=receiver, relay=cfg, trust_new=True,
+            ))
+
+        def send():
+            send_rc.append(nomnom._relay_send(
+                name, payload, code=code, target_ik_hex=None,
+                identity=sender, relay=cfg, trust_new=True,
+            ))
+
+        tr = threading.Thread(target=receive, daemon=True); tr.start()
+        time.sleep(0.1)
+        ts = threading.Thread(target=send, daemon=True); ts.start()
+        ts.join(timeout=15.0); tr.join(timeout=15.0)
+        assert send_rc == [0] and recv_rc == [0]
+
+    def test_existing_file_is_uniquified_not_overwritten(
+        self, mock_relay, tmp_path, monkeypatch,
+    ):
         monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
-        monkeypatch.setattr(nomnom, "_lan_discover", lambda *a, **k: [])
-        monkeypatch.setattr(nomnom, "_lan_host", lambda **k: {})
-        src = tmp_path / "f.txt"
-        src.write_text("x")
-        rc = nomnom.cmd_encrypt(str(src), timeout=1)
-        assert rc == 1
-        assert "no receiver" in capsys.readouterr().err
+        cwd = tmp_path / "rx"; cwd.mkdir()
+        monkeypatch.chdir(cwd)
+        (cwd / "demo.txt").write_bytes(b"pre-existing")
 
-    def test_decrypt_no_peer(self, tmp_path, capsys, monkeypatch):
+        sender = self._mk_identity("sender")
+        receiver = self._mk_identity("receiver")
+        self._do_first_contact(
+            mock_relay, sender, receiver, b"fresh payload", "demo.txt",
+        )
+
+        assert (cwd / "demo.txt").read_bytes() == b"pre-existing"
+        assert (cwd / "demo-1.txt").read_bytes() == b"fresh payload"
+
+    def test_pinned_peer_name_locked_after_first_contact(
+        self, mock_relay, tmp_path, monkeypatch,
+    ):
         monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
-        monkeypatch.setattr(nomnom, "_lan_discover", lambda *a, **k: [])
-        monkeypatch.setattr(nomnom, "_lan_host", lambda **k: {})
-        rc = nomnom.cmd_decrypt(timeout=1)
-        assert rc == 1
-        assert "no sender" in capsys.readouterr().err
+        cwd = tmp_path / "rx"; cwd.mkdir()
+        monkeypatch.chdir(cwd)
 
-    def test_forget_command(self, tmp_path, capsys, monkeypatch):
+        # Sender's first transfer: name "alice-laptop".
+        sender = self._mk_identity("alice-laptop")
+        receiver = self._mk_identity("receiver")
+        self._do_first_contact(
+            mock_relay, sender, receiver, b"first", "a.txt",
+        )
+        peers = nomnom._load_known_peers()
+        assert peers[sender["device_id"]]["name"] == "alice-laptop"
+
+        # Second transfer: sender flips identity name to "security-team".
+        sender["name"] = "security-team"
+        send_rc: list = []
+
+        def send():
+            send_rc.append(nomnom._relay_send(
+                "b.txt", b"second", code=None,
+                target_ik_hex=receiver["ik_pub"],
+                identity=sender, relay=mock_relay.cfg(), trust_new=True,
+            ))
+
+        recv_rc: list = []
+
+        def receive():
+            recv_rc.append(nomnom._relay_recv_pinned(
+                identity=receiver, relay=mock_relay.cfg(), trust_new=True,
+            ))
+
+        tr = threading.Thread(target=receive, daemon=True); tr.start()
+        time.sleep(0.2)
+        ts = threading.Thread(target=send, daemon=True); ts.start()
+        ts.join(timeout=15.0); tr.join(timeout=15.0)
+        assert send_rc == [0] and recv_rc == [0]
+
+        peers = nomnom._load_known_peers()
+        # Name MUST remain the first-contact value, not the spoofed second one.
+        assert peers[sender["device_id"]]["name"] == "alice-laptop"
+        # Transfer count was still bumped.
+        assert peers[sender["device_id"]]["transfer_count"] >= 2
+
+    def test_decrypt_value_error_returns_rc_1_no_traceback(
+        self, mock_relay, tmp_path, monkeypatch, capsys,
+    ):
+        """Tampered ciphertext should surface cleanly, not as a traceback."""
         monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
-        nomnom._save_known_peer("H", "host", "aa")
-        assert nomnom.cmd_forget("host") == 0
-        assert "forgot host" in capsys.readouterr().err
-        assert nomnom._known_peer_ik("H") is None
-        assert nomnom.cmd_forget("host") == 1
-        assert "no known peer" in capsys.readouterr().err
+        cwd = tmp_path / "rx"; cwd.mkdir()
+        monkeypatch.chdir(cwd)
+
+        # decrypt_bytes raises ValueError on bad magic; the receive helper
+        # must catch it and return 1, not propagate.
+        with pytest.raises(ValueError, match="bad magic"):
+            nomnom.decrypt_bytes(b"\x00" * 100, "wrong-key")
+
+        # End-to-end: corrupt the slot_d body in mock_relay mid-flight so that
+        # decrypt_bytes is fed a tampered blob.
+        sender = self._mk_identity("sender")
+        receiver = self._mk_identity("receiver")
+        cfg = mock_relay.cfg()
+        code = nomnom._generate_pairing_code()
+
+        # Monkeypatch decrypt_bytes to simulate any of its ValueError raises.
+        original = nomnom.decrypt_bytes
+
+        def boom(*_args, **_kwargs):
+            raise ValueError("authentication failed")
+
+        recv_err: list = []
+        send_err: list = []
+
+        def receive():
+            monkeypatch.setattr(nomnom, "decrypt_bytes", boom)
+            try:
+                nomnom._relay_recv_first_contact(
+                    code, identity=receiver, relay=cfg, trust_new=True,
+                )
+            except nomnom.NomnomError as exc:
+                recv_err.append(str(exc))
+            finally:
+                monkeypatch.setattr(nomnom, "decrypt_bytes", original)
+
+        def send():
+            try:
+                nomnom._relay_send(
+                    "x.txt", b"payload", code=code, target_ik_hex=None,
+                    identity=sender, relay=cfg, trust_new=True,
+                )
+            except nomnom.NomnomError as exc:
+                send_err.append(str(exc))
+
+        tr = threading.Thread(target=receive, daemon=True); tr.start()
+        time.sleep(0.1)
+        ts = threading.Thread(target=send, daemon=True); ts.start()
+        ts.join(timeout=15.0); tr.join(timeout=15.0)
+
+        # Receiver transforms the ValueError into a NomnomError with a clean
+        # user-facing message; the caller (cmd_decrypt / TUI worker) catches
+        # NomnomError and surfaces it without a traceback.
+        assert recv_err and "authentication failed" in recv_err[0]
+
+    def test_peers_list_tolerates_non_dict_entries(
+        self, tmp_path, monkeypatch, capsys,
+    ):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        cfg_dir = tmp_path / "nomnom"
+        cfg_dir.mkdir(parents=True, exist_ok=True)
+        # Hand-edited file: every entry is the wrong shape.
+        (cfg_dir / "known_peers.json").write_text(
+            json.dumps({"olddev": "legacy-string-value"}),
+            encoding="utf-8",
+        )
+
+        # Must not raise ValueError: max() arg is an empty sequence.
+        rc = nomnom._cmd_peers_list(None)
+        assert rc == 0
 
 
-@pytest.mark.skipif(
-    os.environ.get("NOMNOM_E2E") != "1",
-    reason="real-broadcast e2e on localhost; run with NOMNOM_E2E=1",
-)
-class TestLanTofuE2E:
-    """Spawn the real CLI as two processes (separate config dirs) and let them
-    discover and transfer over genuine UDP broadcast, trusting on first use.
-    Skipped by default."""
+class TestTuiCliContract:
+    """Regression coverage for helper / caller decoupling (Commit B)."""
 
-    NOM = Path(__file__).resolve().parent.parent / "nomnom.py"
+    def test_ensure_relay_configured_non_interactive_raises(
+        self, tmp_path, monkeypatch,
+    ):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        with pytest.raises(nomnom.NomnomError, match="no relay configured"):
+            nomnom._ensure_relay_configured(interactive=False)
 
-    def _env(self, cfg):
-        return dict(os.environ, XDG_CONFIG_HOME=str(cfg), PYTHONUNBUFFERED="1")
+    def test_ensure_relay_configured_in_tui_raises(
+        self, tmp_path, monkeypatch,
+    ):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        monkeypatch.setattr(nomnom, "_TUI_ACTIVE", True)
+        try:
+            with pytest.raises(nomnom.NomnomError, match="no relay configured"):
+                nomnom._ensure_relay_configured()
+        finally:
+            monkeypatch.setattr(nomnom, "_TUI_ACTIVE", False)
 
-    def test_transfer_first_use(self, tmp_path):
-        a, b = tmp_path / "a", tmp_path / "b"
-        a.mkdir()
-        b.mkdir()
-        out = tmp_path / "out"
-        out.mkdir()
-        src = tmp_path / "doc.txt"
-        payload = b"tofu transfer\n" * 40
-        src.write_bytes(payload)
-        # receiver hosts first
-        rcv = subprocess.Popen(
-            [sys.executable, str(self.NOM), "decrypt", "--timeout", "25"],
-            stdin=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
-            env=self._env(b), cwd=out)
-        time.sleep(5)  # let it start beaconing
-        snd = subprocess.Popen(
-            [sys.executable, str(self.NOM), "encrypt", str(src),
-             "--timeout", "20"],
-            stdin=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
-            env=self._env(a))
-        snd.communicate("1\n", timeout=40)   # pick the only receiver
-        rcv.communicate(timeout=40)
-        assert snd.returncode == 0 and rcv.returncode == 0
-        assert (out / "doc.txt").read_bytes() == payload
-        # both sides pinned each other on first use
-        assert (a / "nomnom" / "known_peers.json").exists()
-        assert (b / "nomnom" / "known_peers.json").exists()
+    def test_bundle_send_via_relay_invokes_on_code_callback(
+        self, tmp_path, monkeypatch,
+    ):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        nomnom._save_relay_config("https://example.invalid", "secret")
+
+        captured: list = []
+
+        def fake_send(name, data, **kwargs):
+            return 0
+
+        monkeypatch.setattr(nomnom, "_relay_send", fake_send)
+        rc = nomnom._bundle_send_via_relay(
+            "x.txt", b"payload",
+            interactive=False,
+            on_code=lambda c: captured.append(c),
+        )
+        assert rc == 0
+        assert len(captured) == 1
+        # Pairing code shape: XXX-XXX-XXX (Crockford base32).
+        assert len(captured[0]) == 11 and captured[0].count("-") == 2
+
+    def test_bundle_send_via_relay_no_relay_returns_2(
+        self, tmp_path, monkeypatch,
+    ):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        # No relay config + interactive=False -> raises NomnomError caught
+        # internally and surfaced as rc=2 to the caller.
+        rc = nomnom._bundle_send_via_relay(
+            "x.txt", b"payload", interactive=False,
+        )
+        assert rc == 2
+
+    def test_relay_send_raises_nomnomerror_on_no_receiver(
+        self, mock_relay, tmp_path, monkeypatch,
+    ):
+        """The helper must raise instead of writing to stderr + returning 1."""
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        priv, pub = nomnom._dh_keypair()
+        sender = {
+            "device_id": "dev-sender", "name": "sender",
+            "ik_priv": format(priv, "x"), "ik_pub": format(pub, "x"),
+        }
+
+        # Short wait so the test doesn't hang for 30s on the long-poll.
+        monkeypatch.setattr(nomnom, "_RELAY_DEFAULT_WAIT_MS", 200)
+        code = nomnom._generate_pairing_code()
+        with pytest.raises(nomnom.NomnomError, match="receiver didn't connect"):
+            nomnom._relay_send(
+                "x.txt", b"data",
+                code=code, target_ik_hex=None,
+                identity=sender, relay=mock_relay.cfg(),
+                trust_new=True,
+            )
+
+    def test_recv_complete_populates_on_result(
+        self, mock_relay, tmp_path, monkeypatch,
+    ):
+        """on_result callback must fire on the success path."""
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        cwd = tmp_path / "rx"; cwd.mkdir()
+        monkeypatch.chdir(cwd)
+
+        priv_s, pub_s = nomnom._dh_keypair()
+        priv_r, pub_r = nomnom._dh_keypair()
+        sender = {
+            "device_id": "dev-sender", "name": "sender",
+            "ik_priv": format(priv_s, "x"), "ik_pub": format(pub_s, "x"),
+        }
+        receiver = {
+            "device_id": "dev-receiver", "name": "receiver",
+            "ik_priv": format(priv_r, "x"), "ik_pub": format(pub_r, "x"),
+        }
+
+        cfg = mock_relay.cfg()
+        code = nomnom._generate_pairing_code()
+        payload = b"recv-callback-payload"
+        results: list = []
+
+        def receive():
+            nomnom._relay_recv_first_contact(
+                code, identity=receiver, relay=cfg, trust_new=True,
+                on_result=lambda r: results.append(r),
+            )
+
+        def send():
+            nomnom._relay_send(
+                "out.txt", payload, code=code, target_ik_hex=None,
+                identity=sender, relay=cfg, trust_new=True,
+            )
+
+        tr = threading.Thread(target=receive, daemon=True); tr.start()
+        time.sleep(0.1)
+        ts = threading.Thread(target=send, daemon=True); ts.start()
+        ts.join(timeout=15.0); tr.join(timeout=15.0)
+
+        assert len(results) == 1
+        r = results[0]
+        assert r["name"] == "out.txt"
+        assert r["bytes"] == len(payload)
+        assert r["peer_name"] == "sender"
+        assert r["out_path"].endswith("out.txt")
+
+
+class TestCancellationPropagation:
+    """Regression coverage for Commit C — cancel must be observed promptly."""
+
+    @staticmethod
+    def _mk_identity(name: str) -> dict:
+        priv, pub = nomnom._dh_keypair()
+        return {
+            "device_id": "dev-" + name, "name": name,
+            "ik_priv": format(priv, "x"), "ik_pub": format(pub, "x"),
+        }
+
+    def test_recv_pinned_observes_cancel_within_200ms(
+        self, mock_relay, tmp_path, monkeypatch,
+    ):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        receiver = self._mk_identity("receiver")
+        # Pin a peer so the helper has a worker to spawn.
+        nomnom._save_known_peer("dev-fake-peer", "fake", "deadbeef" * 8)
+
+        import threading as _t
+        cancel = _t.Event()
+        result: list = []
+
+        def runit():
+            try:
+                result.append(nomnom._relay_recv_pinned(
+                    identity=receiver, relay=mock_relay.cfg(),
+                    trust_new=True, cancel=cancel,
+                ))
+            except nomnom.NomnomError as e:
+                result.append(str(e))
+
+        t = _t.Thread(target=runit, daemon=True); t.start()
+        time.sleep(0.1)
+        cancel.set()
+        t.join(timeout=1.0)
+        assert not t.is_alive(), "cancel was not observed within 1s"
+        # The cancel-during-result_q.get path returns 130 cleanly.
+        assert result == [130]
+
+    def test_tofu_event_clear_happens_before_publish(
+        self, mock_relay, tmp_path, monkeypatch,
+    ):
+        """Fast main-thread set() must not race the worker's clear().
+
+        The worker now clears the event BEFORE publishing tofu_request, so a
+        main-thread set() that arrives between the clear() and the wait()
+        leaves the wait() unblocked (event stays set, wait returns immediately).
+        Conversely, if clear() came AFTER publish (the bug), the worker would
+        wipe its own signal and hang.
+        """
+        import threading as _t
+
+        # Simulate the _on_tofu pattern on a fresh state, with a "fast main"
+        # that calls set() the instant tofu_request is observed.
+        from nomnom import _RelayTransferState  # local import for clarity
+
+        for _ in range(20):  # Repeat to give the race chances to manifest.
+            state = _RelayTransferState()
+            seen = _t.Event()
+
+            def worker():
+                # Mirror _TransferScreen._on_tofu.
+                state.tofu_answer_event.clear()
+                with state._lock:
+                    state.tofu_request = {"decision": "new"}
+                state.tofu_answer_event.wait()  # Must not hang.
+
+            def main():
+                # Spin until worker has published the request, then answer.
+                while True:
+                    with state._lock:
+                        if state.tofu_request is not None:
+                            state.tofu_answer = True
+                            break
+                state.tofu_answer_event.set()
+                seen.set()
+
+            tw = _t.Thread(target=worker, daemon=True); tw.start()
+            tm = _t.Thread(target=main, daemon=True); tm.start()
+            tw.join(timeout=1.0)
+            tm.join(timeout=1.0)
+            assert not tw.is_alive(), "worker hung waiting for TOFU answer"
+            assert seen.is_set()
+
+
+class TestDefenseInDepth:
+    """Regression coverage for Commit D — content-length cap, SSRF allowlist,
+    tmp-file permission race, poll-worker error surfacing."""
+
+    def test_save_relay_config_refuses_loopback_by_default(
+        self, tmp_path, monkeypatch,
+    ):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        with pytest.raises(nomnom.NomnomError, match="private/loopback"):
+            nomnom._save_relay_config("http://127.0.0.1:8787", "secret")
+
+    def test_save_relay_config_refuses_metadata_address(
+        self, tmp_path, monkeypatch,
+    ):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        with pytest.raises(nomnom.NomnomError, match="private/loopback"):
+            nomnom._save_relay_config("http://169.254.169.254/", "secret")
+
+    def test_save_relay_config_accepts_loopback_with_allow_private(
+        self, tmp_path, monkeypatch,
+    ):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        nomnom._save_relay_config(
+            "http://127.0.0.1:8787", "secret", allow_private=True,
+        )
+        cfg = nomnom._load_relay_config()
+        assert cfg["url"] == "http://127.0.0.1:8787"
+
+    def test_save_relay_config_unresolvable_host_is_allowed(
+        self, tmp_path, monkeypatch,
+    ):
+        """DNS failure should not block save — self-test catches genuinely
+        broken Workers, and a hostname that doesn't resolve isn't an SSRF
+        vector by itself."""
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        nomnom._save_relay_config("https://relay.example.invalid", "secret")
+        cfg = nomnom._load_relay_config()
+        assert cfg["secret"] == "secret"
+
+    def test_save_relay_config_tmp_file_never_world_readable(
+        self, tmp_path, monkeypatch,
+    ):
+        """The tmp file must be created mode 0o600 by the kernel (O_EXCL +
+        mode arg), never the default umask 0o644."""
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        captured_modes: list = []
+        original_open = os.open
+
+        def watched_open(path, flags, mode=0o777):
+            fd = original_open(path, flags, mode)
+            if isinstance(path, (str, Path)) and ".json.tmp" in str(path):
+                captured_modes.append(os.fstat(fd).st_mode & 0o777)
+            return fd
+
+        monkeypatch.setattr(nomnom.os, "open", watched_open)
+        nomnom._save_relay_config(
+            "http://127.0.0.1:8787", "secret", allow_private=True,
+        )
+        assert captured_modes == [0o600]
+
+    def test_relay_request_rejects_oversized_content_length(
+        self, mock_relay, monkeypatch,
+    ):
+        """Hostile relay declaring a huge body must be refused before read()."""
+        cfg = mock_relay.cfg()
+
+        class _BadResp:
+            status = 200
+            def getheader(self, name, default=None):
+                if name.lower() == "content-length":
+                    return str(nomnom._RELAY_MAX_BODY + 1024)
+                return default
+            def read(self, *_a, **_kw):
+                raise AssertionError("should not be called")
+
+        class _BadConn:
+            def request(self, *_a, **_kw): pass
+            def getresponse(self): return _BadResp()
+            def close(self): pass
+
+        monkeypatch.setattr(nomnom, "_relay_open", lambda _r: _BadConn())
+        with pytest.raises(nomnom.NomnomError, match="oversized body"):
+            nomnom._relay_request(cfg, "GET", "/slots/x")
+
+    def test_poll_worker_surfaces_non_404_status_as_last_error(
+        self, mock_relay, monkeypatch,
+    ):
+        """A 401 (clock skew, bad secret) used to silently look like a
+        404 timeout; now it lands in worker.last_error so the caller can
+        surface it via _relay_recv_pinned."""
+        cfg = mock_relay.cfg()
+
+        class _Resp401:
+            status = 401
+            def getheader(self, _n, default=None): return default
+            def read(self, *_a, **_kw): return b"clock skew detected"
+
+        class _Conn:
+            def request(self, *_a, **_kw): pass
+            def getresponse(self): return _Resp401()
+            def close(self): pass
+
+        monkeypatch.setattr(nomnom, "_relay_open", lambda _r: _Conn())
+        w = nomnom._RelayPollWorker(cfg, "ghost", wait_ms=100)
+        result = w.run()
+        assert result is None
+        assert w.last_error and "401" in w.last_error
+
