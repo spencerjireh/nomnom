@@ -19,7 +19,7 @@ nomnom .
 
 Opens a picker for the current directory. Pick files, hit `Enter`, get `./<repo>-<timestamp>.txt`. `.gitignore`, junk dirs (`.git`, `node_modules`, …), binaries, symlinks, and obvious secrets are skipped before the picker loads.
 
-Bare `nomnom` on a TTY opens a launcher menu fronting every verb (bundle, `commit`, `pr`, `review`, `encrypt`, `decrypt`, `pair`, `rebuild`, `register`, `relay`, `peers`).
+Bare `nomnom` on a TTY opens a launcher with tiles for Bundle, Send, Receive, Pair, Rebuild, Pins, and Extensions. Inside the picker, `v` cycles bundle / `commit` / `pr` / `review` when run from inside a git repo.
 
 Output mirrors [repomix](https://github.com/yamadashy/repomix)'s shape:
 
@@ -107,7 +107,7 @@ Never overwrites. Path-escape attempts (absolute paths, `..` segments) are refus
 
 ## Send between machines (via your own relay)
 
-`pair`, `encrypt`, and `decrypt` move files between machines through a Cloudflare Worker you deploy to your own account. Nothing hits disk on the sender. The relay sees only ciphertext + per-peer rendezvous ids.
+`pair`, `encrypt`, and `decrypt` move files between machines through a Cloudflare Worker you deploy to your own account. Nothing hits disk on the sender. The relay sees only ciphertext + per-pair rendezvous ids.
 
 ### One-time setup
 

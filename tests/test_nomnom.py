@@ -4613,19 +4613,18 @@ class TestDefenseInDepth:
     def test_save_relay_config_tmp_file_never_world_readable(
         self, tmp_path, monkeypatch,
     ):
-        """The tmp file must be created mode 0o600 by the kernel (O_EXCL +
-        mode arg), never the default umask 0o644."""
+        """The tmp file must be mode 0o600 before any content lands, never
+        the default umask 0o644. _atomic_write_text calls fchmod immediately
+        after mkstemp so the umask window is closed before write()."""
         monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
         captured_modes: list = []
-        original_open = os.open
+        original_fchmod = os.fchmod
 
-        def watched_open(path, flags, mode=0o777):
-            fd = original_open(path, flags, mode)
-            if isinstance(path, (str, Path)) and ".json.tmp" in str(path):
-                captured_modes.append(os.fstat(fd).st_mode & 0o777)
-            return fd
+        def watched_fchmod(fd, mode):
+            captured_modes.append(mode)
+            return original_fchmod(fd, mode)
 
-        monkeypatch.setattr(nomnom.os, "open", watched_open)
+        monkeypatch.setattr(nomnom.os, "fchmod", watched_fchmod)
         nomnom._save_relay_config(
             "http://127.0.0.1:8787", "secret", allow_private=True,
         )

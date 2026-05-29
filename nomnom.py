@@ -30,6 +30,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -2520,23 +2521,42 @@ def _known_peers_path() -> Path:
     return _nomnom_config_dir() / "known_peers.json"
 
 
-def _atomic_write_text(path: Path, content: str, *, mode: int = 0o600) -> None:
-    """Write `content` to `path` atomically with `mode` baked in by O_EXCL.
+def _is_inside_git_repo(root: Path) -> bool:
+    """True if `root` is inside a git worktree.
 
-    Tmpfile + os.replace so a crash mid-write can't truncate the destination.
-    The kernel creates the tmpfile with `mode` directly (no umask window where
-    secrets are world-readable).
+    Walk parents looking for `.git` (a directory in the worktree root, or a
+    file for linked worktrees). Cheaper than shelling out and avoids
+    blocking the curses event loop on a subprocess.
     """
-    tmp = path.with_suffix(path.suffix + ".tmp")
     try:
-        os.unlink(tmp)
-    except FileNotFoundError:
-        pass
-    fd = os.open(str(tmp), os.O_CREAT | os.O_EXCL | os.O_WRONLY, mode)
+        candidate = root.resolve()
+    except OSError:
+        return False
+    for cur in (candidate, *candidate.parents):
+        if (cur / ".git").exists():
+            return True
+    return False
+
+
+def _atomic_write_text(path: Path, content: str, *, mode: int = 0o600) -> None:
+    """Write `content` to `path` atomically.
+
+    Uses `tempfile.mkstemp` so concurrent writers each get a unique tmpfile
+    (a fixed `*.tmp` name lets two processes race on unlink/open and clobber
+    each other's update). The tmpfile is created in the destination dir so
+    `os.replace` is a same-filesystem rename. `os.fchmod` enforces `mode`
+    immediately; the umask window is closed before any content lands.
+    """
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp",
+        dir=str(path.parent),
+    )
+    tmp = Path(tmp_name)
     try:
+        os.fchmod(fd, mode)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(content)
-    except Exception:
+    except BaseException:
         try:
             os.unlink(tmp)
         except OSError:
@@ -5168,7 +5188,7 @@ class BundleScreen(Screen):
         stats = collect_stats(root, items)
         nodes = build_tree(items, stats=stats)
 
-        allow_git_verbs = (root / ".git").exists()
+        allow_git_verbs = _is_inside_git_repo(root)
         result = _picker_ui(
             stdscr, nodes, root=root,
             allow_stdout=False, allow_git_verbs=allow_git_verbs,
@@ -5810,9 +5830,13 @@ class SendScreen(_TransferScreen):
             self._launch_send(peers[0][1]["ik_pub"])
             return
         # Most-recently-used first; last_transfer is set by _relay_pin_peer.
-        self._peers = sorted(
-            peers, key=lambda pr: -(pr[1].get("last_transfer") or 0),
-        )
+        # Match the renderer's tolerance for malformed persisted values: a
+        # non-numeric last_transfer sorts as "never seen" instead of crashing.
+        def _last_transfer_key(pr: tuple[str, dict]) -> int:
+            last = pr[1].get("last_transfer")
+            return -int(last) if isinstance(last, (int, float)) else 0
+
+        self._peers = sorted(peers, key=_last_transfer_key)
         self._cursor = 0
         self.step = "peer-pick"
 
@@ -6838,7 +6862,7 @@ def main() -> int:
             for n in nodes:
                 if not n.is_dir and n.rel in matched_rels:
                     n.checked = True
-        allow_git_verbs = (root / ".git").exists()
+        allow_git_verbs = _is_inside_git_repo(root)
         result = pick(nodes, root=root, allow_git_verbs=allow_git_verbs)
         if result is None:
             print("cancelled.", file=sys.stderr)
