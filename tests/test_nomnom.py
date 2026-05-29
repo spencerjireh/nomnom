@@ -23,6 +23,16 @@ import nomnom
 
 # ---------- helpers ----------
 
+
+def _tofu_yes(_req: dict) -> bool:
+    """Auto-accept TOFU callback for tests that exercise the happy path
+    without an interactive prompt. Receivers must pass this when running
+    in a worker thread, since the main-thread guard refuses input() off
+    the main thread.
+    """
+    return True
+
+
 def make_repo(root: Path, layout: dict) -> None:
     """Create a synthetic file tree.
 
@@ -534,6 +544,24 @@ class TestCycleDestination:
             == nomnom.Destination.FILE
 
 
+class TestCycleVerb:
+    def test_full_cycle(self):
+        v = nomnom.Verb.BUNDLE
+        for expected in (nomnom.Verb.COMMIT, nomnom.Verb.PR,
+                         nomnom.Verb.REVIEW, nomnom.Verb.BUNDLE):
+            v = nomnom.cycle_verb(v)
+            assert v == expected
+
+    def test_allowed_bundle_only_is_a_no_op(self):
+        allowed = (nomnom.Verb.BUNDLE,)
+        assert nomnom.cycle_verb(nomnom.Verb.BUNDLE, allowed) == nomnom.Verb.BUNDLE
+
+    def test_allowed_snaps_to_first_when_current_not_allowed(self):
+        allowed = (nomnom.Verb.BUNDLE,)
+        # If we somehow start on COMMIT but only BUNDLE is allowed, snap back.
+        assert nomnom.cycle_verb(nomnom.Verb.COMMIT, allowed) == nomnom.Verb.BUNDLE
+
+
 class TestComputeSummary:
     def _node(self, rel, *, is_dir=False, checked=False, size=0):
         return nomnom.Node(
@@ -581,19 +609,40 @@ class TestFormatFooter:
         assert "tree: off" in off
 
     def test_narrow_width_drops_stats_block(self):
-        # Wide enough for "selected: 2 files" + gap + "dest: file  tree: on"
-        # but not the size/token block in between.
-        narrow = nomnom.format_footer(nomnom.Destination.FILE, True, (2, 1000, 250), 50)
+        # Wide enough for "selected: 2 files" + gap + the right block
+        # (verb: bundle  dest: file  tree: on) but not the size/token block
+        # in between.
+        narrow = nomnom.format_footer(nomnom.Destination.FILE, True, (2, 1000, 250), 60)
         assert "selected: 2 files" in narrow
         assert "dest: file" in narrow
-        assert len(narrow) <= 50
+        assert "verb: bundle" in narrow
+        assert len(narrow) <= 60
 
     def test_wide_width_includes_everything(self):
         out = nomnom.format_footer(nomnom.Destination.FILE, True, (5, 4096, 1024), 120)
         assert "selected: 5 files" in out
         assert "dest: file" in out
         assert "tree: on" in out
+        assert "verb: bundle" in out
         assert len(out) <= 120
+
+    def test_verb_label_appears(self):
+        for verb, label in [
+            (nomnom.Verb.BUNDLE, "verb: bundle"),
+            (nomnom.Verb.COMMIT, "verb: commit"),
+            (nomnom.Verb.PR, "verb: pr"),
+            (nomnom.Verb.REVIEW, "verb: review"),
+        ]:
+            out = nomnom.format_footer(
+                nomnom.Destination.FILE, True, (3, 1000, 250), 120, verb,
+            )
+            assert label in out
+
+    def test_default_verb_is_bundle(self):
+        # Existing callers that don't pass a verb should still get a footer
+        # with "verb: bundle" implied by the default.
+        out = nomnom.format_footer(nomnom.Destination.FILE, True, (1, 100, 25), 120)
+        assert "verb: bundle" in out
 
 
 # ---------- --include / --exclude filters ----------
@@ -1255,31 +1304,99 @@ class TestSendScreen:
         assert s.step == "path"
         assert "relay" in s.error.lower()
 
+    def test_no_pinned_peers_blocks_send(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        nomnom._save_relay_config("https://example.invalid", "secret",
+                                  allow_private=True)
+        f = tmp_path / "blob.bin"; f.write_bytes(b"x")
+        s = nomnom.SendScreen()
+        s.path_buf = str(f)
+        s._begin_send()
+        assert s.step == "path"
+        assert "pair" in s.error.lower()
+
+    def test_two_peers_routes_to_peer_picker(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        nomnom._save_relay_config("https://example.invalid", "secret",
+                                  allow_private=True)
+        nomnom._save_known_peer("dev-1", "alice", "aa" * 32)
+        nomnom._save_known_peer("dev-2", "bob", "bb" * 32)
+        f = tmp_path / "blob.bin"; f.write_bytes(b"x")
+        s = nomnom.SendScreen()
+        s.path_buf = str(f)
+        s._begin_send()
+        assert s.step == "peer-pick"
+        assert len(s._peers) == 2
+
+    def test_peer_picker_pre_selects_last_used(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        nomnom._save_relay_config("https://example.invalid", "secret",
+                                  allow_private=True)
+        nomnom._save_known_peer("dev-old", "alice", "aa" * 32)
+        nomnom._save_known_peer("dev-new", "bob", "bb" * 32)
+        peers = nomnom._load_known_peers()
+        peers["dev-new"]["last_transfer"] = 2_000_000_000
+        peers["dev-old"]["last_transfer"] = 1_000_000_000
+        nomnom._save_known_peers(peers)
+        f = tmp_path / "blob.bin"; f.write_bytes(b"x")
+        s = nomnom.SendScreen()
+        s.path_buf = str(f)
+        s._begin_send()
+        assert s.step == "peer-pick"
+        assert s._peers[0][0] == "dev-new"  # most recent first
+        assert s._cursor == 0
+
+
+class TestPairScreen:
+    def test_init_defaults(self):
+        s = nomnom.PairScreen()
+        assert s.step == "mode"
+        assert s.role is None
+
+    def test_r_without_relay_sets_error(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        s = nomnom.PairScreen()
+        s.handle_key(ord("r"))
+        assert s.step == "mode"
+        assert "relay" in s.error.lower()
+
+    def test_s_moves_to_path_step(self):
+        s = nomnom.PairScreen()
+        s.handle_key(ord("s"))
+        assert s.step == "path"
+        assert s.role == "send"
+
+    def test_path_invalid_file_sets_error(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        nomnom._save_relay_config("https://example.invalid", "secret",
+                                  allow_private=True)
+        s = nomnom.PairScreen()
+        s.handle_key(ord("s"))
+        s.path_buf = str(tmp_path / "missing.bin")
+        s._begin_send()
+        assert s.step == "path"
+        assert "not a file" in s.error
+
 
 class TestReceiveScreen:
     def test_init_defaults(self):
         s = nomnom.ReceiveScreen()
-        # New ReceiveScreen opens on the mode chooser (pinned-peers vs code).
+        # New ReceiveScreen opens on the mode chooser (info-only since no
+        # code is required anymore).
         assert s.step == "mode"
 
     def test_q_returns_back(self):
         s = nomnom.ReceiveScreen()
         assert s.handle_key(ord("q")) == nomnom.ScreenAction.BACK
 
-    def test_enter_without_peers_or_code_shows_error(self, tmp_path, monkeypatch):
+    def test_enter_without_peers_shows_error(self, tmp_path, monkeypatch):
         monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        nomnom._save_relay_config("https://relay.invalid", "secret",
+                                  allow_private=True)
         s = nomnom.ReceiveScreen()
         s.handle_key(10)
         assert s.step == "mode"
         assert "no pinned peers" in s.error.lower()
-
-    def test_enter_with_bad_code_shows_error(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
-        s = nomnom.ReceiveScreen()
-        s.code_buf = "not-a-code"
-        s.handle_key(10)
-        assert s.step == "mode"
-        assert "invalid pairing code" in s.error.lower()
 
 
 class TestEmitGitBundleSend:
@@ -3023,6 +3140,76 @@ class TestIdentityKnownPeers:
         assert nomnom._forget_peer("nope") == []
 
 
+class TestKnownPeersMigration:
+    """Pre-rendezvous flat-dict known_peers.json rewraps in-place; pins survive."""
+
+    def test_v1_flat_dict_pins_survive(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        cfg_dir = tmp_path / "nomnom"; cfg_dir.mkdir(parents=True)
+        (cfg_dir / "known_peers.json").write_text(
+            json.dumps({"dev-old": {"name": "old", "ik_pub": "deadbeef"}}),
+            encoding="utf-8",
+        )
+        peers = nomnom._load_known_peers()
+        assert peers == {"dev-old": {"name": "old", "ik_pub": "deadbeef"}}
+        assert "migrated 1" in capsys.readouterr().err.lower()
+
+    def test_sentinel_is_persisted_after_migration(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        cfg_dir = tmp_path / "nomnom"; cfg_dir.mkdir(parents=True)
+        (cfg_dir / "known_peers.json").write_text(
+            json.dumps({"dev-old": {"name": "x", "ik_pub": "aa"}}),
+            encoding="utf-8",
+        )
+        nomnom._load_known_peers()
+        on_disk = json.loads((cfg_dir / "known_peers.json").read_text())
+        assert on_disk["version"] == nomnom._KNOWN_PEERS_SCHEMA
+        assert on_disk["peers"] == {"dev-old": {"name": "x", "ik_pub": "aa"}}
+
+    def test_second_load_does_not_re_migrate(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        cfg_dir = tmp_path / "nomnom"; cfg_dir.mkdir(parents=True)
+        (cfg_dir / "known_peers.json").write_text(
+            json.dumps({"dev-old": {"name": "x", "ik_pub": "aa"}}),
+            encoding="utf-8",
+        )
+        nomnom._load_known_peers()
+        capsys.readouterr()  # drain
+        nomnom._load_known_peers()
+        assert "migrated" not in capsys.readouterr().err.lower()
+
+    def test_non_dict_entries_are_dropped_during_migration(
+        self, tmp_path, monkeypatch,
+    ):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        cfg_dir = tmp_path / "nomnom"; cfg_dir.mkdir(parents=True)
+        (cfg_dir / "known_peers.json").write_text(
+            json.dumps({
+                "good": {"name": "g", "ik_pub": "ab"},
+                "bad": "legacy-string-value",  # never valid record shape
+            }),
+            encoding="utf-8",
+        )
+        peers = nomnom._load_known_peers()
+        assert peers == {"good": {"name": "g", "ik_pub": "ab"}}
+
+    def test_v2_wrapper_round_trips(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        nomnom._save_known_peer("d", "n", "ab")
+        peers = nomnom._load_known_peers()
+        assert "d" in peers
+        assert "version" not in peers  # sentinel hidden from caller
+
+    def test_writers_preserve_sentinel(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        nomnom._save_known_peer("d", "n", "ab")
+        on_disk = json.loads(
+            (tmp_path / "nomnom" / "known_peers.json").read_text(),
+        )
+        assert on_disk["version"] == nomnom._KNOWN_PEERS_SCHEMA
+        assert "d" in on_disk["peers"]
+
+
 class TestSessionCrypto:
     def test_dh_prime_is_2048_bit(self):
         assert nomnom._DH_P.bit_length() == 2048
@@ -3158,51 +3345,276 @@ class TestSessionCrypto:
         assert ki != kr_other
 
 
-class TestPairingCode:
-    def test_generated_format(self):
-        for _ in range(50):
-            code = nomnom._generate_pairing_code()
-            assert len(code) == 11 and code[3] == "-" and code[7] == "-"
-            chars = code.replace("-", "")
-            for c in chars:
-                assert c in nomnom._PAIRING_ALPHABET
+class TestRendezvousSlots:
+    def test_first_contact_binding_is_relay_keyed(self):
+        a = nomnom._first_contact_binding("secret-A")
+        b = nomnom._first_contact_binding("secret-B")
+        assert a != b
+        assert nomnom._first_contact_binding("secret-A") == a
 
-    def test_parse_round_trip(self):
-        code = nomnom._generate_pairing_code()
-        parsed = nomnom._parse_pairing_code(code)
-        assert parsed == code.replace("-", "").encode("ascii")
+    def test_init_slot_is_deterministic_per_relay(self):
+        s = "test-secret"
+        assert (nomnom._slot_first_contact_init(s)
+                == nomnom._slot_first_contact_init(s))
+        assert (nomnom._slot_first_contact_init(s)
+                != nomnom._slot_first_contact_init("other"))
 
-    def test_parse_tolerates_ambiguous_chars(self):
-        # I -> 1, L -> 1, O -> 0
-        parsed = nomnom._parse_pairing_code("iLo-2BC-D3E")
-        assert parsed == b"110" + b"2BC" + b"D3E"
-
-    def test_parse_strips_whitespace_and_hyphens(self):
-        assert nomnom._parse_pairing_code("ab c-12 3-4 56") == b"ABC1234" + b"56"
-
-    def test_parse_rejects_wrong_length(self):
-        with pytest.raises(ValueError):
-            nomnom._parse_pairing_code("AB-CD")
-
-    def test_parse_rejects_invalid_chars(self):
-        # 'U' is not in Crockford base32
-        with pytest.raises(ValueError):
-            nomnom._parse_pairing_code("UAB-CDE-FGH")
-
-
-class TestRelaySlots:
-    def test_first_contact_deterministic(self):
-        code = b"ABC123XYZ"
-        assert nomnom._slot_first_contact(code) == nomnom._slot_first_contact(code)
-        assert nomnom._slot_first_contact(b"ABC123XYZ") != nomnom._slot_first_contact(b"ABC123XYY")
-
-    def test_slot_chars_are_urlsafe(self):
-        slot = nomnom._slot_first_contact(b"ABC123XYZ")
-        # base64-urlsafe, no padding
+    def test_init_slot_chars_are_urlsafe(self):
+        slot = nomnom._slot_first_contact_init("s")
         for c in slot:
             assert c.isalnum() or c in "-_"
         assert "=" not in slot
 
+    def test_resp_base_differs_per_sender(self):
+        s = "test-secret"
+        _, pub_a = nomnom._dh_keypair()
+        _, pub_b = nomnom._dh_keypair()
+        a = nomnom._slot_first_contact_resp_base(s, format(pub_a, "x"))
+        b = nomnom._slot_first_contact_resp_base(s, format(pub_b, "x"))
+        assert a != b
+
+    def test_resp_base_keyed_by_relay_too(self):
+        _, pub = nomnom._dh_keypair()
+        a = nomnom._slot_first_contact_resp_base("s1", format(pub, "x"))
+        b = nomnom._slot_first_contact_resp_base("s2", format(pub, "x"))
+        assert a != b
+
+
+class TestFirstContactBindingKdf:
+    """The first-contact binding is scrypt over the relay secret, not HMAC.
+
+    Naive HMAC over a human-memorable passphrase is brute-forceable in
+    seconds; scrypt with N=2^15 raises that to days/weeks per guess on a
+    laptop. The KDF wrapping is part of the on-wire contract — both sides
+    must compute the same bytes for the session key to agree.
+    """
+
+    def test_binding_is_not_a_bare_hmac(self):
+        import hmac as _hmac
+        import hashlib as _hashlib
+        secret = "fend-sage-trash-cod-visa-data"
+        hmac_out = _hmac.new(
+            secret.encode("utf-8"),
+            nomnom._FIRST_CONTACT_BINDING_TAG, _hashlib.sha256,
+        ).digest()
+        scrypt_out = nomnom._first_contact_binding(secret)
+        assert hmac_out != scrypt_out, "binding must be slow-KDF, not bare HMAC"
+
+    def test_binding_is_cached(self):
+        # The lru_cache returns the same digest object on the second call
+        # without re-running scrypt (~100ms otherwise).
+        secret = "cached-secret"
+        a = nomnom._first_contact_binding(secret)
+        b = nomnom._first_contact_binding(secret)
+        assert a is b
+
+    def test_binding_length_is_32_bytes(self):
+        # Session-key transcript expects 32 bytes; assert dklen contract.
+        assert len(nomnom._first_contact_binding("any")) == 32
+
+
+class TestHandshakeHexValidation:
+    """_relay_parse_handshake rejects non-hex ik/ek with NomnomError."""
+
+    @staticmethod
+    def _blob(*, ik="aa", ek="bb", magic=None) -> bytes:
+        return json.dumps({
+            "magic": magic or nomnom._RELAY_INIT_RENDEZVOUS_MAGIC,
+            "ik": ik, "ek": ek, "device_id": "d", "name": "n",
+        }).encode("utf-8")
+
+    def test_non_hex_ik_raises_nomnom_error_not_value_error(self):
+        bad = self._blob(ik="zzzz")
+        with pytest.raises(nomnom.NomnomError, match=r"'ik' is not hex"):
+            nomnom._relay_parse_handshake(
+                bad, nomnom._RELAY_INIT_RENDEZVOUS_MAGIC,
+            )
+
+    def test_non_hex_ek_raises_nomnom_error(self):
+        bad = self._blob(ek="not-hex!")
+        with pytest.raises(nomnom.NomnomError, match=r"'ek' is not hex"):
+            nomnom._relay_parse_handshake(
+                bad, nomnom._RELAY_INIT_RENDEZVOUS_MAGIC,
+            )
+
+    def test_valid_odd_length_hex_is_accepted(self):
+        # format(int, "x") can produce odd-length hex when the top nibble is 0.
+        ok = self._blob(ik="abc", ek="1")
+        obj = nomnom._relay_parse_handshake(
+            ok, nomnom._RELAY_INIT_RENDEZVOUS_MAGIC,
+        )
+        assert obj["ik"] == "abc"
+
+
+class TestAtomicWrite:
+    """`_atomic_write_text` survives a crash mid-write."""
+
+    def test_partial_write_does_not_clobber_existing(self, tmp_path,
+                                                     monkeypatch):
+        target = tmp_path / "stored.json"
+        target.write_text('{"version":2,"peers":{"old":{"ik_pub":"ab"}}}')
+
+        # Make the inner write raise after open but before rename.
+        real_fdopen = os.fdopen
+
+        def boom_fdopen(fd, *args, **kwargs):
+            # Close the descriptor to avoid leaks, then explode.
+            os.close(fd)
+            raise OSError("disk full")
+
+        monkeypatch.setattr(os, "fdopen", boom_fdopen)
+        with pytest.raises(OSError, match="disk full"):
+            nomnom._atomic_write_text(target, '{"version":2,"peers":{}}')
+        # Original file is untouched.
+        assert "old" in target.read_text()
+
+    def test_completed_write_replaces_atomically(self, tmp_path):
+        target = tmp_path / "stored.json"
+        target.write_text('{"version":2,"peers":{}}')
+        nomnom._atomic_write_text(target, '{"version":2,"peers":{"new":1}}')
+        assert "new" in target.read_text()
+
+
+class TestCmdDecryptNoPeers:
+    """cmd_decrypt errors when no peers are pinned; no silent rendezvous."""
+
+    def test_no_peers_errors(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        nomnom._save_relay_config("https://example.invalid", "secret",
+                                  allow_private=True)
+        rc = nomnom.cmd_decrypt()
+        assert rc == 1
+        assert "no pinned peers" in capsys.readouterr().err.lower()
+
+
+class TestStatBeforeRead:
+    """cmd_pair and cmd_encrypt reject oversize files before read_bytes."""
+
+    def test_cmd_pair_oversize_short_circuits(self, tmp_path, monkeypatch,
+                                              capsys):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        nomnom._save_relay_config("https://example.invalid", "secret",
+                                  allow_private=True)
+        big = tmp_path / "huge.bin"
+        big.write_bytes(b"x" * 16)
+        # Lie about size via monkeypatched stat to avoid allocating 256 MB.
+        real_stat = Path.stat
+
+        def fake_stat(self):
+            r = real_stat(self)
+            if self == big:
+                class S:
+                    st_size = nomnom._RELAY_MAX_BODY + 1
+                    st_mode = r.st_mode
+                return S()
+            return r
+
+        monkeypatch.setattr(Path, "stat", fake_stat)
+        rc = nomnom.cmd_pair(str(big))
+        assert rc == 1
+        assert "too large" in capsys.readouterr().err.lower()
+
+
+class TestFirstContactPromptDefaultsNo:
+    """CLI _tofu_confirm_new defaults to No on empty answer."""
+
+    def test_empty_answer_returns_false(self, monkeypatch):
+        monkeypatch.setattr("builtins.input", lambda *_a, **_k: "")
+        assert nomnom._tofu_confirm_new("alice", "dev-x", "ab") is False
+
+    def test_yes_returns_true(self, monkeypatch):
+        monkeypatch.setattr("builtins.input", lambda *_a, **_k: "y")
+        assert nomnom._tofu_confirm_new("alice", "dev-x", "ab") is True
+
+    def test_eof_returns_false(self, monkeypatch):
+        def raises_eof(*_a, **_k):
+            raise EOFError
+        monkeypatch.setattr("builtins.input", raises_eof)
+        assert nomnom._tofu_confirm_new("alice", "dev-x", "ab") is False
+
+
+class TestTrustNewCallback:
+    """`--trust-new` injects an auto-accept callback with stderr audit."""
+
+    def test_callback_returns_true_and_audits(self, capsys):
+        cb = nomnom._trust_new_callback()
+        ok = cb({
+            "decision": "new", "peer_id": "d", "peer_name": "alice",
+            "old_ik": None, "new_ik": "ab",
+            "fingerprint": "aa:bb:cc:dd",
+        })
+        assert ok is True
+        err = capsys.readouterr().err
+        assert "--trust-new" in err
+        assert "alice" in err
+        assert "aa:bb:cc:dd" in err
+
+
+class TestSenderCleansRendezvousSlot:
+    """Sender's success path deletes slot_i so the next pair isn't 409'd."""
+
+    @staticmethod
+    def _mk_identity(name: str) -> dict:
+        priv, pub = nomnom._dh_keypair()
+        return {
+            "device_id": f"dev-{name}",
+            "name": name,
+            "ik_priv": format(priv, "x"),
+            "ik_pub": format(pub, "x"),
+        }
+
+    def test_back_to_back_pairs_do_not_409(self, mock_relay, tmp_path,
+                                           monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        cwd = tmp_path / "rx"; cwd.mkdir()
+        monkeypatch.chdir(cwd)
+        cfg = mock_relay.cfg()
+
+        # First pair.
+        s1 = self._mk_identity("s1"); r1 = self._mk_identity("r1")
+        recv1: list = []; send1: list = []
+
+        def recv_a():
+            recv1.append(nomnom._relay_recv_rendezvous(
+                identity=r1, relay=cfg, on_tofu=_tofu_yes,
+            ))
+
+        def send_a():
+            send1.append(nomnom._relay_send(
+                "a.txt", b"first", target_ik_hex=None,
+                identity=s1, relay=cfg, on_tofu=_tofu_yes,
+            ))
+
+        tr = threading.Thread(target=recv_a, daemon=True); tr.start()
+        time.sleep(0.1)
+        ts = threading.Thread(target=send_a, daemon=True); ts.start()
+        ts.join(timeout=15.0); tr.join(timeout=15.0)
+        assert send1 == [0] and recv1 == [0]
+
+        # Immediately retry — slot_i must already be cleaned up.
+        s2 = self._mk_identity("s2"); r2 = self._mk_identity("r2")
+        recv2: list = []; send2: list = []
+
+        def recv_b():
+            recv2.append(nomnom._relay_recv_rendezvous(
+                identity=r2, relay=cfg, on_tofu=_tofu_yes,
+            ))
+
+        def send_b():
+            send2.append(nomnom._relay_send(
+                "b.txt", b"second", target_ik_hex=None,
+                identity=s2, relay=cfg, on_tofu=_tofu_yes,
+            ))
+
+        tr = threading.Thread(target=recv_b, daemon=True); tr.start()
+        time.sleep(0.1)
+        ts = threading.Thread(target=send_b, daemon=True); ts.start()
+        ts.join(timeout=15.0); tr.join(timeout=15.0)
+        # No 'in flight' error; second pair succeeds.
+        assert send2 == [0] and recv2 == [0]
+
+
+class TestRelaySlots:
     def test_recurring_slot_is_symmetric(self):
         # Both peers, given each other's ik_pub, derive the same base slot.
         a_priv, a_pub = nomnom._dh_keypair()
@@ -3333,16 +3745,6 @@ class TestTofu:
             raise AssertionError("should not prompt for a matching key")
         monkeypatch.setattr("builtins.input", boom)
         assert nomnom._tofu_check_join({"id": "H", "name": "host", "ik": "aa"})
-
-    def test_trust_new_auto_accepts_changed_key(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
-        nomnom._save_known_peer("H", "host", "aa")
-        peer = {"id": "H", "name": "host", "ik": "bb"}
-
-        def boom(*a):
-            raise AssertionError("trust_new should bypass the prompt")
-        monkeypatch.setattr("builtins.input", boom)
-        assert nomnom._tofu_check_join(peer, trust_new=True) is True
 
 
 # ---------- Mock relay (in-process HTTP server) ----------
@@ -3591,7 +3993,7 @@ class TestRelayE2E:
             "ik_pub": format(pub, "x"),
         }
 
-    def test_first_contact_round_trip(self, mock_relay, tmp_path, monkeypatch):
+    def test_rendezvous_round_trip(self, mock_relay, tmp_path, monkeypatch):
         monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
         cwd = tmp_path / "rx"; cwd.mkdir()
         monkeypatch.chdir(cwd)
@@ -3600,28 +4002,24 @@ class TestRelayE2E:
         receiver = self._mk_identity("receiver-host")
         cfg = mock_relay.cfg()
 
-        code = nomnom._generate_pairing_code()
         payload = b"hello relay world\n" * 100
-        # encrypt_bytes wraps with name + AEAD; _relay_send takes that as `data`.
-        # Test invokes _relay_send with `data = payload` and `name = "demo.txt"`.
 
         recv_rc: list = []
         send_rc: list = []
 
         def receive():
-            recv_rc.append(nomnom._relay_recv_first_contact(
-                code, identity=receiver, relay=cfg,
-                trust_new=True,
+            recv_rc.append(nomnom._relay_recv_rendezvous(
+                identity=receiver, relay=cfg, on_tofu=_tofu_yes,
             ))
 
         def send():
             send_rc.append(nomnom._relay_send(
-                "demo.txt", payload, code=code, target_ik_hex=None,
-                identity=sender, relay=cfg,
-                trust_new=True,
+                "demo.txt", payload, target_ik_hex=None,
+                identity=sender, relay=cfg, on_tofu=_tofu_yes,
             ))
 
-        # Start receiver first so it long-polls slot_init before the sender PUTs.
+        # Start receiver first so it long-polls the rendezvous slot before
+        # the sender PUTs.
         tr = threading.Thread(target=receive, daemon=True)
         tr.start()
         time.sleep(0.1)
@@ -3640,8 +4038,6 @@ class TestRelayE2E:
         peers = nomnom._load_known_peers()
         assert sender["device_id"] in peers
         assert receiver["device_id"] in peers
-        # Transfer count is bumped on both sides (single shared known_peers
-        # in this test fixture because both identities share XDG_CONFIG_HOME).
         for rec in peers.values():
             assert rec.get("transfer_count", 0) >= 1
 
@@ -3665,34 +4061,20 @@ class TestRelayE2E:
 
         def receive():
             recv_rc.append(nomnom._relay_recv_pinned(
-                identity=receiver, relay=cfg, trust_new=True,
+                identity=receiver, relay=cfg,
             ))
 
         def send():
             send_rc.append(nomnom._relay_send(
-                "rec.txt", payload, code=None,
-                target_ik_hex=sender["ik_pub"],  # sender targets RECEIVER's pubkey
-                identity=sender, relay=cfg, trust_new=True,
-            ))
-
-        # Receiver targets sender's pubkey for slot derivation (recurring is
-        # symmetric so this works either way). We point the sender at the
-        # receiver's ik_pub so the slot derived by the sender matches the slot
-        # the receiver computes from its own pinned-peer (sender's) ik_pub.
-        # Adjust: send_target = receiver_ik so the recurring slot is shared.
-        send_rc.clear()
-
-        def send2():
-            send_rc.append(nomnom._relay_send(
-                "rec.txt", payload, code=None,
+                "rec.txt", payload,
                 target_ik_hex=receiver["ik_pub"],
-                identity=sender, relay=cfg, trust_new=True,
+                identity=sender, relay=cfg,
             ))
 
         tr = threading.Thread(target=receive, daemon=True)
         tr.start()
         time.sleep(0.2)
-        ts = threading.Thread(target=send2, daemon=True)
+        ts = threading.Thread(target=send, daemon=True)
         ts.start()
         ts.join(timeout=15.0)
         tr.join(timeout=15.0)
@@ -3700,6 +4082,80 @@ class TestRelayE2E:
         assert send_rc == [0] and recv_rc == [0]
         out = cwd / "rec.txt"
         assert out.exists() and out.read_bytes() == payload
+
+
+class TestCmdPair:
+    """End-to-end cmd_pair on both sides through the mock relay."""
+
+    def test_pair_round_trip_via_cmd(self, mock_relay, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        cwd = tmp_path / "rx"; cwd.mkdir()
+        monkeypatch.chdir(cwd)
+
+        # Configure the relay (used by _ensure_relay_configured inside cmd_pair).
+        cfg = mock_relay.cfg()
+        nomnom._save_relay_config(cfg["url"], cfg["secret"], allow_private=True)
+
+        payload = b"hello pair\n" * 20
+        src = tmp_path / "msg.txt"; src.write_bytes(payload)
+
+        recv_rc: list = []
+        send_rc: list = []
+
+        def receive():
+            recv_rc.append(nomnom.cmd_pair(None, trust_new=True))
+
+        def send():
+            send_rc.append(nomnom.cmd_pair(str(src), trust_new=True))
+
+        tr = threading.Thread(target=receive, daemon=True); tr.start()
+        time.sleep(0.1)
+        ts = threading.Thread(target=send, daemon=True); ts.start()
+        ts.join(timeout=15.0); tr.join(timeout=15.0)
+
+        assert send_rc == [0] and recv_rc == [0]
+        out = cwd / "msg.txt"
+        assert out.exists() and out.read_bytes() == payload
+
+    def test_pair_send_missing_file_returns_1(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        nomnom._save_relay_config("https://example.invalid", "secret",
+                                  allow_private=True)
+        rc = nomnom.cmd_pair(str(tmp_path / "missing.bin"))
+        assert rc == 1
+
+
+class TestRelayConcurrency:
+    """Concurrent rendezvous attempts collide on the deterministic init slot."""
+
+    def test_second_rendezvous_in_flight_raises(
+        self, mock_relay, tmp_path, monkeypatch,
+    ):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        priv_a, pub_a = nomnom._dh_keypair()
+        priv_b, pub_b = nomnom._dh_keypair()
+        sender_a = {
+            "device_id": "dev-a", "name": "a",
+            "ik_priv": format(priv_a, "x"), "ik_pub": format(pub_a, "x"),
+        }
+        sender_b = {
+            "device_id": "dev-b", "name": "b",
+            "ik_priv": format(priv_b, "x"), "ik_pub": format(pub_b, "x"),
+        }
+        cfg = mock_relay.cfg()
+
+        # First sender posts init into the rendezvous slot.
+        slot_i = nomnom._slot_first_contact_init(cfg["secret"])
+        nomnom._relay_put_slot(cfg, slot_i, b"someone else's init blob")
+
+        # Second sender's PUT must fail with a clean "in flight" error.
+        with pytest.raises(
+            nomnom.NomnomError, match="another pair is in flight",
+        ):
+            nomnom._relay_send(
+                "x.txt", b"payload", target_ik_hex=None,
+                identity=sender_b, relay=cfg,
+            )
 
 
 class TestReceivePathSafety:
@@ -3715,21 +4171,20 @@ class TestReceivePathSafety:
             "ik_pub": format(pub, "x"),
         }
 
-    def _do_first_contact(self, mock_relay, sender, receiver, payload, name):
+    def _do_rendezvous(self, mock_relay, sender, receiver, payload, name):
         cfg = mock_relay.cfg()
-        code = nomnom._generate_pairing_code()
         recv_rc: list = []
         send_rc: list = []
 
         def receive():
-            recv_rc.append(nomnom._relay_recv_first_contact(
-                code, identity=receiver, relay=cfg, trust_new=True,
+            recv_rc.append(nomnom._relay_recv_rendezvous(
+                identity=receiver, relay=cfg, on_tofu=_tofu_yes,
             ))
 
         def send():
             send_rc.append(nomnom._relay_send(
-                name, payload, code=code, target_ik_hex=None,
-                identity=sender, relay=cfg, trust_new=True,
+                name, payload, target_ik_hex=None,
+                identity=sender, relay=cfg, on_tofu=_tofu_yes,
             ))
 
         tr = threading.Thread(target=receive, daemon=True); tr.start()
@@ -3748,7 +4203,7 @@ class TestReceivePathSafety:
 
         sender = self._mk_identity("sender")
         receiver = self._mk_identity("receiver")
-        self._do_first_contact(
+        self._do_rendezvous(
             mock_relay, sender, receiver, b"fresh payload", "demo.txt",
         )
 
@@ -3765,7 +4220,7 @@ class TestReceivePathSafety:
         # Sender's first transfer: name "alice-laptop".
         sender = self._mk_identity("alice-laptop")
         receiver = self._mk_identity("receiver")
-        self._do_first_contact(
+        self._do_rendezvous(
             mock_relay, sender, receiver, b"first", "a.txt",
         )
         peers = nomnom._load_known_peers()
@@ -3777,16 +4232,18 @@ class TestReceivePathSafety:
 
         def send():
             send_rc.append(nomnom._relay_send(
-                "b.txt", b"second", code=None,
+                "b.txt", b"second",
                 target_ik_hex=receiver["ik_pub"],
-                identity=sender, relay=mock_relay.cfg(), trust_new=True,
+                identity=sender, relay=mock_relay.cfg(),
+                on_tofu=_tofu_yes,
             ))
 
         recv_rc: list = []
 
         def receive():
             recv_rc.append(nomnom._relay_recv_pinned(
-                identity=receiver, relay=mock_relay.cfg(), trust_new=True,
+                identity=receiver, relay=mock_relay.cfg(),
+                on_tofu=_tofu_yes,
             ))
 
         tr = threading.Thread(target=receive, daemon=True); tr.start()
@@ -3819,7 +4276,6 @@ class TestReceivePathSafety:
         sender = self._mk_identity("sender")
         receiver = self._mk_identity("receiver")
         cfg = mock_relay.cfg()
-        code = nomnom._generate_pairing_code()
 
         # Monkeypatch decrypt_bytes to simulate any of its ValueError raises.
         original = nomnom.decrypt_bytes
@@ -3833,8 +4289,8 @@ class TestReceivePathSafety:
         def receive():
             monkeypatch.setattr(nomnom, "decrypt_bytes", boom)
             try:
-                nomnom._relay_recv_first_contact(
-                    code, identity=receiver, relay=cfg, trust_new=True,
+                nomnom._relay_recv_rendezvous(
+                    identity=receiver, relay=cfg, on_tofu=_tofu_yes,
                 )
             except nomnom.NomnomError as exc:
                 recv_err.append(str(exc))
@@ -3844,8 +4300,8 @@ class TestReceivePathSafety:
         def send():
             try:
                 nomnom._relay_send(
-                    "x.txt", b"payload", code=code, target_ik_hex=None,
-                    identity=sender, relay=cfg, trust_new=True,
+                    "x.txt", b"payload", target_ik_hex=None,
+                    identity=sender, relay=cfg, on_tofu=_tofu_yes,
                 )
             except nomnom.NomnomError as exc:
                 send_err.append(str(exc))
@@ -3866,9 +4322,14 @@ class TestReceivePathSafety:
         monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
         cfg_dir = tmp_path / "nomnom"
         cfg_dir.mkdir(parents=True, exist_ok=True)
-        # Hand-edited file: every entry is the wrong shape.
+        # Hand-edited v2 file: every entry is the wrong shape. (Pre-wrap as v2
+        # so we exercise _cmd_peers_list, not the v1→v2 migration that would
+        # drop non-dict entries during load.)
         (cfg_dir / "known_peers.json").write_text(
-            json.dumps({"olddev": "legacy-string-value"}),
+            json.dumps({
+                "version": nomnom._KNOWN_PEERS_SCHEMA,
+                "peers": {"olddev": "legacy-string-value"},
+            }),
             encoding="utf-8",
         )
 
@@ -3898,27 +4359,51 @@ class TestTuiCliContract:
         finally:
             monkeypatch.setattr(nomnom, "_TUI_ACTIVE", False)
 
-    def test_bundle_send_via_relay_invokes_on_code_callback(
+    def test_bundle_send_via_relay_targets_single_pinned_peer(
         self, tmp_path, monkeypatch,
     ):
         monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
-        nomnom._save_relay_config("https://example.invalid", "secret")
+        nomnom._save_relay_config("https://example.invalid", "secret",
+                                  allow_private=True)
+        nomnom._save_known_peer("dev-bob", "bob", "ab" * 32)
+        captured: dict = {}
 
-        captured: list = []
-
-        def fake_send(name, data, **kwargs):
+        def fake_send(name, data, *, target_ik_hex, **kwargs):
+            captured["target_ik_hex"] = target_ik_hex
             return 0
 
         monkeypatch.setattr(nomnom, "_relay_send", fake_send)
         rc = nomnom._bundle_send_via_relay(
-            "x.txt", b"payload",
-            interactive=False,
-            on_code=lambda c: captured.append(c),
+            "x.txt", b"payload", interactive=False,
         )
         assert rc == 0
-        assert len(captured) == 1
-        # Pairing code shape: XXX-XXX-XXX (Crockford base32).
-        assert len(captured[0]) == 11 and captured[0].count("-") == 2
+        assert captured["target_ik_hex"] == "ab" * 32
+
+    def test_bundle_send_via_relay_no_peers_errors(
+        self, tmp_path, monkeypatch, capsys,
+    ):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        nomnom._save_relay_config("https://example.invalid", "secret",
+                                  allow_private=True)
+        rc = nomnom._bundle_send_via_relay(
+            "x.txt", b"payload", interactive=False,
+        )
+        assert rc == 1
+        assert "nomnom pair" in capsys.readouterr().err
+
+    def test_bundle_send_via_relay_multiple_peers_errors(
+        self, tmp_path, monkeypatch, capsys,
+    ):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        nomnom._save_relay_config("https://example.invalid", "secret",
+                                  allow_private=True)
+        nomnom._save_known_peer("dev-1", "alice", "aa" * 32)
+        nomnom._save_known_peer("dev-2", "bob", "bb" * 32)
+        rc = nomnom._bundle_send_via_relay(
+            "x.txt", b"payload", interactive=False,
+        )
+        assert rc == 1
+        assert "--to" in capsys.readouterr().err
 
     def test_bundle_send_via_relay_no_relay_returns_2(
         self, tmp_path, monkeypatch,
@@ -3944,13 +4429,11 @@ class TestTuiCliContract:
 
         # Short wait so the test doesn't hang for 30s on the long-poll.
         monkeypatch.setattr(nomnom, "_RELAY_DEFAULT_WAIT_MS", 200)
-        code = nomnom._generate_pairing_code()
         with pytest.raises(nomnom.NomnomError, match="receiver didn't connect"):
             nomnom._relay_send(
                 "x.txt", b"data",
-                code=code, target_ik_hex=None,
+                target_ik_hex=None,
                 identity=sender, relay=mock_relay.cfg(),
-                trust_new=True,
             )
 
     def test_recv_complete_populates_on_result(
@@ -3973,20 +4456,20 @@ class TestTuiCliContract:
         }
 
         cfg = mock_relay.cfg()
-        code = nomnom._generate_pairing_code()
         payload = b"recv-callback-payload"
         results: list = []
 
         def receive():
-            nomnom._relay_recv_first_contact(
-                code, identity=receiver, relay=cfg, trust_new=True,
+            nomnom._relay_recv_rendezvous(
+                identity=receiver, relay=cfg,
                 on_result=lambda r: results.append(r),
+                on_tofu=_tofu_yes,
             )
 
         def send():
             nomnom._relay_send(
-                "out.txt", payload, code=code, target_ik_hex=None,
-                identity=sender, relay=cfg, trust_new=True,
+                "out.txt", payload, target_ik_hex=None,
+                identity=sender, relay=cfg, on_tofu=_tofu_yes,
             )
 
         tr = threading.Thread(target=receive, daemon=True); tr.start()
@@ -4029,7 +4512,7 @@ class TestCancellationPropagation:
             try:
                 result.append(nomnom._relay_recv_pinned(
                     identity=receiver, relay=mock_relay.cfg(),
-                    trust_new=True, cancel=cancel,
+                    cancel=cancel,
                 ))
             except nomnom.NomnomError as e:
                 result.append(str(e))

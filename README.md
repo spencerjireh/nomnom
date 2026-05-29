@@ -19,7 +19,7 @@ nomnom .
 
 Opens a picker for the current directory. Pick files, hit `Enter`, get `./<repo>-<timestamp>.txt`. `.gitignore`, junk dirs (`.git`, `node_modules`, …), binaries, symlinks, and obvious secrets are skipped before the picker loads.
 
-Bare `nomnom` on a TTY opens a launcher menu fronting every verb (bundle, `commit`, `pr`, `review`, `encrypt`, `decrypt`, `rebuild`, `register`, `relay`, `peers`).
+Bare `nomnom` on a TTY opens a launcher menu fronting every verb (bundle, `commit`, `pr`, `review`, `encrypt`, `decrypt`, `pair`, `rebuild`, `register`, `relay`, `peers`).
 
 Output mirrors [repomix](https://github.com/yamadashy/repomix)'s shape:
 
@@ -107,7 +107,7 @@ Never overwrites. Path-escape attempts (absolute paths, `..` segments) are refus
 
 ## Send between machines (via your own relay)
 
-`encrypt` and `decrypt` move files between machines through a Cloudflare Worker you deploy to your own account. Nothing hits disk on the sender. The relay sees only ciphertext + per-peer rendezvous ids.
+`pair`, `encrypt`, and `decrypt` move files between machines through a Cloudflare Worker you deploy to your own account. Nothing hits disk on the sender. The relay sees only ciphertext + per-peer rendezvous ids.
 
 ### One-time setup
 
@@ -120,17 +120,17 @@ nomnom relay setup           # paste URL + the passphrase, runs a self-test
 ### Day-to-day
 
 ```sh
-# First contact (no pin yet):
-nomnom encrypt report.txt --code     # prints "share this code: K7M-3QB-9X"
-nomnom decrypt K7M-3QB-9X            # on the other side; pairs + receives
+# First contact (no pin yet) — both sides run `pair`:
+nomnom pair report.txt               # sender: posts at the rendezvous
+nomnom pair                          # receiver: long-polls, TOFU-prompts
 
-# Recurring (after pairing, no code):
+# Recurring (after pairing, no extra ceremony):
 nomnom decrypt                       # long-polls every pinned peer
 nomnom encrypt report.txt            # auto-targets the single pinned peer
 nomnom encrypt report.txt --to spencer-mac   # disambiguates if many
 ```
 
-`--trust-new` auto-accepts the TOFU prompt (scriptable but loses verification). Max transfer size: 256 MB (capped at 100 MB on Cloudflare's free tier — see relay-worker/README.md).
+`--trust-new` auto-accepts the TOFU prompt (scriptable but loses verification; an audit line is still written to stderr). Max transfer size: 256 MB (capped at 100 MB on Cloudflare's free tier — see relay-worker/README.md).
 
 ### Pinned peers
 
@@ -138,7 +138,7 @@ nomnom encrypt report.txt --to spencer-mac   # disambiguates if many
 nomnom peers list                    # show pinned peers + fingerprints
 nomnom peers fingerprint spencer-mac # for out-of-band verification
 nomnom peers nickname dev-abc spencer   # short alias for --to
-nomnom peers forget spencer-mac      # drop a pin
+nomnom peers forget spencer-mac      # drop a pin (then `nomnom pair` to re-pair)
 ```
 
 <details>
@@ -153,14 +153,23 @@ Each machine has a long-term identity key in `~/.config/nomnom/identity.json`. T
   trust the new key and continue? [y/N]:
 ```
 
-The first-contact code is the only window where TOFU has nothing to compare against. Verify the fingerprint out-of-band if it matters.
+First contact prompts before any pin commits:
+
+```text
+  first contact with 'bob-laptop' (device 7a31f9d2c8b04e15).
+    fingerprint: 9c01:7a4f:21bd:0e88
+  verify this fingerprint out-of-band with the sender if it matters.
+  trust and pin this device? [y/N]:
+```
+
+Anyone who can talk to your relay can land at the rendezvous, so verify the fingerprint out-of-band if it matters. `--trust-new` skips the prompt for scripted callers and still writes an audit line to stderr.
 
 </details>
 
 <details>
 <summary><b>Crypto</b></summary>
 
-Triple-DH over RFC 3526 group 14 derives a fresh session key per transfer (forward secrecy, identity-pinned auth). The pairing code (or, after pinning, the canonical pair of identity pubkeys) is mixed into the key derivation — a relay-level adversary cannot land on the same key without the out-of-band agreement.
+Triple-DH over RFC 3526 group 14 derives a fresh session key per transfer (forward secrecy, identity-pinned auth). After first contact, the canonical pair of identity pubkeys is mixed into the key derivation, so a relay-level adversary cannot land on the same key without the long-term pin. For the very first contact, `scrypt(relay_secret, "nomnom-first-contact-v2", N=2^15)` plays the same role — slowing offline brute-force on a human-memorable passphrase so the trust claim narrows to "anyone with the relay secret can initiate pairing; TOFU confirms device identity."
 
 Three-message handshake over the Worker: sender PUTs init blob → receiver fetches + PUTs response → sender encrypts + PUTs ciphertext → receiver fetches + decrypts. Each slot expires in 5 min on the Worker; bucket lifecycle deletes orphans after 1 day. The Worker's HMAC authenticates clients to your relay; body integrity comes from the AEAD wrapper (encrypt-then-HMAC-SHA256 in counter mode, keys via scrypt).
 
