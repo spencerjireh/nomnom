@@ -1,0 +1,14 @@
+name = "nomnom-relay"
+main = "src/worker.ts"
+compatibility_date = "2025-05-01"
+
+# R2 bucket holds short-lived rendezvous payloads.
+# Create with: npx wrangler r2 bucket create nomnom-relay
+[[r2_buckets]]
+binding = "BUCKET"
+bucket_name = "nomnom-relay"
+
+# HMAC secret is set out-of-band:
+#   ./scripts/generate-secret.sh | npx wrangler secret put NOMNOM_HMAC_SECRET
+#
+# Do not check the secret into this file.

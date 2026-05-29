@@ -19,7 +19,7 @@ nomnom .
 
 Opens a picker for the current directory. Pick files, hit `Enter`, get `./<repo>-<timestamp>.txt`. `.gitignore`, junk dirs (`.git`, `node_modules`, …), binaries, symlinks, and obvious secrets are skipped before the picker loads.
 
-Bare `nomnom` on a TTY opens a launcher menu fronting every verb (bundle, `commit`, `pr`, `review`, `encrypt`, `decrypt`, `rebuild`, `register`).
+Bare `nomnom` on a TTY opens a launcher menu fronting every verb (bundle, `commit`, `pr`, `review`, `encrypt`, `decrypt`, `rebuild`, `register`, `relay`, `peers`).
 
 Output mirrors [repomix](https://github.com/yamadashy/repomix)'s shape:
 
@@ -105,21 +105,49 @@ nomnom rebuild bundle.txt --name scratch # override folder name
 
 Never overwrites. Path-escape attempts (absolute paths, `..` segments) are refused. Git-context bundles aren't reconstructable and error out.
 
-## Send over LAN
+## Send between machines (via your own relay)
 
-`encrypt` and `decrypt` move a file between two machines on the same Wi-Fi, encrypted end-to-end. Nothing hits disk on the sender; no pairing step.
+`encrypt` and `decrypt` move files between machines through a Cloudflare Worker you deploy to your own account. Nothing hits disk on the sender. The relay sees only ciphertext + per-peer rendezvous ids.
+
+### One-time setup
+
+Deploy the Worker (see [`relay-worker/README.md`](relay-worker/README.md)), grab the URL and secret, then on each machine:
 
 ```sh
-nomnom decrypt           # receiver waits (or picks a sender if one's hosting)
-nomnom encrypt report.txt
+nomnom relay setup           # paste URL + secret, runs a self-test
+# or share the credential bundle between machines:
+nomnom relay export          # prints `nm1.<...>`
+nomnom relay import 'nm1.…'  # on the other Mac
 ```
 
-Scripted: `--peer <name|id>` skips the pick (case-insensitive, prefix-ok); `--trust-new` auto-accepts TOFU prompts. `--host <ip>` overrides interface detection (useful under a VPN); `--timeout <s>` bounds the host wait.
+### Day-to-day
+
+```sh
+# First contact (no pin yet):
+nomnom encrypt report.txt --code     # prints "share this code: K7M-3QB-9X"
+nomnom decrypt K7M-3QB-9X            # on the other side; pairs + receives
+
+# Recurring (after pairing, no code):
+nomnom decrypt                       # long-polls every pinned peer
+nomnom encrypt report.txt            # auto-targets the single pinned peer
+nomnom encrypt report.txt --to spencer-mac   # disambiguates if many
+```
+
+`--trust-new` auto-accepts the TOFU prompt (scriptable but loses verification). Max transfer size: 256 MB (capped at 100 MB on Cloudflare's free tier — see relay-worker/README.md).
+
+### Pinned peers
+
+```sh
+nomnom peers list                    # show pinned peers + fingerprints
+nomnom peers fingerprint spencer-mac # for out-of-band verification
+nomnom peers nickname dev-abc spencer   # short alias for --to
+nomnom peers forget spencer-mac      # drop a pin
+```
 
 <details>
 <summary><b>Trust on first use</b></summary>
 
-Each machine has a long-term identity key. The first transfer pins the peer's key in `~/.config/nomnom/known_peers.json` (`new device` in the list); later transfers show `known`. If a pinned key changes, nomnom blocks:
+Each machine has a long-term identity key in `~/.config/nomnom/identity.json`. The first transfer pins the peer's key in `~/.config/nomnom/known_peers.json`. If a pinned key changes, nomnom blocks:
 
 ```text
   WARNING: the identity key for 'bob-laptop' has CHANGED.
@@ -128,16 +156,31 @@ Each machine has a long-term identity key. The first transfer pins the peer's ke
   trust the new key and continue? [y/N]:
 ```
 
-`nomnom forget <name|id>` clears a pin.
+The first-contact code is the only window where TOFU has nothing to compare against. Verify the fingerprint out-of-band if it matters.
 
 </details>
 
 <details>
 <summary><b>Crypto</b></summary>
 
-Triple-DH over RFC 3526 group 14 derives a fresh session key per transfer (forward secrecy, identity-pinned auth). Stdlib only: 3DH for the key, scrypt for the message schedule, HMAC-SHA256 stream cipher in counter mode, encrypt-then-HMAC. Only ciphertext crosses the wire; discovery is a limited UDP broadcast (`255.255.255.255`) that routers don't forward.
+Triple-DH over RFC 3526 group 14 derives a fresh session key per transfer (forward secrecy, identity-pinned auth). The pairing code (or, after pinning, the canonical pair of identity pubkeys) is mixed into the key derivation — a relay-level adversary cannot land on the same key without the out-of-band agreement.
 
-Caveats: same network segment only; TOFU's known weakness is the very first transfer (a MitM there would be pinned silently); macOS may show a firewall prompt on the host.
+Three-message handshake over the Worker: sender PUTs init blob → receiver fetches + PUTs response → sender encrypts + PUTs ciphertext → receiver fetches + decrypts. Each slot expires in 5 min on the Worker; bucket lifecycle deletes orphans after 1 day. The Worker's HMAC authenticates clients to your relay; body integrity comes from the AEAD wrapper (encrypt-then-HMAC-SHA256 in counter mode, keys via scrypt).
+
+</details>
+
+<details>
+<summary><b>Relay config</b></summary>
+
+| Command | Effect |
+| --- | --- |
+| `nomnom relay setup` | Interactive prompts for URL + secret; runs a round-trip test. |
+| `nomnom relay set URL --secret S` | Non-interactive equivalent. |
+| `nomnom relay export` | Prints `nm1.<base64>` for sharing to another machine. |
+| `nomnom relay import 'nm1.…'` | Applies a shared blob. |
+| `nomnom relay test` | Round-trip: hits `/health` then PUT + GET a random slot. |
+| `nomnom relay show` | Prints URL; redacts secret. |
+| `nomnom relay clear` | Deletes `~/.config/nomnom/relay.json`. |
 
 </details>
 
