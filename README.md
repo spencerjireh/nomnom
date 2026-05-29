@@ -111,13 +111,10 @@ Never overwrites. Path-escape attempts (absolute paths, `..` segments) are refus
 
 ### One-time setup
 
-Deploy the Worker (see [`relay-worker/README.md`](relay-worker/README.md)), grab the URL and secret, then on each machine:
+Deploy the Worker (see [`relay-worker/README.md`](relay-worker/README.md)). The HMAC secret is just a string — `scripts/generate-secret.sh` produces a memorable 6-word passphrase like `fend-sage-trash-cod-visa-data` so you can speak or password-manager it across machines. On each machine:
 
 ```sh
-nomnom relay setup           # paste URL + secret, runs a self-test
-# or share the credential bundle between machines:
-nomnom relay export          # prints `nm1.<...>`
-nomnom relay import 'nm1.…'  # on the other Mac
+nomnom relay setup           # paste URL + the passphrase, runs a self-test
 ```
 
 ### Day-to-day
@@ -176,8 +173,6 @@ Three-message handshake over the Worker: sender PUTs init blob → receiver fetc
 | --- | --- |
 | `nomnom relay setup` | Interactive prompts for URL + secret; runs a round-trip test. |
 | `nomnom relay set URL --secret S` | Non-interactive equivalent. |
-| `nomnom relay export` | Prints `nm1.<base64>` for sharing to another machine. |
-| `nomnom relay import 'nm1.…'` | Applies a shared blob. |
 | `nomnom relay test` | Round-trip: hits `/health` then PUT + GET a random slot. |
 | `nomnom relay show` | Prints URL; redacts secret. |
 | `nomnom relay clear` | Deletes `~/.config/nomnom/relay.json`. |

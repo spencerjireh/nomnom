@@ -8,7 +8,7 @@ The Worker is intentionally dumb: it stores opaque payloads at HMAC-authenticate
 
 - A Cloudflare account (free tier is enough for personal use — see [limits](#cost-and-limits)).
 - Node.js 20+ and `npx` (no global `wrangler` install needed).
-- `openssl` (or anything that can produce 32 random bytes; see `scripts/generate-secret.sh`).
+- `python3` (the bundled `scripts/generate-secret.sh` invokes it; already required by nomnom).
 
 ## Deploy
 
@@ -21,13 +21,15 @@ npx wrangler login
 npx wrangler r2 bucket create nomnom-relay
 ```
 
-Generate and push the HMAC secret. Save the secret — `nomnom relay setup` needs it later.
+Generate and push the HMAC secret. The script emits a 6-word diceware passphrase (~62 bits of entropy) like `fend-sage-trash-cod-visa-data` — memorable enough to speak across the room or paste from a password manager when you set up another machine.
 
 ```sh
 SECRET=$(../scripts/generate-secret.sh)
 echo "save this somewhere: $SECRET"
 printf '%s' "$SECRET" | npx wrangler secret put NOMNOM_HMAC_SECRET
 ```
+
+The secret is treated as opaque bytes by both the Worker and the client — if you want to pick your own phrase instead, just `SECRET="…"` and skip the script.
 
 Deploy:
 
@@ -65,17 +67,7 @@ On each Mac that will use the relay:
 ```sh
 nomnom relay setup
 # paste the worker URL
-# paste the HMAC secret
-```
-
-Or share the credential blob from one machine to others:
-
-```sh
-# On the first Mac, after setup:
-nomnom relay export   # prints nm1.<...>
-
-# On every other Mac:
-nomnom relay import 'nm1.<...>'
+# paste the passphrase from above
 ```
 
 Confirm end-to-end:
