@@ -1,0 +1,564 @@
+/* ============================================================================
+   nomnom-web — "diner receipt" theme.
+   Warm cream paper, ketchup + mustard accents, monospace (Courier-class, which
+   is authentically what thermal/dot-matrix receipts print in), dashed dividers,
+   torn (sawtooth) ticket edges. Fully self-contained — no external fonts/scripts,
+   so the strict CSP in public/_headers stays intact.
+   ============================================================================ */
+
+:root {
+  --paper: #f7efdc;
+  --paper-lit: #fdf8ea;
+  --ink: #2b2620;
+  --ink-dim: #8a7f6b;
+  --ketchup: #bf3b2b;
+  --ketchup-dark: #9c2c1f;
+  --mustard: #c98a12;
+  --line: rgba(43, 38, 32, 0.22);
+  --line-soft: rgba(43, 38, 32, 0.1);
+  --mono: "Courier New", "Courier", "Nimbus Mono PS", ui-monospace, monospace;
+  --zig: 11px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font-family: var(--mono);
+  color: var(--ink);
+  background:
+    radial-gradient(120% 80% at 50% -10%, var(--paper-lit), transparent 55%),
+    repeating-linear-gradient(0deg, transparent 0 26px, rgba(43, 38, 32, 0.035) 26px 27px),
+    var(--paper);
+  -webkit-font-smoothing: antialiased;
+  letter-spacing: 0.01em;
+}
+
+/* --- layout --- */
+
+.onboarding,
+.shell {
+  min-height: 100%;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: clamp(16px, 5vh, 64px) 16px;
+}
+
+/* --- the receipt card --- */
+
+.ticket {
+  position: relative;
+  width: 100%;
+  max-width: 440px;
+  background: var(--paper-lit);
+  padding: 26px 26px 30px;
+  /* Sawtooth top & bottom edges = torn receipt. */
+  -webkit-mask:
+    conic-gradient(from -45deg at bottom, #0000, #000 1deg 89deg, #0000 90deg) bottom / var(--zig)
+      var(--zig) repeat-x,
+    conic-gradient(from 135deg at top, #0000, #000 1deg 89deg, #0000 90deg) top / var(--zig) var(--zig)
+      repeat-x,
+    linear-gradient(#000 0 0) center / 100% calc(100% - 2 * var(--zig)) no-repeat;
+  mask:
+    conic-gradient(from -45deg at bottom, #0000, #000 1deg 89deg, #0000 90deg) bottom / var(--zig)
+      var(--zig) repeat-x,
+    conic-gradient(from 135deg at top, #0000, #000 1deg 89deg, #0000 90deg) top / var(--zig) var(--zig)
+      repeat-x,
+    linear-gradient(#000 0 0) center / 100% calc(100% - 2 * var(--zig)) no-repeat;
+  filter: drop-shadow(0 10px 22px rgba(43, 30, 12, 0.18));
+  animation: rise 0.5s cubic-bezier(0.2, 0.8, 0.2, 1) both;
+}
+
+.app-ticket {
+  max-width: 460px;
+}
+
+.ticket-head,
+.app-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.ticket-head {
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--ketchup);
+  padding-bottom: 12px;
+  margin-bottom: 14px;
+  border-bottom: 2px dashed var(--line);
+}
+
+.big-head,
+.app-head {
+  padding-bottom: 14px;
+  margin-bottom: 16px;
+  border-bottom: 3px double var(--line);
+}
+
+.logo,
+.big-head span:first-child {
+  font-weight: 700;
+  font-size: 1.7rem;
+  letter-spacing: 0.32em;
+  color: var(--ketchup);
+  text-shadow: 1px 1px 0 rgba(201, 138, 18, 0.35);
+}
+
+.brand {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+
+/* --- tabs --- */
+
+.tabbar {
+  display: flex;
+  gap: 0;
+  margin: 4px 0 18px;
+  border-bottom: 2px dashed var(--line);
+}
+
+.tab-btn {
+  flex: 1;
+  appearance: none;
+  background: none;
+  border: none;
+  border-bottom: 3px solid transparent;
+  margin-bottom: -2px;
+  padding: 9px 4px;
+  font: inherit;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: var(--ink-dim);
+  cursor: pointer;
+  transition: color 0.15s;
+}
+
+.tab-btn:hover {
+  color: var(--ink);
+}
+
+.tab-btn.active {
+  color: var(--ketchup);
+  font-weight: 700;
+  border-bottom-color: var(--ketchup);
+}
+
+.tab-body {
+  min-height: 230px;
+}
+
+.tab {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.tab.center {
+  align-items: center;
+  text-align: center;
+  gap: 18px;
+  padding-top: 14px;
+}
+
+.tab-empty {
+  text-align: center;
+  padding: 48px 12px;
+  line-height: 1.9;
+}
+
+/* --- form controls --- */
+
+.field {
+  display: block;
+}
+
+.field-label {
+  display: block;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  font-size: 0.72rem;
+  color: var(--ink-dim);
+  margin-bottom: 6px;
+}
+
+.inline {
+  display: flex;
+  gap: 8px;
+}
+
+input,
+select,
+textarea {
+  width: 100%;
+  font: inherit;
+  color: var(--ink);
+  background: rgba(255, 255, 255, 0.5);
+  border: 1.5px solid var(--line);
+  border-radius: 0;
+  padding: 9px 10px;
+}
+
+input:focus,
+select:focus,
+textarea:focus {
+  outline: none;
+  border-color: var(--ketchup);
+  background: #fff;
+}
+
+.textbox {
+  resize: vertical;
+}
+
+/* --- file drop --- */
+
+.filedrop-tabs {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+
+.dropzone {
+  border: 2px dashed var(--line);
+  padding: 26px 16px;
+  text-align: center;
+  cursor: pointer;
+  transition:
+    border-color 0.15s,
+    background 0.15s;
+}
+
+.dropzone:hover,
+.dropzone.over {
+  border-color: var(--ketchup);
+  background: rgba(191, 59, 43, 0.06);
+}
+
+/* --- buttons --- */
+
+.btn {
+  appearance: none;
+  font: inherit;
+  cursor: pointer;
+  padding: 11px 18px;
+  border: 2px solid var(--ink);
+  background: var(--paper);
+  color: var(--ink);
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  transition:
+    transform 0.08s,
+    box-shadow 0.12s,
+    background 0.12s;
+}
+
+.btn:active {
+  transform: translateY(1px);
+}
+
+.btn.big {
+  width: 100%;
+  padding: 13px;
+  font-weight: 700;
+  font-size: 1.02rem;
+}
+
+.btn.primary {
+  background: var(--ketchup);
+  border-color: var(--ketchup-dark);
+  color: #fff8ee;
+  box-shadow: 3px 3px 0 var(--ketchup-dark);
+}
+
+.btn.primary:hover:not(:disabled) {
+  background: var(--ketchup-dark);
+}
+
+.btn.ghost {
+  background: transparent;
+  border-style: dashed;
+}
+
+.btn.danger {
+  border-color: var(--ketchup-dark);
+  color: var(--ketchup-dark);
+  background: transparent;
+}
+
+.btn.danger:hover:not(:disabled) {
+  background: var(--ketchup);
+  color: #fff8ee;
+}
+
+.btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+  box-shadow: none;
+}
+
+.chip {
+  appearance: none;
+  font: inherit;
+  font-size: 0.82rem;
+  cursor: pointer;
+  padding: 4px 10px;
+  border: 1.5px solid var(--line);
+  background: transparent;
+  color: var(--ink-dim);
+  text-transform: lowercase;
+  letter-spacing: 0.06em;
+}
+
+.chip:hover:not(:disabled) {
+  color: var(--ink);
+  border-color: var(--ink);
+}
+
+.chip.active {
+  color: var(--ketchup);
+  border-color: var(--ketchup);
+  font-weight: 700;
+}
+
+.chip.danger:hover:not(:disabled) {
+  color: var(--ketchup);
+  border-color: var(--ketchup);
+}
+
+.chip:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* --- transfer panel / order ticket --- */
+
+.panel {
+  margin-top: 18px;
+}
+
+.ticket.panel {
+  max-width: none;
+  animation: rise 0.3s ease both;
+}
+
+.phase-label {
+  margin: 6px 0 10px;
+  letter-spacing: 0.06em;
+}
+
+.progress {
+  position: relative;
+  height: 22px;
+  border: 1.5px solid var(--ink);
+  background: repeating-linear-gradient(
+    45deg,
+    transparent 0 6px,
+    rgba(43, 38, 32, 0.05) 6px 12px
+  );
+  margin-bottom: 12px;
+  overflow: hidden;
+}
+
+.progress-fill {
+  height: 100%;
+  background: var(--mustard);
+  background-image: repeating-linear-gradient(
+    45deg,
+    rgba(255, 255, 255, 0.25) 0 8px,
+    transparent 8px 16px
+  );
+  transition: width 0.2s ease;
+}
+
+.progress-pct {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  font-size: 0.78rem;
+  font-weight: 700;
+  color: var(--ink);
+}
+
+.result {
+  line-height: 1.7;
+}
+
+.result.ok strong {
+  color: var(--ketchup);
+}
+
+.thanks {
+  text-align: center;
+  letter-spacing: 0.18em;
+  color: var(--ink-dim);
+  text-transform: uppercase;
+  font-size: 0.78rem;
+  margin: 12px 0 8px;
+}
+
+/* --- modal --- */
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(43, 30, 12, 0.4);
+  display: grid;
+  place-items: center;
+  padding: 16px;
+  z-index: 10;
+  animation: fade 0.2s ease both;
+}
+
+.modal {
+  line-height: 1.6;
+}
+
+.modal.settings {
+  max-width: 460px;
+}
+
+.modal-actions {
+  display: flex;
+  gap: 10px;
+  justify-content: flex-end;
+  margin-top: 16px;
+}
+
+.reset-confirm {
+  margin-top: 4px;
+}
+
+/* --- peers --- */
+
+.peer-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.peer {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 4px 12px;
+  padding: 12px 0;
+  border-bottom: 1.5px dashed var(--line-soft);
+}
+
+.peer-fp {
+  grid-column: 1 / -1;
+}
+
+.peer-actions {
+  grid-column: 1 / -1;
+  display: flex;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+/* --- bits --- */
+
+.fingerprint {
+  color: var(--mustard);
+  letter-spacing: 0.08em;
+}
+
+.strike {
+  text-decoration: line-through;
+  opacity: 0.6;
+}
+
+.kv {
+  margin: 6px 0;
+}
+
+.dim {
+  color: var(--ink-dim);
+}
+
+.small {
+  font-size: 0.82rem;
+}
+
+.err {
+  color: var(--ketchup-dark);
+}
+
+.ok-inline {
+  color: var(--mustard);
+}
+
+code {
+  font-family: var(--mono);
+  background: rgba(43, 38, 32, 0.07);
+  padding: 1px 5px;
+}
+
+hr.dashed {
+  border: none;
+  border-top: 2px dashed var(--line);
+  margin: 18px 0;
+}
+
+.app-foot {
+  margin-top: 18px;
+  padding-top: 12px;
+  border-top: 2px dashed var(--line);
+  text-align: center;
+}
+
+/* staggered entrance for the app ticket's rows */
+.app-ticket > * {
+  animation: rise 0.5s cubic-bezier(0.2, 0.8, 0.2, 1) both;
+}
+.app-ticket > *:nth-child(2) {
+  animation-delay: 0.05s;
+}
+.app-ticket > *:nth-child(3) {
+  animation-delay: 0.1s;
+}
+.app-ticket > *:nth-child(4) {
+  animation-delay: 0.15s;
+}
+
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes fade {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation: none !important;
+  }
+}
