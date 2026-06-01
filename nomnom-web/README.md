@@ -56,25 +56,22 @@ make fixtures
 CI runs `fixtures-no-drift`: it regenerates and fails on any diff, so the Python
 crypto and the TS port can't silently diverge.
 
-## Deploy (Cloudflare Pages)
+## Deploy (Cloudflare Worker — static assets)
 
-The `spencerjireh.com` zone is already on Cloudflare (the relay Worker uses
-`relay.spencerjireh.com`).
-
-**Git-connected (recommended):** create a Pages project, set
-- Root directory: `nomnom-web`
-- Build command: `npm run build`
-- Build output directory: `dist`
-
-No build-time env is required — the relay URL is hardcoded in `src/config.ts` and
-the passphrase is entered at runtime. Then add `nomnom.spencerjireh.com` under the
-project's **Custom domains** tab; Cloudflare provisions the CNAME + cert.
-
-**Direct upload:**
+Hosted as a static-assets Worker bound to `nomnom.spencerjireh.com` (see
+`wrangler.toml`). We use a Worker rather than Pages because `wrangler deploy`
+auto-provisions the custom domain's DNS + TLS through the Workers API — the same
+path the relay Worker uses for `relay.spencerjireh.com` — so the whole deploy is
+one CLI command with no dashboard step. (A Pages custom domain needs a separate
+DNS record that a `pages:write`/`zone:read` token can't create.) Workers Static
+Assets honors `dist/_headers`, so the strict CSP ships unchanged.
 
 ```sh
 npm run build
-npx wrangler pages deploy dist --project-name nomnom-web
+npx wrangler deploy
 ```
 
-`public/_headers` ships the CSP and security headers with the build.
+No build-time env is required — the relay URL is hardcoded in `src/config.ts` and
+the passphrase is entered at runtime. The `spencerjireh.com` zone is already on
+Cloudflare, so the custom domain + cert are provisioned automatically on first
+deploy.

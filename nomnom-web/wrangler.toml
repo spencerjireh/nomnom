@@ -1,0 +1,20 @@
+# Serves the built nomnom-web app from Cloudflare's edge as a static-assets Worker,
+# bound to a custom domain. We use a Worker (not Pages) because `wrangler deploy`
+# auto-provisions the custom domain's DNS + TLS via the Workers API — the same
+# path that gives relay.spencerjireh.com its record — without needing a
+# dns_records token scope. `dist/_headers` (the strict CSP) is honored by Workers
+# Static Assets just as it is on Pages.
+#
+# Build first:  npm run build    Deploy:  npx wrangler deploy
+#
+# NOTE: top-level keys (incl. `routes`) must precede the [assets] table — in TOML
+# everything after a table header belongs to that table.
+name = "nomnom-web"
+compatibility_date = "2025-05-01"
+
+routes = [
+  { pattern = "nomnom.spencerjireh.com", custom_domain = true },
+]
+
+[assets]
+directory = "./dist"
