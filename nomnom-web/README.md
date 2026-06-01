@@ -35,11 +35,27 @@ npm install
 npm run dev          # http://localhost:5173 — hits the live relay (allowlisted in the Worker CORS)
 npm run typecheck
 npm test             # crypto interop vectors (vitest)
+npm run test:e2e     # Playwright UI smoke (offline; builds + previews on :4173)
 npm run build        # tsc --noEmit && vite build -> dist/
 ```
 
 `npm run dev` talks to the production relay; the Worker's CORS allowlist includes
 `http://localhost:5173`.
+
+## Tests
+
+Three layers, each proving a different thing:
+
+- **`npm test`** — cross-language crypto vectors (vitest). Proves the TS port
+  reproduces `nomnom.py` byte-for-byte and decrypts a Python-sealed blob.
+- **`npm run test:e2e`** — Playwright UI smoke (`e2e/`). Drives the built app
+  through `vite preview`, fully **offline and secret-free**: onboarding's relay
+  health probe is mocked and every screen is reached from `localStorage`, so it
+  guards the UI + state wiring without touching the relay. First run needs
+  `npx playwright install chromium`.
+- **Manual CLI↔browser round-trip** — the real interop proof, run by hand against
+  the live relay: pair the browser with `nomnom pair`, send a file each way, and
+  checksum-compare. Not in CI (it needs the relay passphrase + a running CLI).
 
 ## Crypto interop fixtures
 
