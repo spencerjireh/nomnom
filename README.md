@@ -19,7 +19,7 @@ nomnom .
 
 Opens a picker for the current directory. Pick files, hit `Enter`, get `./<repo>-<timestamp>.txt`. `.gitignore`, junk dirs (`.git`, `node_modules`, …), binaries, symlinks, and obvious secrets are skipped before the picker loads.
 
-Bare `nomnom` on a TTY opens a launcher with tiles for Bundle, Send, Receive, Pair, Rebuild, Pins, and Extensions. Inside the picker, `v` cycles bundle / `commit` / `pr` / `review` when run from inside a git repo.
+Bare `nomnom` on a TTY opens a launcher with tiles for Bundle, Send, Receive, Pair, Commit, PR, Review, Rebuild, Pins, and Extensions. Inside the picker, `v` cycles bundle / `commit` / `pr` / `review` when run from inside a git repo.
 
 Output mirrors [repomix](https://github.com/yamadashy/repomix)'s shape:
 
@@ -107,14 +107,27 @@ Never overwrites. Path-escape attempts (absolute paths, `..` segments) are refus
 
 ## Send between machines (via your own relay)
 
-`pair`, `encrypt`, and `decrypt` move files between machines through a Cloudflare Worker you deploy to your own account. Nothing hits disk on the sender. The relay sees only ciphertext + per-pair rendezvous ids.
+`pair`, `send`, and `receive` move files between machines through a Cloudflare Worker you deploy to your own account. Nothing hits disk on the sender. The relay sees only ciphertext + per-pair rendezvous ids.
 
 ### One-time setup
 
-Deploy the Worker (see [`relay-worker/README.md`](relay-worker/README.md)). The HMAC secret is just a string — `scripts/generate-secret.sh` produces a memorable 6-word passphrase like `fend-sage-trash-cod-visa-data` so you can speak or password-manager it across machines. On each machine:
+Deploy the Worker (see [`relay-worker/README.md`](relay-worker/README.md)). Then on the first device:
 
 ```sh
-nomnom relay setup           # paste URL + the passphrase, runs a self-test
+nomnom relay init            # prompts for Worker URL; auto-generates the HMAC secret
+                             # and prints the `wrangler secret put` + `wrangler deploy`
+                             # commands to push the secret and ship the Worker.
+```
+
+To onboard a second device, grab a single shareable join token from the first device and paste it on the new one — no need to re-type the URL or secret:
+
+```sh
+# device 1
+nomnom relay show --token
+# relay.your-subdomain.workers.dev#k4n2pX9qLm3T
+
+# device 2
+nomnom join 'relay.your-subdomain.workers.dev#k4n2pX9qLm3T'
 ```
 
 ### Day-to-day
@@ -124,10 +137,12 @@ nomnom relay setup           # paste URL + the passphrase, runs a self-test
 nomnom pair                          # identity-only handshake, TOFU on both ends
 
 # Recurring (after pairing, no extra ceremony):
-nomnom decrypt                       # long-polls every pinned peer
-nomnom encrypt report.txt            # auto-targets the single pinned peer
-nomnom encrypt report.txt --to spencer-mac   # disambiguates if many
+nomnom receive                       # listens until Ctrl-C, prints one line per file
+nomnom send report.txt               # auto-targets the single pinned peer
+nomnom send report.txt --to spencer-mac   # disambiguates if many
 ```
+
+`receive` keeps the long-poll alive after each delivery, so you can leave a laptop listening and fire off `send` from another machine all afternoon. Pass `--once` to exit after the first received file (for scripting).
 
 `pair` is symmetric: whichever side wins the race at the rendezvous slot becomes the initiator, the other side falls back to responder. Pinning is local, so a one-sided TOFU decline just leaves that side unpinned; the other side times out after 30s with no harm.
 
@@ -170,9 +185,9 @@ Anyone who can talk to your relay can land at the rendezvous, so verify the fing
 <details>
 <summary><b>Crypto</b></summary>
 
-**Recurring transfers** (encrypt/decrypt to an already-pinned peer): Triple-DH over RFC 3526 group 14 derives a fresh session key per transfer (forward secrecy, identity-pinned auth). The canonical pair of identity pubkeys is mixed into the key derivation, so a relay-level adversary cannot land on the same key without the long-term pin. Three-message handshake over the Worker: sender PUTs init blob → receiver fetches + PUTs response → sender encrypts + PUTs ciphertext → receiver fetches + decrypts.
+**Recurring transfers** (`send`/`receive` to an already-pinned peer): Triple-DH over RFC 3526 group 14 derives a fresh session key per transfer (forward secrecy, identity-pinned auth). The canonical pair of identity pubkeys is mixed into the key derivation, so a relay-level adversary cannot land on the same key without the long-term pin. Three-message handshake over the Worker: sender PUTs init blob → receiver fetches + PUTs response → sender encrypts + PUTs ciphertext → receiver fetches + decrypts.
 
-**First contact (`pair`)**: identity-only, two-message exchange. Each side PUTs its identity pubkey + device id + name into the per-relay rendezvous slot derived from `scrypt(relay_secret, "nomnom-first-contact-v2", N=2^15)`; the scrypt cost slows offline brute-force on a human-memorable passphrase. No DH, no session key, no payload — the trust claim narrows to "anyone with the relay secret can land at the rendezvous; TOFU confirms device identity." Verify the fingerprint out-of-band if it matters.
+**First contact (`pair`)**: identity-only, two-message exchange. Each side PUTs its identity pubkey + device id + name into the per-relay rendezvous slot derived from `scrypt(relay_secret, "nomnom-first-contact-v2", N=2^16)`; the scrypt cost slows offline brute-force on a captured rendezvous transcript. The secret itself is ~72 bits of url-safe base64 generated by `relay init` and shared via the `host#secret` join token. No DH, no session key, no payload — the trust claim narrows to "anyone with the relay secret can land at the rendezvous; TOFU confirms device identity." Verify the fingerprint out-of-band if it matters.
 
 Each slot expires in 5 min on the Worker; bucket lifecycle deletes orphans after 1 day. The Worker's HMAC authenticates clients to your relay; body integrity comes from the AEAD wrapper (encrypt-then-HMAC-SHA256 in counter mode, keys via scrypt).
 
@@ -183,10 +198,11 @@ Each slot expires in 5 min on the Worker; bucket lifecycle deletes orphans after
 
 | Command | Effect |
 | --- | --- |
-| `nomnom relay setup` | Interactive prompts for URL + secret; runs a round-trip test. |
-| `nomnom relay set URL --secret S` | Non-interactive equivalent. |
-| `nomnom relay test` | Round-trip: hits `/health` then PUT + GET a random slot. |
+| `nomnom relay init` | First-device setup: prompt URL, generate HMAC secret, save, print the `wrangler secret put` + `wrangler deploy` commands. |
+| `nomnom join <token>` | Other-device setup: paste a `host#secret` token from `relay show --token`. |
 | `nomnom relay show` | Prints URL; redacts secret. |
+| `nomnom relay show --token` | Prints the shareable `host#secret` join token (secret in clear). |
+| `nomnom relay test` | Round-trip: hits `/health` then PUT + GET a random slot. |
 | `nomnom relay clear` | Deletes `~/.config/nomnom/relay.json`. |
 
 </details>
@@ -204,7 +220,7 @@ nomnom reset
 # proceed? [y/N]: y
 ```
 
-After reset the next `nomnom relay setup` regenerates a fresh identity. Other devices that previously paired with you will see a TOFU mismatch on the next transfer; re-pair to re-establish trust.
+After reset the next `nomnom relay init` (or `nomnom join`) regenerates a fresh identity. Other devices that previously paired with you will see a TOFU mismatch on the next transfer; re-pair to re-establish trust.
 
 </details>
 

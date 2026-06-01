@@ -1346,6 +1346,56 @@ class TestSendScreen:
         assert s._peers[0][0] == "dev-new"  # most recent first
         assert s._cursor == 0
 
+    def test_check_finished_rc0_transitions_to_toast(self):
+        s = nomnom.SendScreen()
+        s.step = "running"
+        s._last_sent = ("foo.txt", 12)
+        with s.state._lock:
+            s.state.finished = True
+            s.state.rc = 0
+        s._check_finished()
+        assert s.step == "toast"
+        assert s._toast_until > 0.0
+
+    def test_check_finished_rc_nonzero_falls_through_to_done(self):
+        s = nomnom.SendScreen()
+        s.step = "running"
+        with s.state._lock:
+            s.state.finished = True
+            s.state.rc = 1
+        s._check_finished()
+        assert s.step == "done"
+
+    def test_reset_for_next_send_clears_state(self):
+        s = nomnom.SendScreen()
+        s.path_buf = "/old/path"
+        s.error = "boom"
+        s.step = "toast"
+        s._toast_until = 12345.0
+        original_state = s.state
+        s._reset_for_next_send()
+        assert s.step == "path"
+        assert s.path_buf == ""
+        assert s.error == ""
+        assert s._toast_until == 0.0
+        # Fresh state object — old cancel_event / tofu_answer_event don't leak.
+        assert s.state is not original_state
+
+    def test_toast_any_key_dismisses_to_path(self):
+        s = nomnom.SendScreen()
+        s.step = "toast"
+        s._toast_until = time.monotonic() + 10
+        s.path_buf = "foo"
+        s.handle_key(ord("x"))
+        assert s.step == "path"
+        assert s.path_buf == ""
+
+    def test_toast_esc_returns_to_launcher(self):
+        s = nomnom.SendScreen()
+        s.step = "toast"
+        s._toast_until = time.monotonic() + 10
+        assert s.handle_key(27) == nomnom.ScreenAction.BACK
+
 
 class TestPairScreen:
     def test_init_without_relay_finishes_with_error(self, tmp_path, monkeypatch):
@@ -1393,24 +1443,111 @@ class TestPairScreen:
 
 
 class TestReceiveScreen:
-    def test_init_defaults(self):
+    def test_init_without_relay_is_blocked(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
         s = nomnom.ReceiveScreen()
-        # New ReceiveScreen opens on the mode chooser (info-only since no
-        # code is required anymore).
-        assert s.step == "mode"
+        assert s.step == "blocked"
+        assert "no relay" in s.error.lower()
 
-    def test_q_returns_back(self):
-        s = nomnom.ReceiveScreen()
-        assert s.handle_key(ord("q")) == nomnom.ScreenAction.BACK
-
-    def test_enter_without_peers_shows_error(self, tmp_path, monkeypatch):
+    def test_init_without_peers_is_blocked(self, tmp_path, monkeypatch):
         monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
         nomnom._save_relay_config("https://relay.invalid", "secret",
                                   allow_private=True)
         s = nomnom.ReceiveScreen()
-        s.handle_key(10)
-        assert s.step == "mode"
+        assert s.step == "blocked"
         assert "no pinned peers" in s.error.lower()
+
+    def test_blocked_q_returns_back(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        s = nomnom.ReceiveScreen()
+        assert s.handle_key(ord("q")) == nomnom.ScreenAction.BACK
+
+    def test_watching_starts_when_relay_and_peers_configured(
+        self, tmp_path, monkeypatch,
+    ):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        nomnom._save_relay_config("https://relay.invalid", "secret",
+                                  allow_private=True)
+        nomnom._save_known_peer("alice", "alice-mac", "aa" * 32)
+
+        # Stub the worker so __init__ doesn't try to hit the relay.
+        def fake_recv(*, identity, relay, on_progress, on_tofu, on_result, cancel):
+            cancel.wait()
+            return 130
+
+        monkeypatch.setattr(nomnom, "_relay_recv_pinned", fake_recv)
+        s = nomnom.ReceiveScreen()
+        assert s.step == "watching"
+        # Cleanly stop the worker so the test exits.
+        s._loop_exit.set()
+        s._cancel_and_back()
+        s.thread.join(timeout=1.0)
+
+    def test_log_accumulates_via_on_result(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        nomnom._save_relay_config("https://relay.invalid", "secret",
+                                  allow_private=True)
+        nomnom._save_known_peer("alice", "alice-mac", "aa" * 32)
+
+        captured: dict = {}
+
+        def fake_recv(*, identity, relay, on_progress, on_tofu, on_result, cancel):
+            # Capture the on_result callback the screen passed in, so the
+            # test can drive it directly and assert the log appends.
+            captured["on_result"] = on_result
+            cancel.wait()
+            return 130
+
+        monkeypatch.setattr(nomnom, "_relay_recv_pinned", fake_recv)
+        s = nomnom.ReceiveScreen()
+        # Wait for the worker thread to invoke fake_recv and register on_result.
+        deadline = time.monotonic() + 1.0
+        while "on_result" not in captured and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert "on_result" in captured
+        captured["on_result"]({
+            "name": "foo.txt", "bytes": 12, "peer_name": "alice",
+            "out_path": "./foo.txt",
+        })
+        captured["on_result"]({
+            "name": "bar.txt", "bytes": 34, "peer_name": "alice",
+            "out_path": "./bar.txt",
+        })
+        assert len(s._log) == 2
+        assert s._log[0]["name"] == "foo.txt"
+        assert s._log[1]["name"] == "bar.txt"
+        s._loop_exit.set()
+        s._cancel_and_back()
+        s.thread.join(timeout=1.0)
+
+    def test_log_capped_at_LOG_MAX(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        nomnom._save_relay_config("https://relay.invalid", "secret",
+                                  allow_private=True)
+        nomnom._save_known_peer("alice", "alice-mac", "aa" * 32)
+        captured: dict = {}
+
+        def fake_recv(*, identity, relay, on_progress, on_tofu, on_result, cancel):
+            captured["on_result"] = on_result
+            cancel.wait()
+            return 130
+
+        monkeypatch.setattr(nomnom, "_relay_recv_pinned", fake_recv)
+        s = nomnom.ReceiveScreen()
+        deadline = time.monotonic() + 1.0
+        while "on_result" not in captured and time.monotonic() < deadline:
+            time.sleep(0.01)
+        for i in range(s.LOG_MAX + 5):
+            captured["on_result"]({
+                "name": f"f{i}.txt", "bytes": 1, "peer_name": "alice",
+                "out_path": f"./f{i}.txt",
+            })
+        assert len(s._log) == s.LOG_MAX
+        # Oldest dropped: first surviving entry is f5.txt (5 entries trimmed).
+        assert s._log[0]["name"] == "f5.txt"
+        s._loop_exit.set()
+        s._cancel_and_back()
+        s.thread.join(timeout=1.0)
 
 
 class TestEmitGitBundleSend:
@@ -3027,69 +3164,69 @@ class TestPayloadPackUnpack:
             nomnom._unpack_payload(blob)
 
 
-class TestEncryptBytes:
+class TestSealBytes:
     def test_round_trip_random(self):
         data = bytes(range(256)) * 5
-        blob = nomnom.encrypt_bytes(data, "thing.bin", "pw")
-        name, body = nomnom.decrypt_bytes(blob, "pw")
+        blob = nomnom.seal_bytes(data, "thing.bin", "pw")
+        name, body = nomnom.open_bytes(blob, "pw")
         assert name == "thing.bin"
         assert body == data
 
     def test_empty_body(self):
-        blob = nomnom.encrypt_bytes(b"", "empty.txt", "pw")
-        assert nomnom.decrypt_bytes(blob, "pw") == ("empty.txt", b"")
+        blob = nomnom.seal_bytes(b"", "empty.txt", "pw")
+        assert nomnom.open_bytes(blob, "pw") == ("empty.txt", b"")
 
     def test_two_encrypts_differ(self):
         # Fresh salt + nonce per call means two encrypts of the same input
         # must produce different ciphertexts.
-        a = nomnom.encrypt_bytes(b"same", "n", "pw")
-        b = nomnom.encrypt_bytes(b"same", "n", "pw")
+        a = nomnom.seal_bytes(b"same", "n", "pw")
+        b = nomnom.seal_bytes(b"same", "n", "pw")
         assert a != b
 
     def test_deterministic_with_pinned_salt_and_nonce(self):
-        a = nomnom.encrypt_bytes(
+        a = nomnom.seal_bytes(
             b"same", "n", "pw",
             _salt=b"\x00" * 16, _nonce=b"\x01" * 12,
         )
-        b = nomnom.encrypt_bytes(
+        b = nomnom.seal_bytes(
             b"same", "n", "pw",
             _salt=b"\x00" * 16, _nonce=b"\x01" * 12,
         )
         assert a == b
 
     def test_wrong_passphrase_fails_auth(self):
-        blob = nomnom.encrypt_bytes(b"secret", "f.txt", "right")
+        blob = nomnom.seal_bytes(b"secret", "f.txt", "right")
         with pytest.raises(ValueError, match="authentication failed"):
-            nomnom.decrypt_bytes(blob, "wrong")
+            nomnom.open_bytes(blob, "wrong")
 
     def test_tampered_ciphertext_fails_auth(self):
-        blob = bytearray(nomnom.encrypt_bytes(b"secret bytes", "f.txt", "pw"))
+        blob = bytearray(nomnom.seal_bytes(b"secret bytes", "f.txt", "pw"))
         # Flip a bit deep in the ciphertext region (well past the 65-byte header).
         blob[100] ^= 0x01
         with pytest.raises(ValueError, match="authentication failed"):
-            nomnom.decrypt_bytes(bytes(blob), "pw")
+            nomnom.open_bytes(bytes(blob), "pw")
 
     def test_tampered_mac_fails_auth(self):
-        blob = bytearray(nomnom.encrypt_bytes(b"secret", "f.txt", "pw"))
+        blob = bytearray(nomnom.seal_bytes(b"secret", "f.txt", "pw"))
         # MAC sits at offset 33..65.
         blob[40] ^= 0x80
         with pytest.raises(ValueError, match="authentication failed"):
-            nomnom.decrypt_bytes(bytes(blob), "pw")
+            nomnom.open_bytes(bytes(blob), "pw")
 
     def test_truncated_blob_rejected(self):
-        blob = nomnom.encrypt_bytes(b"x", "f.txt", "pw")
+        blob = nomnom.seal_bytes(b"x", "f.txt", "pw")
         with pytest.raises(ValueError, match="too short"):
-            nomnom.decrypt_bytes(blob[:30], "pw")
+            nomnom.open_bytes(blob[:30], "pw")
 
     def test_wrong_magic_rejected(self):
-        blob = nomnom.encrypt_bytes(b"x", "f.txt", "pw")
+        blob = nomnom.seal_bytes(b"x", "f.txt", "pw")
         bad = b"WRONG" + blob[5:]
         with pytest.raises(ValueError, match="bad magic"):
-            nomnom.decrypt_bytes(bad, "pw")
+            nomnom.open_bytes(bad, "pw")
 
     def test_empty_passphrase_rejected(self):
         with pytest.raises(ValueError, match="passphrase"):
-            nomnom.encrypt_bytes(b"x", "f.txt", "")
+            nomnom.seal_bytes(b"x", "f.txt", "")
 
 
 class TestPickDecryptedPath:
@@ -3397,16 +3534,16 @@ class TestRendezvousSlots:
 class TestFirstContactBindingKdf:
     """The first-contact binding is scrypt over the relay secret, not HMAC.
 
-    Naive HMAC over a human-memorable passphrase is brute-forceable in
-    seconds; scrypt with N=2^15 raises that to days/weeks per guess on a
-    laptop. The KDF wrapping is part of the on-wire contract — both sides
-    must compute the same bytes for the session key to agree.
+    A bare HMAC over a short random secret is brute-forceable on a captured
+    transcript; scrypt with N=2^16 raises that cost by ~10^6x. The KDF
+    wrapping is part of the on-wire contract — both sides must compute the
+    same bytes for the session key to agree.
     """
 
     def test_binding_is_not_a_bare_hmac(self):
         import hmac as _hmac
         import hashlib as _hashlib
-        secret = "fend-sage-trash-cod-visa-data"
+        secret = "k4n2pX9qLm3T"
         hmac_out = _hmac.new(
             secret.encode("utf-8"),
             nomnom._FIRST_CONTACT_BINDING_TAG, _hashlib.sha256,
@@ -3416,7 +3553,7 @@ class TestFirstContactBindingKdf:
 
     def test_binding_is_cached(self):
         # The lru_cache returns the same digest object on the second call
-        # without re-running scrypt (~100ms otherwise).
+        # without re-running scrypt (~200ms otherwise).
         secret = "cached-secret"
         a = nomnom._first_contact_binding(secret)
         b = nomnom._first_contact_binding(secret)
@@ -3489,16 +3626,83 @@ class TestAtomicWrite:
         assert "new" in target.read_text()
 
 
-class TestCmdDecryptNoPeers:
-    """cmd_decrypt errors when no peers are pinned; no silent rendezvous."""
+class TestCmdReceiveNoPeers:
+    """cmd_receive errors when no peers are pinned; no silent rendezvous."""
 
     def test_no_peers_errors(self, tmp_path, monkeypatch, capsys):
         monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
         nomnom._save_relay_config("https://example.invalid", "secret",
                                   allow_private=True)
-        rc = nomnom.cmd_decrypt()
+        rc = nomnom.cmd_receive()
         assert rc == 1
         assert "no pinned peers" in capsys.readouterr().err.lower()
+
+
+class TestCmdReceiveWatch:
+    """cmd_receive default watch loop accumulates results until interrupted;
+    --once exits after the first received file."""
+
+    def _setup_env(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        nomnom._save_relay_config("https://example.invalid", "secret",
+                                  allow_private=True)
+        nomnom._save_known_peer("alice", "alice-mac", "aa" * 32)
+
+    def test_loops_on_multiple_results(self, tmp_path, monkeypatch, capsys):
+        self._setup_env(tmp_path, monkeypatch)
+        results = [
+            {"name": "foo.txt", "bytes": 12, "peer_name": "alice",
+             "out_path": str(tmp_path / "foo.txt")},
+            {"name": "bar.txt", "bytes": 34, "peer_name": "alice",
+             "out_path": str(tmp_path / "bar.txt")},
+        ]
+        call_count = {"n": 0}
+
+        def fake_recv(*, identity, relay, on_result, on_tofu):
+            i = call_count["n"]
+            call_count["n"] += 1
+            if i < len(results):
+                on_result(results[i])
+                return 0
+            # third iteration: simulate Ctrl-C inside the long-poll
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(nomnom, "_relay_recv_pinned", fake_recv)
+        rc = nomnom.cmd_receive()
+        # received_any was True before the KeyboardInterrupt → clean exit
+        assert rc == 0
+        err = capsys.readouterr().err
+        assert "foo.txt" in err
+        assert "bar.txt" in err
+        assert call_count["n"] == 3  # two results + one interrupted iteration
+
+    def test_once_exits_after_one(self, tmp_path, monkeypatch, capsys):
+        self._setup_env(tmp_path, monkeypatch)
+        call_count = {"n": 0}
+
+        def fake_recv(*, identity, relay, on_result, on_tofu):
+            call_count["n"] += 1
+            on_result({"name": "foo.txt", "bytes": 1, "peer_name": "alice",
+                       "out_path": str(tmp_path / "foo.txt")})
+            return 0
+
+        monkeypatch.setattr(nomnom, "_relay_recv_pinned", fake_recv)
+        rc = nomnom.cmd_receive(once=True)
+        assert rc == 0
+        assert call_count["n"] == 1
+        assert "foo.txt" in capsys.readouterr().err
+
+    def test_relay_error_exits_loop(self, tmp_path, monkeypatch, capsys):
+        # A NomnomError from the relay should NOT cause a tight retry loop.
+        self._setup_env(tmp_path, monkeypatch)
+
+        def fake_recv(*, identity, relay, on_result, on_tofu):
+            raise nomnom.NomnomError("relay is on fire")
+
+        monkeypatch.setattr(nomnom, "_relay_recv_pinned", fake_recv)
+        rc = nomnom.cmd_receive()
+        assert rc == 1
+        assert "on fire" in capsys.readouterr().err
 
 
 class TestFirstContactPromptDefaultsNo:
@@ -3733,6 +3937,45 @@ class TestRelaySlots:
         _, b_pub = nomnom._dh_keypair()
         binding = nomnom._recurring_binding(format(a_pub, "x"), format(b_pub, "x"))
         assert binding.startswith(b"recurring-v1")
+
+
+class TestJoinToken:
+    def test_format_then_parse_round_trip(self):
+        host = "relay.spencerjireh.com"
+        secret = "k4n2pX9qLm3T"
+        token = nomnom._format_join_token(host, secret)
+        assert token == f"{host}#{secret}"
+        assert nomnom._parse_join_token(token) == (host, secret)
+
+    def test_parse_strips_outer_whitespace(self):
+        host, secret = nomnom._parse_join_token("  host.example#abc  ")
+        assert host == "host.example"
+        assert secret == "abc"
+
+    @pytest.mark.parametrize(
+        "token",
+        [
+            "",
+            "    ",
+            "no-hash-here",
+            "two##hashes",
+            "a#b#c",
+            "#secretonly",
+            "hostonly#",
+            "https://host.example#abc",
+            "host.example/path#abc",
+            "host.example:8443#abc",
+            "host with space#abc",
+            "host.example#bad secret",
+        ],
+    )
+    def test_parse_rejects_malformed(self, token):
+        with pytest.raises(nomnom.NomnomError):
+            nomnom._parse_join_token(token)
+
+    def test_parse_rejects_non_string(self):
+        with pytest.raises(nomnom.NomnomError):
+            nomnom._parse_join_token(None)  # type: ignore[arg-type]
 
 
 class TestRelayConfig:
@@ -4387,13 +4630,13 @@ class TestReceivePathSafety:
         cwd = tmp_path / "rx"; cwd.mkdir()
         monkeypatch.chdir(cwd)
 
-        # decrypt_bytes raises ValueError on bad magic; the receive helper
+        # open_bytes raises ValueError on bad magic; the receive helper
         # must catch it and return 1, not propagate.
         with pytest.raises(ValueError, match="bad magic"):
-            nomnom.decrypt_bytes(b"\x00" * 100, "wrong-key")
+            nomnom.open_bytes(b"\x00" * 100, "wrong-key")
 
         # End-to-end: drive a recurring transfer (pre-pinned peers) and
-        # monkeypatch decrypt_bytes to simulate any of its ValueError
+        # monkeypatch open_bytes to simulate any of its ValueError
         # raises mid-flight.
         sender = self._mk_identity("sender")
         receiver = self._mk_identity("receiver")
@@ -4405,7 +4648,7 @@ class TestReceivePathSafety:
             receiver["device_id"], receiver["name"], receiver["ik_pub"],
         )
 
-        original = nomnom.decrypt_bytes
+        original = nomnom.open_bytes
 
         def boom(*_args, **_kwargs):
             raise ValueError("authentication failed")
@@ -4414,7 +4657,7 @@ class TestReceivePathSafety:
         send_err: list = []
 
         def receive():
-            monkeypatch.setattr(nomnom, "decrypt_bytes", boom)
+            monkeypatch.setattr(nomnom, "open_bytes", boom)
             try:
                 nomnom._relay_recv_pinned(
                     identity=receiver, relay=cfg, on_tofu=_tofu_yes,
@@ -4422,7 +4665,7 @@ class TestReceivePathSafety:
             except nomnom.NomnomError as exc:
                 recv_err.append(str(exc))
             finally:
-                monkeypatch.setattr(nomnom, "decrypt_bytes", original)
+                monkeypatch.setattr(nomnom, "open_bytes", original)
 
         def send():
             try:
@@ -4440,7 +4683,7 @@ class TestReceivePathSafety:
         ts.join(timeout=15.0); tr.join(timeout=15.0)
 
         # Receiver transforms the ValueError into a NomnomError with a clean
-        # user-facing message; the caller (cmd_decrypt / TUI worker) catches
+        # user-facing message; the caller (cmd_receive / TUI worker) catches
         # NomnomError and surfaces it without a traceback.
         assert recv_err and "authentication failed" in recv_err[0]
 

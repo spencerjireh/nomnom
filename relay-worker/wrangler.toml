@@ -14,7 +14,10 @@ routes = [
 binding = "BUCKET"
 bucket_name = "nomnom-relay"
 
-# HMAC secret is set out-of-band:
-#   ./scripts/generate-secret.sh | npx wrangler secret put NOMNOM_HMAC_SECRET
+# HMAC secret is set out-of-band. The fastest path is to let `nomnom relay init`
+# generate it for you — it prints the exact `wrangler secret put` and
+# `wrangler deploy` commands. Or generate one yourself, e.g.
+#   python3 -c 'import secrets; print(secrets.token_urlsafe(9))' \
+#     | npx wrangler secret put NOMNOM_HMAC_SECRET
 #
 # Do not check the secret into this file.
