@@ -8,11 +8,11 @@ The Worker is intentionally dumb: it stores opaque payloads at HMAC-authenticate
 
 - A Cloudflare account (free tier is enough for personal use — see [limits](#cost-and-limits)).
 - Node.js 20+ and `npx` (no global `wrangler` install needed).
-- `python3` (the bundled `scripts/generate-secret.sh` invokes it; already required by nomnom).
+- `python3` (already required by nomnom).
 
 ## Deploy
 
-From the repository root:
+The fastest path is to let `nomnom relay init` generate the HMAC secret for you and print the exact `wrangler` commands. From the repository root:
 
 ```sh
 cd relay-worker
@@ -21,23 +21,23 @@ npx wrangler login
 npx wrangler r2 bucket create nomnom-relay
 ```
 
-Generate and push the HMAC secret. The script emits a 6-word diceware passphrase (~62 bits of entropy) like `fend-sage-trash-cod-visa-data` — memorable enough to speak across the room or paste from a password manager when you set up another machine.
+Then on the machine that will be the first nomnom client, run:
 
 ```sh
-SECRET=$(../scripts/generate-secret.sh)
-echo "save this somewhere: $SECRET"
-printf '%s' "$SECRET" | npx wrangler secret put NOMNOM_HMAC_SECRET
+nomnom relay init
+# paste the Worker URL when prompted (e.g. https://nomnom-relay.your-subdomain.workers.dev)
 ```
 
-The secret is treated as opaque bytes by both the Worker and the client — if you want to pick your own phrase instead, just `SECRET="…"` and skip the script.
-
-Deploy:
+`relay init` generates a random ~72-bit secret, saves it locally, and prints the exact commands to push it to the Worker and deploy:
 
 ```sh
+echo 'GENERATED_SECRET' | npx wrangler secret put NOMNOM_HMAC_SECRET
 npx wrangler deploy
 ```
 
-Wrangler prints the worker URL (e.g. `https://nomnom-relay.your-subdomain.workers.dev`). Verify it's up:
+Run those in the `relay-worker/` directory. The Worker treats the secret as opaque bytes — if you'd rather generate it yourself, set `SECRET=...` and skip `relay init`.
+
+Verify the deploy:
 
 ```sh
 curl https://nomnom-relay.your-subdomain.workers.dev/health
@@ -60,17 +60,23 @@ npx wrangler r2 bucket lifecycle list nomnom-relay
 
 This is belt-and-suspenders for the 5-minute protocol TTL. Without it, abandoned slots sit indefinitely.
 
-## Configure nomnom
+## Add more devices
 
-On each Mac that will use the relay:
+On the first device you already ran `nomnom relay init`. To onboard a second device, grab a shareable join token:
 
 ```sh
-nomnom relay setup
-# paste the worker URL
-# paste the passphrase from above
+# device 1
+nomnom relay show --token
+# relay.your-subdomain.workers.dev#k4n2pX9qLm3T
 ```
 
-Confirm end-to-end:
+On the new device:
+
+```sh
+nomnom join 'relay.your-subdomain.workers.dev#k4n2pX9qLm3T'
+```
+
+`join` self-tests the relay and saves the config. Confirm end-to-end at any time:
 
 ```sh
 nomnom relay test
@@ -101,14 +107,19 @@ The HMAC authenticates clients to the Worker; it does not vouch for the body. Bo
 
 ## Rotating the secret
 
-Generate a new secret, push it, redeploy, then update each client.
+Wipe the local config on one device and re-run `nomnom relay init` to generate a fresh secret, then push + deploy it, then `join` the rest of the devices with a new token.
 
 ```sh
-SECRET=$(../scripts/generate-secret.sh)
-printf '%s' "$SECRET" | npx wrangler secret put NOMNOM_HMAC_SECRET
-npx wrangler deploy
-# On every Mac that uses the relay:
-nomnom relay set <worker-url> --secret "$SECRET"
+# device that will own the new secret:
+nomnom relay clear
+nomnom relay init
+# follow the printed wrangler commands to push the new secret and deploy
+
+nomnom relay show --token   # share with the other devices
+
+# on every other device:
+nomnom relay clear
+nomnom join '<new-token>'
 ```
 
 There is no `nomnom relay rotate-secret` command in this version. Rotation is intentionally manual because it requires coordination across every device using the relay.

@@ -2415,7 +2415,7 @@ def _unpack_payload(payload: bytes) -> tuple[str, bytes]:
     return name, payload[2 + header_len:]
 
 
-def encrypt_bytes(
+def seal_bytes(
     data: bytes,
     name: str,
     passphrase: str,
@@ -2440,8 +2440,8 @@ def encrypt_bytes(
     return _NMNM_MAGIC + salt + nonce + mac + ciphertext
 
 
-def decrypt_bytes(blob: bytes, passphrase: str) -> tuple[str, bytes]:
-    """Verify and decrypt `blob` produced by `encrypt_bytes`.
+def open_bytes(blob: bytes, passphrase: str) -> tuple[str, bytes]:
+    """Verify and decrypt `blob` produced by `seal_bytes`.
 
     Returns (original_name, original_bytes). Raises ValueError on any
     structural problem, wrong passphrase, or tampering.
@@ -2576,7 +2576,7 @@ def _migrate_known_peers_v2(legacy: dict) -> dict:
 
     v1 and v2 derive the recurring session key identically (`_recurring_binding`
     is byte-identical across the two schemas), so old pins remain valid for
-    `decrypt`/`encrypt` and only `pair`-style first-contact metadata is
+    `send`/`receive` and only `pair`-style first-contact metadata is
     affected. Preserving the records avoids re-pairing every device on
     upgrade. Returns the inner peers dict.
     """
@@ -2962,7 +2962,7 @@ def _save_relay_config(url: str, secret: str, *, allow_private: bool = False) ->
 
     `allow_private=False` (default) refuses URLs whose host resolves to a
     private / loopback / link-local / metadata address — every later
-    encrypt/decrypt sends device metadata and ciphertext to whatever this
+    send/receive sends device metadata and ciphertext to whatever this
     URL points at, so silently accepting an internal endpoint enables SSRF
     via a socially-engineered `nomnom relay import` blob.
     """
@@ -2986,6 +2986,46 @@ def _relay_clear_config() -> bool:
         return False
     except OSError:
         return False
+
+
+# --- join token ---
+
+# Format: <host>#<secret>. Host is bare (no scheme, no path, no port). We always
+# assume https://. The `#` separator avoids collision with port-in-host (e.g.
+# `relay.foo.com:8443`) and keeps the token paste-friendly.
+
+
+def _format_join_token(host: str, secret: str) -> str:
+    return f"{host}#{secret}"
+
+
+def _parse_join_token(token: str) -> tuple[str, str]:
+    """Parse `host#secret`. Raises NomnomError on anything malformed.
+
+    Strict: rejects schemes, paths, ports, embedded whitespace, multiple `#`,
+    or empty halves. The point is to refuse anything that isn't a bare-host
+    rendezvous string so we can keep `https://{host}` substitution safe."""
+    if not isinstance(token, str):
+        raise NomnomError("join token must be a string")
+    token = token.strip()
+    if not token:
+        raise NomnomError("join token is empty")
+    if token.count("#") != 1:
+        raise NomnomError(
+            "join token must contain exactly one '#' separating host and secret",
+        )
+    host, secret = token.split("#", 1)
+    if not host:
+        raise NomnomError("join token has empty host")
+    if not secret:
+        raise NomnomError("join token has empty secret")
+    if "://" in host or "/" in host or ":" in host:
+        raise NomnomError(
+            f"join token host must be bare (no scheme/port/path): {host!r}",
+        )
+    if any(c.isspace() for c in host) or any(c.isspace() for c in secret):
+        raise NomnomError("join token must not contain whitespace")
+    return host, secret
 
 
 # --- HMAC + HTTP ---
@@ -3154,7 +3194,7 @@ def _raise_relay_error(status: int, body: bytes) -> None:
 class _RelayPollWorker:
     """One long-poll GET that another thread can cancel via socket shutdown.
 
-    `nomnom decrypt` with no args races one of these against every pinned
+    `nomnom receive` with no args races one of these against every pinned
     peer's deterministic-rendezvous slot. First to return a body wins; the
     rest are cancelled.
     """
@@ -3314,12 +3354,11 @@ _FIRST_CONTACT_BINDING_TAG = b"nomnom-first-contact-v2"
 _FIRST_CONTACT_RENDEZVOUS_TAG = b"nomnom-rendezvous-v1"
 _FIRST_CONTACT_RESP_TAG = b"nomnom-rendezvous-resp-v1"
 
-# scrypt parameters for the first-contact binding. N=2^15 takes ~100ms on a
-# laptop; r=8/p=1/dklen=32 match common defaults. Slowing the binding by ~10^6x
-# shifts an offline relay-secret brute-force on a captured transcript from
-# trivial-on-laptop to expensive-on-cluster, so a human-memorable passphrase
-# isn't an instant kill.
-_FIRST_CONTACT_SCRYPT_N = 2 ** 15
+# scrypt parameters for the first-contact binding. N=2^16 takes ~200ms on a
+# laptop; r=8/p=1/dklen=32 match common defaults. The KDF cost slows offline
+# brute-force on a captured transcript by ~10^6x, so even a short random secret
+# isn't an instant kill if the relay log ever leaks.
+_FIRST_CONTACT_SCRYPT_N = 2 ** 16
 _FIRST_CONTACT_SCRYPT_R = 8
 _FIRST_CONTACT_SCRYPT_P = 1
 
@@ -3344,9 +3383,9 @@ def _first_contact_binding(relay_secret: str) -> bytes:
         n=_FIRST_CONTACT_SCRYPT_N,
         r=_FIRST_CONTACT_SCRYPT_R,
         p=_FIRST_CONTACT_SCRYPT_P,
-        # CPython's default maxmem is 32 MiB and N=2^15,r=8 needs exactly 32
+        # CPython's default maxmem is 32 MiB and N=2^16,r=8 needs exactly 64
         # MiB; pad so the parameters validate on 3.8 too.
-        maxmem=64 * 1024 * 1024,
+        maxmem=128 * 1024 * 1024,
         dklen=32,
     )
 
@@ -3760,7 +3799,7 @@ def _relay_send(
             cleanup_authored()
             raise NomnomError(f"bad peer key: {e}") from e
         try:
-            ciphertext = encrypt_bytes(data, name, session_key.hex())
+            ciphertext = seal_bytes(data, name, session_key.hex())
         except Exception as e:
             cleanup_authored()
             raise NomnomError(f"encryption failed: {e}") from e
@@ -3768,10 +3807,15 @@ def _relay_send(
         _relay_progress(on_progress, "uploading payload", 0.7)
         try:
             _relay_put_slot(relay, slot_d, ciphertext)
-            authored.append(slot_d)
         except NomnomError:
             cleanup_authored()
             raise
+        # NOTE: slot_d is intentionally NOT added to `authored`. The receiver's
+        # GET on slot_d auto-deletes on successful read; if the receiver never
+        # arrives, the Worker's 5-minute TTL collects the slot. Deleting it
+        # here would race the receiver's long-poll on fast networks
+        # (localhost / wrangler dev) and produce "sender didn't deliver
+        # payload (waited 30s)" errors.
 
         _relay_pin_peer(
             resp["device_id"], resp["name"], resp["ik"], decision=decision,
@@ -3900,7 +3944,7 @@ def _relay_recv_complete(
 
         _relay_progress(on_progress, "decrypting", 0.9)
         try:
-            name, plaintext = decrypt_bytes(ciphertext, session_key.hex())
+            name, plaintext = open_bytes(ciphertext, session_key.hex())
         except (NomnomError, ValueError) as e:
             raise NomnomError(f"decrypt failed: {e}") from e
 
@@ -3943,7 +3987,7 @@ def _bundle_send_via_relay(
     Bulk repo bundles aren't a good fit for first-contact pairing — the
     receiver has to be running `nomnom pair` at the exact right moment.
     So this errors when the pin state is ambiguous and tells the user to
-    pair first or use `nomnom encrypt --to PEER` from the CLI.
+    pair first or use `nomnom send --to PEER` from the CLI.
 
     `interactive=False` makes the relay-config helper non-interactive so
     the TUI can call this without curses-incompatible prompts.
@@ -3969,7 +4013,7 @@ def _bundle_send_via_relay(
     if len(peers) > 1:
         sys.stderr.write(
             "error: multiple pinned peers; bundle SEND auto-targets only "
-            "when one peer exists. use `nomnom encrypt <bundle> --to PEER` "
+            "when one peer exists. use `nomnom send <bundle> --to PEER` "
             "from the CLI instead.\n",
         )
         return 1
@@ -4096,7 +4140,7 @@ def _read_payload_or_error(p: Path) -> bytes | None:
         return None
 
 
-def cmd_encrypt(path: str, *, to: str | None = None, trust_new: bool = False) -> int:
+def cmd_send(path: str, *, to: str | None = None, trust_new: bool = False) -> int:
     """Send a file through the relay to a pinned peer.
 
     Routing:
@@ -4177,11 +4221,13 @@ def cmd_encrypt(path: str, *, to: str | None = None, trust_new: bool = False) ->
     return rc
 
 
-def cmd_decrypt(*, trust_new: bool = False) -> int:
-    """Receive a file through the relay from a pinned peer.
+def cmd_receive(*, once: bool = False, trust_new: bool = False) -> int:
+    """Receive files through the relay from pinned peers.
 
-    Long-polls every pinned peer's deterministic rendezvous slot. With zero
-    pinned peers, errors: first contact goes through `nomnom pair`.
+    Default: keep long-polling every pinned peer's deterministic rendezvous
+    slot, printing one line per received file. Ctrl-C exits cleanly. Pass
+    `once=True` to exit after the first received file (scripting). With
+    zero pinned peers, errors: first contact goes through `nomnom pair`.
     """
     relay = _ensure_relay_configured()
     if relay is None:
@@ -4194,27 +4240,57 @@ def cmd_decrypt(*, trust_new: bool = False) -> int:
         )
         return 1
 
-    result_holder: list[dict] = []
-
-    def _on_result(r: dict) -> None:
-        result_holder.append(r)
-
     on_tofu = _trust_new_callback() if trust_new else None
-    try:
-        rc = _relay_recv_pinned(
-            identity=identity, relay=relay,
-            on_result=_on_result, on_tofu=on_tofu,
-        )
-    except NomnomError as e:
-        sys.stderr.write(f"error: {e}\n")
-        return 1
-    if rc == 0 and result_holder:
-        r = result_holder[0]
+    received_any = False
+    if not once:
         sys.stderr.write(
-            f"received {r['name']!r} ({r['bytes']} bytes) from {r['peer_name']} "
-            f"-> {r['out_path']}\n",
+            "waiting for transfers (Ctrl-C to exit)...\n",
         )
-    return rc
+        sys.stderr.flush()
+    while True:
+        result_holder: list[dict] = []
+
+        def _on_result(r: dict) -> None:
+            result_holder.append(r)
+
+        try:
+            rc = _relay_recv_pinned(
+                identity=identity, relay=relay,
+                on_result=_on_result, on_tofu=on_tofu,
+            )
+        except KeyboardInterrupt:
+            sys.stderr.write("\n")
+            return 0 if received_any else 130
+        except NomnomError as e:
+            # `_relay_recv_pinned` raises "no transfer (waited 30s)" on a
+            # benign long-poll timeout — for the single-shot mode that's an
+            # error ("expected a transfer, got none"), but for the watch
+            # loop it's the steady-state idle case. Re-arm in watch mode.
+            # The error-loaded variant ("no transfer: 401 Unauthorized")
+            # carries a real reason and should always exit.
+            msg = str(e)
+            if not once and msg.startswith("no transfer (waited"):
+                continue
+            sys.stderr.write(f"error: {e}\n")
+            return 1
+        if rc == 0 and result_holder:
+            r = result_holder[0]
+            sys.stderr.write(
+                f"received {r['name']!r} ({r['bytes']} bytes) "
+                f"from {r['peer_name']} -> {r['out_path']}\n",
+            )
+            sys.stderr.flush()
+            received_any = True
+            if once:
+                return 0
+            continue
+        if rc == 130:
+            return 0 if received_any else 130
+        if once:
+            return rc
+        # Non-zero return without a Ctrl-C signal: surface and exit so the
+        # user isn't stuck in a tight loop against a broken relay.
+        return rc
 
 
 def cmd_pair(*, trust_new: bool = False) -> int:
@@ -4261,22 +4337,21 @@ def cmd_pair(*, trust_new: bool = False) -> int:
 def cmd_relay(args) -> int:
     action = getattr(args, "action", None)
     handlers = {
-        "setup": _cmd_relay_setup,
-        "set": _cmd_relay_set,
+        "init": _cmd_relay_init,
         "test": _cmd_relay_test,
         "show": _cmd_relay_show,
         "clear": _cmd_relay_clear,
     }
     if action is None:
         sys.stderr.write(
-            "usage: nomnom relay {setup,set,test,show,clear}\n",
+            "usage: nomnom relay {init,test,show,clear}\n",
         )
         return 2
     return handlers[action](args)
 
 
 def _ensure_relay_configured(*, interactive: bool = True) -> dict | None:
-    """Return loaded relay config; prompt to run setup if missing.
+    """Return loaded relay config; prompt to run init if missing.
 
     `interactive=False` (TUI callers) skips the input() prompt entirely and
     raises NomnomError so the caller surfaces a clean error — calling input()
@@ -4290,12 +4365,11 @@ def _ensure_relay_configured(*, interactive: bool = True) -> dict | None:
     cfg = _load_relay_config()
     if cfg is not None:
         return cfg
+    hint = "run `nomnom relay init` (first device) or `nomnom join <token>` (other devices)"
     if not interactive or _in_tui():
-        raise NomnomError(
-            "no relay configured. run `nomnom relay setup` first.",
-        )
+        raise NomnomError(f"no relay configured. {hint}.")
     if not sys.stdin.isatty():
-        sys.stderr.write("error: no relay configured. run `nomnom relay setup`.\n")
+        sys.stderr.write(f"error: no relay configured. {hint}.\n")
         return None
     sys.stderr.write("no relay configured. set one up now? [Y/n]: ")
     sys.stderr.flush()
@@ -4305,13 +4379,13 @@ def _ensure_relay_configured(*, interactive: bool = True) -> dict | None:
         sys.stderr.write("\n")
         return None
     if ans not in ("", "y", "yes"):
-        sys.stderr.write("see `nomnom relay setup`.\n")
+        sys.stderr.write(f"{hint}.\n")
         return None
-    return _cmd_relay_setup_interactive()
+    return _cmd_relay_init_interactive()
 
 
-def _cmd_relay_setup_interactive(*, allow_private: bool = False) -> dict | None:
-    """Interactive walkthrough: prompt URL + secret, self-test, save on success."""
+def _cmd_relay_init_interactive(*, allow_private: bool = False) -> dict | None:
+    """First-device flow: prompt URL, generate secret, self-test, save, print wrangler commands."""
     sys.stderr.write(
         "relay URL (e.g. https://nomnom-relay.<account>.workers.dev): ",
     )
@@ -4319,7 +4393,7 @@ def _cmd_relay_setup_interactive(*, allow_private: bool = False) -> dict | None:
     try:
         url = input().strip()
     except (EOFError, KeyboardInterrupt):
-        sys.stderr.write("\nsetup cancelled.\n")
+        sys.stderr.write("\ninit cancelled.\n")
         return None
     if not url:
         sys.stderr.write("error: empty URL.\n")
@@ -4327,20 +4401,25 @@ def _cmd_relay_setup_interactive(*, allow_private: bool = False) -> dict | None:
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
     url = url.rstrip("/")
-    sys.stderr.write("HMAC secret (the one pushed to the Worker): ")
-    sys.stderr.flush()
-    try:
-        secret = input().strip()
-    except (EOFError, KeyboardInterrupt):
-        sys.stderr.write("\nsetup cancelled.\n")
-        return None
-    if not secret:
-        sys.stderr.write("error: empty secret.\n")
-        return None
+    # 9 random bytes → 12 url-safe base64 chars (~72 bits). Replaces the old
+    # 6-word diceware passphrase: now that the secret is generated and
+    # pasted (via `relay show --token`) instead of typed, readability stops
+    # mattering and entropy density wins.
+    secret = secrets.token_urlsafe(9)
     candidate = {"url": url, "secret": secret}
     rc, msg = _relay_self_test(candidate)
     if rc != 0:
-        sys.stderr.write(f"error: {msg}\nconfig NOT saved.\n")
+        sys.stderr.write(
+            f"error: {msg}\n"
+            "the Worker rejected the self-test. did you push this secret to it "
+            "yet? see the commands below; you can re-run `nomnom relay init` "
+            "after deploying.\n",
+        )
+        sys.stderr.write("\non the Worker side, run:\n")
+        sys.stderr.write(
+            f"  echo {secret!r} | npx wrangler secret put NOMNOM_HMAC_SECRET\n"
+            "  npx wrangler deploy\n",
+        )
         return None
     try:
         _save_relay_config(url, secret, allow_private=allow_private)
@@ -4348,34 +4427,47 @@ def _cmd_relay_setup_interactive(*, allow_private: bool = False) -> dict | None:
         sys.stderr.write(f"error: {e}\n")
         return None
     sys.stderr.write(f"saved to {_relay_config_path()} ({msg})\n")
+    sys.stderr.write("\non the Worker side, run (if you haven't already):\n")
+    sys.stderr.write(
+        f"  echo {secret!r} | npx wrangler secret put NOMNOM_HMAC_SECRET\n"
+        "  npx wrangler deploy\n",
+    )
+    sys.stderr.write(
+        "\nshare with another device with: nomnom relay show --token\n",
+    )
     return candidate
 
 
-def _cmd_relay_setup(args) -> int:
-    cfg = _cmd_relay_setup_interactive(
+def _cmd_relay_init(args) -> int:
+    cfg = _cmd_relay_init_interactive(
         allow_private=getattr(args, "allow_private", False),
     )
     return 0 if cfg is not None else 1
 
 
-def _cmd_relay_set(args) -> int:
-    url = args.url.rstrip("/")
-    if not url.startswith(("http://", "https://")):
-        url = "https://" + url
-    candidate = {"url": url, "secret": args.secret}
+def cmd_join(args) -> int:
+    """Second-device flow: parse `host#secret`, self-test, save."""
+    try:
+        host, secret = _parse_join_token(args.token)
+    except NomnomError as e:
+        sys.stderr.write(f"error: {e}\n")
+        return 1
+    url = f"https://{host}"
+    candidate = {"url": url, "secret": secret}
     rc, msg = _relay_self_test(candidate)
     if rc != 0:
         sys.stderr.write(f"error: {msg}\nconfig NOT saved.\n")
         return 1
     try:
         _save_relay_config(
-            url, args.secret,
+            url, secret,
             allow_private=getattr(args, "allow_private", False),
         )
     except NomnomError as e:
         sys.stderr.write(f"error: {e}\n")
         return 1
     sys.stderr.write(f"saved to {_relay_config_path()} ({msg})\n")
+    sys.stderr.write("run `nomnom pair` on both devices to add this peer.\n")
     return 0
 
 
@@ -4389,11 +4481,18 @@ def _cmd_relay_test(_args) -> int:
     return rc
 
 
-def _cmd_relay_show(_args) -> int:
+def _cmd_relay_show(args) -> int:
     cfg = _load_relay_config()
     if cfg is None:
         sys.stderr.write("no relay configured.\n")
         return 1
+    if getattr(args, "token", False):
+        # Reduce the stored https://host URL back to the bare host the token
+        # format expects. `_load_relay_config` already rejects http(s)-less
+        # URLs and strips trailing slashes.
+        host = cfg["url"].split("://", 1)[1]
+        print(_format_join_token(host, cfg["secret"]))
+        return 0
     redacted = cfg["secret"]
     redacted = "*" * max(0, len(redacted) - 4) + redacted[-4:] if redacted else ""
     print(f"url:    {cfg['url']}")
@@ -4673,15 +4772,15 @@ class LauncherScreen(Screen):
         self.cursor = 0
         self.tiles: list[tuple[str, str]] = [
             ("Bundle",     "Pick files and write a bundle .txt"),
+            ("Send",       "Encrypt a file and send it to a pinned peer"),
+            ("Receive",    "Listen for transfers (auto-resumes after each)"),
+            ("Pair",       "Pair with a new device over the relay"),
             ("Commit",     "Bundle staged/unstaged diffs + recent commits"),
             ("PR",         "Bundle commits since base + diff for an LLM"),
             ("Review",     "Bundle a PR's meta, diff, and comments"),
             ("Rebuild",    "Reconstruct a file tree from a bundle .txt"),
-            ("Send",       "Encrypt a file and send to a pinned peer"),
-            ("Receive",    "Wait for a transfer from a pinned peer"),
-            ("Pair",       "Pair with a new device over the relay"),
-            ("Extensions", "Edit the text/binary/name/secret lists"),
             ("Pins",       "Manage TOFU-pinned peers"),
+            ("Extensions", "Edit the text/binary/name/secret lists"),
         ]
 
     def render(self, stdscr) -> None:  # pragma: no cover - curses I/O
@@ -5848,6 +5947,21 @@ class _TransferScreen(Screen):
             if self.state.finished and self.step == "running":
                 self.step = "done"
 
+    def _reset_transfer_state(self) -> None:
+        """Replace shared state for a fresh iteration.
+
+        Used by screens that loop (SendScreen toast→path, ReceiveScreen
+        idle→running→idle): a stale `cancel_event` or `tofu_answer_event`
+        from a previous transfer would otherwise leak into the next one and
+        either fire spurious cancels or deadlock TOFU waits.
+
+        Does NOT touch `self.thread` — the ReceiveScreen's loop runner
+        calls this between iterations of its own loop, so nulling the
+        handle would invalidate the join() that callers (or test fixtures)
+        rely on.
+        """
+        self.state = _RelayTransferState()
+
     def _render_running(self, stdscr, theme, y: int, w: int) -> None:  # pragma: no cover
         with self.state._lock:
             phase = self.state.phase
@@ -5882,7 +5996,10 @@ class _TransferScreen(Screen):
                 pass
 
     def _set_render_timeout(self, stdscr) -> None:  # pragma: no cover
-        if self.step == "running":
+        # Steps that need a periodic re-render to make progress without input:
+        # 'running' (progress bar) and 'toast' (auto-reset deadline). Other
+        # steps block on getch.
+        if self.step in ("running", "toast", "idle"):
             try:
                 stdscr.timeout(self.POLL_INTERVAL_MS)
             except curses.error:
@@ -5905,7 +6022,8 @@ class _TransferScreen(Screen):
 class SendScreen(_TransferScreen):
     """Send a file through the relay. Stays in curses; progress live.
 
-    State machine: 'path' → optional 'peer-pick' (≥2 peers) → 'running' → 'done'.
+    State machine: 'path' → optional 'peer-pick' (≥2 peers) → 'running'
+    → 'toast' (rc=0, ~1.5s, then back to 'path') or 'done' (rc≠0).
     """
 
     title = "Send"
@@ -5915,7 +6033,9 @@ class SendScreen(_TransferScreen):
         "enter starts the transfer (relay is required)",
         "with 2+ pinned peers, pick the target on the next screen",
         "esc cancels (cleans up any half-sent slots)",
+        "after a successful send, the screen auto-resets to send another",
     ]
+    TOAST_DURATION_S = 1.5
 
     def __init__(self) -> None:
         super().__init__()
@@ -5926,6 +6046,15 @@ class SendScreen(_TransferScreen):
         self._peers: list[tuple[str, dict]] = []
         self._cursor = 0
         self._pending_send: tuple[str, bytes, dict, dict] | None = None
+        # Last-used peer ik_pub, set on each successful _launch_send. Used to
+        # pre-position the cursor on the next peer-pick screen so a burst of
+        # sends to the same person doesn't make the user re-pick every time.
+        self._last_target_ik: str | None = None
+        # Monotonic deadline for the toast → path auto-reset. 0.0 means no
+        # toast is active.
+        self._toast_until: float = 0.0
+        # Last completed transfer summary, for the toast line. (name, bytes)
+        self._last_sent: tuple[str, int] | None = None
 
     def _begin_send(self) -> None:
         self.error = ""
@@ -5940,7 +6069,7 @@ class SendScreen(_TransferScreen):
             return
         relay = _load_relay_config()
         if relay is None:
-            self.error = "no relay configured — run `nomnom relay setup` first."
+            self.error = "no relay configured — run `nomnom relay init` or `nomnom join <token>` first."
             return
         identity = _load_identity()
         peers = [
@@ -5967,12 +6096,20 @@ class SendScreen(_TransferScreen):
         self._peers = sorted(peers, key=_last_transfer_key)
         # If the user just paired with a device, drop the cursor on it so
         # "+ pair new device" → enter → send lands on the new peer.
+        # Otherwise, fall back to the last-used peer from this session.
         just_paired = PairScreen.last_paired_peer_id
         PairScreen.last_paired_peer_id = None
         self._cursor = 0
+        target_ik_pref = None
         if just_paired:
             for i, (pid, _rec) in enumerate(self._peers):
                 if pid == just_paired:
+                    self._cursor = i
+                    target_ik_pref = self._peers[i][1].get("ik_pub")
+                    break
+        if target_ik_pref is None and self._last_target_ik is not None:
+            for i, (_pid, rec) in enumerate(self._peers):
+                if rec.get("ik_pub") == self._last_target_ik:
                     self._cursor = i
                     break
         self.step = "peer-pick"
@@ -5983,6 +6120,11 @@ class SendScreen(_TransferScreen):
             return
         name, data, relay, identity = self._pending_send
         self._pending_send = None
+        # Stash for next iteration's peer-pick pre-selection; also held in
+        # `self._last_sent` once the worker finishes so the toast can render
+        # the file name + size after _pending_send has already been cleared.
+        self._last_target_ik = target_ik
+        self._last_sent = (name, len(data))
         self._start_worker(
             _relay_send, name, data,
             target_ik_hex=target_ik,
@@ -5992,8 +6134,49 @@ class SendScreen(_TransferScreen):
             cancel=self.state.cancel_event,
         )
 
+    def _check_finished(self) -> None:
+        # Override so a clean send transitions into a brief toast rather
+        # than terminating on 'done'. rc≠0 keeps the original behavior.
+        with self.state._lock:
+            if self.state.finished and self.step == "running":
+                if self.state.rc == 0:
+                    self.step = "toast"
+                    self._toast_until = time.monotonic() + self.TOAST_DURATION_S
+                else:
+                    self.step = "done"
+
+    def _reset_for_next_send(self) -> None:
+        """Wipe per-transfer scratch and return to the path field."""
+        self._reset_transfer_state()
+        self.path_buf = ""
+        self.error = ""
+        self._pending_send = None
+        self._peers = []
+        self._cursor = 0
+        self._toast_until = 0.0
+        self.step = "path"
+
+    def _render_toast(self, stdscr, theme, y: int, w: int) -> None:  # pragma: no cover
+        if self._last_sent is None:
+            line = "sent."
+        else:
+            name, size = self._last_sent
+            line = f"sent {name!r} ({size} bytes)."
+        try:
+            stdscr.addstr(y, 2, line[: max(1, w - 4)], theme["checked"])
+        except curses.error:
+            pass
+        try:
+            stdscr.addstr(y + 2, 2,
+                          "ready for another send..."[: max(1, w - 4)],
+                          theme["dim"])
+        except curses.error:
+            pass
+
     def render(self, stdscr) -> None:  # pragma: no cover - curses I/O
         self._check_finished()
+        if self.step == "toast" and time.monotonic() >= self._toast_until:
+            self._reset_for_next_send()
         theme = _setup_theme()
         self._set_render_timeout(stdscr)
         h, w = stdscr.getmaxyx()
@@ -6019,6 +6202,9 @@ class SendScreen(_TransferScreen):
             self._render_running(stdscr, theme, 2, w)
             self._check_tofu_modal(stdscr)
             footer = "esc:cancel  ?:help"
+        elif self.step == "toast":
+            self._render_toast(stdscr, theme, 2, w)
+            footer = "any key:next  esc/q:back  ?:help"
         else:
             self._render_done(stdscr, theme, 2, w)
             footer = "esc/q:back  ?:help"
@@ -6092,50 +6278,139 @@ class SendScreen(_TransferScreen):
             if ch in (27,):
                 self._cancel_and_back()
             return ScreenAction.CONTINUE
+        if self.step == "toast":
+            if ch in (ord("q"), 3, 27):
+                return ScreenAction.BACK
+            # Any other key: short-circuit the 1.5s timer.
+            self._reset_for_next_send()
+            return ScreenAction.CONTINUE
         if ch in (ord("q"), 3, 27, 10, 13):
             return ScreenAction.BACK
         return ScreenAction.CONTINUE
 
 
 class ReceiveScreen(_TransferScreen):
-    """Receive a file through the relay. Stays in curses; progress live."""
+    """Listen for transfers until the user exits.
+
+    State machine: 'blocked' (preflight failed — show error, q to back) or
+    'watching' (worker loop alive, log accumulates). Within 'watching', the
+    underlying long-poll/transfer phase is read from `state.progress` /
+    `state.phase`: progress == 0.0 means idle (long-poll), > 0.0 means a
+    transfer is in flight.
+
+    Esc semantics:
+    - idle (progress == 0.0): exit to launcher.
+    - running (progress > 0.0): cancel that transfer; the worker loop
+      swallows rc=130, resets primitives, and re-arms.
+    """
 
     title = "Receive"
     verb = "Receive"
     help_lines = [
-        "enter starts long-poll for any pinned peer",
-        "no pinned peers? open the Pair screen first",
-        "esc cancels",
+        "auto-starts listening for pinned peers",
+        "received files accumulate in the on-screen log",
+        "esc during a transfer cancels that file; esc while idle exits",
     ]
+    LOG_MAX = 20
 
     def __init__(self) -> None:
         super().__init__()
-        self.step = "mode"
         self.error = ""
-
-    def _begin_recv(self) -> None:
-        self.error = ""
+        self._log: list[dict] = []
+        self._log_lock = threading.Lock()
+        self._loop_exit = threading.Event()
+        self._stopped_reason = ""
         relay = _load_relay_config()
         if relay is None:
-            self.error = "no relay configured — run `nomnom relay setup` first."
+            self.step = "blocked"
+            self.error = "no relay configured — run `nomnom relay init` or `nomnom join <token>` first."
             return
-        identity = _load_identity()
         if not _load_known_peers():
-            self.error = (
-                "no pinned peers — open the Pair screen to add a new device."
-            )
+            self.step = "blocked"
+            self.error = "no pinned peers — open the Pair screen to add a new device."
             return
-        self._start_worker(
-            _relay_recv_pinned,
-            identity=identity, relay=relay,
-            on_progress=self._on_progress,
-            on_tofu=self._on_tofu,
-            on_result=self._on_result,
-            cancel=self.state.cancel_event,
-        )
+        self.step = "watching"
+        identity = _load_identity()
+        self._start_watch_worker(identity, relay)
+
+    def _start_watch_worker(self, identity: dict, relay: dict) -> None:
+        def _on_result(result: dict) -> None:
+            row = {
+                "name": result.get("name", "?"),
+                "bytes": result.get("bytes", 0),
+                "peer_name": result.get("peer_name", "?"),
+                "out_path": result.get("out_path", ""),
+                "ts": time.time(),
+            }
+            with self._log_lock:
+                self._log.append(row)
+                if len(self._log) > self.LOG_MAX:
+                    del self._log[: len(self._log) - self.LOG_MAX]
+
+        def runner() -> None:
+            while not self._loop_exit.is_set():
+                # Per-iteration: fresh cancel_event / tofu_event / progress.
+                self._reset_transfer_state()
+                try:
+                    rc = _relay_recv_pinned(
+                        identity=identity, relay=relay,
+                        on_progress=self._on_progress,
+                        on_tofu=self._on_tofu,
+                        on_result=_on_result,
+                        cancel=self.state.cancel_event,
+                    )
+                except NomnomError as e:
+                    # Benign 30s timeout is the steady-state idle case in
+                    # the watch loop — re-arm. The error-loaded variant
+                    # ("no transfer: ...") carries a real reason and exits.
+                    if str(e).startswith("no transfer (waited"):
+                        continue
+                    self._stopped_reason = str(e)
+                    self._loop_exit.set()
+                    return
+                except Exception as e:
+                    self._stopped_reason = f"{type(e).__name__}: {e}"
+                    self._loop_exit.set()
+                    return
+                # rc==130: cancel_event was set (either an in-flight cancel
+                # from the user, or our own _loop_exit propagation). The
+                # while header handles whether to re-arm.
+                # rc!=0 & rc!=130: surface and exit.
+                if rc not in (0, 130):
+                    self._stopped_reason = f"relay returned rc={rc}"
+                    self._loop_exit.set()
+                    return
+
+        self.thread = threading.Thread(target=runner, daemon=True)
+        self.thread.start()
+
+    def _is_transferring(self) -> bool:
+        with self.state._lock:
+            return self.state.progress > 0.0
+
+    def _render_log(self, stdscr, theme, y: int, w: int) -> int:  # pragma: no cover
+        with self._log_lock:
+            entries = list(reversed(self._log))  # newest at top
+        if not entries:
+            try:
+                stdscr.addstr(y, 2, "(no transfers yet)"[: max(1, w - 4)],
+                              theme["dim"])
+            except curses.error:
+                pass
+            return y + 1
+        for i, row in enumerate(entries):
+            ts = datetime.fromtimestamp(int(row["ts"])).strftime("%H:%M:%S")
+            line = (
+                f"[{ts}] {row['name']} {row['bytes']}B from "
+                f"{row['peer_name']} -> {row['out_path']}"
+            )
+            try:
+                stdscr.addstr(y + i, 2, line[: max(1, w - 4)], 0)
+            except curses.error:
+                pass
+        return y + len(entries)
 
     def render(self, stdscr) -> None:  # pragma: no cover - curses I/O
-        self._check_finished()
         theme = _setup_theme()
         self._set_render_timeout(stdscr)
         h, w = stdscr.getmaxyx()
@@ -6144,53 +6419,67 @@ class ReceiveScreen(_TransferScreen):
                           theme["filter"])
         except curses.error:
             pass
-        if self.step == "mode":
-            peers = _load_known_peers()
+
+        if self.step == "blocked":
             try:
-                if peers:
-                    stdscr.addstr(2, 2,
-                                  f"press enter to wait for any of "
-                                  f"{len(peers)} pinned peer(s).",
-                                  0)
-                else:
-                    stdscr.addstr(2, 2,
-                                  "no pinned peers — open the Pair screen "
-                                  "first.",
-                                  theme["dim"])
+                stdscr.addstr(2, 2, f"error: {self.error}"[: max(1, w - 4)],
+                              theme["dim"])
             except curses.error:
                 pass
-            if self.error:
+            footer = "esc/q:back  ?:help"
+        else:
+            log_height = max(1, min(self.LOG_MAX, h - 7))
+            self._render_log(stdscr, theme, 2, w)
+            status_y = 2 + log_height + 1
+            if self._loop_exit.is_set():
+                msg = (
+                    f"listener stopped: {self._stopped_reason}"
+                    if self._stopped_reason else "listener stopped."
+                )
                 try:
-                    stdscr.addstr(5, 2, f"error: {self.error}"[: max(1, w - 4)],
+                    stdscr.addstr(status_y, 2, msg[: max(1, w - 4)],
+                                  theme["filter"])
+                except curses.error:
+                    pass
+                footer = "esc/q:back  ?:help"
+            elif self._is_transferring():
+                self._render_running(stdscr, theme, status_y, w)
+                self._check_tofu_modal(stdscr)
+                footer = "esc:cancel transfer  ?:help"
+            else:
+                try:
+                    stdscr.addstr(status_y, 2,
+                                  "waiting for transfers..."[: max(1, w - 4)],
                                   theme["dim"])
                 except curses.error:
                     pass
-            footer = "enter:start  esc/q:back  ?:help"
-        elif self.step == "running":
-            self._render_running(stdscr, theme, 2, w)
-            self._check_tofu_modal(stdscr)
-            footer = "esc:cancel  ?:help"
-        else:
-            self._render_done(stdscr, theme, 2, w)
-            footer = "esc/q:back  ?:help"
+                footer = "esc/q:back  ?:help"
         try:
             stdscr.addstr(h - 1, 0, footer[: max(1, w - 1)], theme["dim"])
         except curses.error:
             pass
 
     def handle_key(self, ch: int, stdscr=None):
-        if self.step == "mode":
-            if ch in (ord("q"), 3, 27):
-                return ScreenAction.BACK
-            if ch in (10, 13):
-                self._begin_recv()
-                return ScreenAction.CONTINUE
-            return ScreenAction.CONTINUE
-        if self.step == "running":
-            if ch in (27,):
+        if self.step == "blocked" or self._loop_exit.is_set():
+            if ch in (ord("q"), 3, 27, 10, 13):
+                self._loop_exit.set()
+                # Wake any in-flight long-poll so the worker thread can exit.
                 self._cancel_and_back()
+                return ScreenAction.BACK
             return ScreenAction.CONTINUE
-        if ch in (ord("q"), 3, 27, 10, 13):
+        if ch == 27:
+            if self._is_transferring():
+                # Cancel just this transfer; the worker loop re-arms.
+                self._cancel_and_back()
+                return ScreenAction.CONTINUE
+            # Idle: exit. cancel_event wakes the long-poll so the worker
+            # thread can see _loop_exit and return promptly.
+            self._loop_exit.set()
+            self._cancel_and_back()
+            return ScreenAction.BACK
+        if ch in (ord("q"), 3):
+            self._loop_exit.set()
+            self._cancel_and_back()
             return ScreenAction.BACK
         return ScreenAction.CONTINUE
 
@@ -6221,7 +6510,7 @@ class PairScreen(_TransferScreen):
             self.step = "done"
             with self.state._lock:
                 self.state.error = (
-                    "no relay configured — run `nomnom relay setup` first."
+                    "no relay configured — run `nomnom relay init` or `nomnom join <token>` first."
                 )
                 self.state.rc = 2
                 self.state.finished = True
@@ -6549,15 +6838,15 @@ def _build_rebuild_parser() -> argparse.ArgumentParser:
     return sub
 
 
-def _build_encrypt_parser() -> argparse.ArgumentParser:
+def _build_send_parser() -> argparse.ArgumentParser:
     sub = argparse.ArgumentParser(
-        prog="nomnom encrypt",
+        prog="nomnom send",
         description=(
             "Send a file to a pinned peer through the Cloudflare relay. "
             "Nothing is written to disk on this side. With exactly one peer "
             "pinned, auto-targets it. With multiple peers, pass --to PEER. "
-            "With zero peers, run `nomnom pair FILE` instead. The relay "
-            "sees only ciphertext."
+            "With zero peers, run `nomnom pair` instead. The relay sees "
+            "only ciphertext."
         ),
     )
     sub.add_argument("file", help="Path to the file to send.")
@@ -6576,14 +6865,21 @@ def _build_encrypt_parser() -> argparse.ArgumentParser:
     return sub
 
 
-def _build_decrypt_parser() -> argparse.ArgumentParser:
+def _build_receive_parser() -> argparse.ArgumentParser:
     sub = argparse.ArgumentParser(
-        prog="nomnom decrypt",
+        prog="nomnom receive",
         description=(
-            "Receive a file through the relay and write it into the current "
-            "directory. Long-polls every pinned peer's deterministic "
-            "rendezvous slot and accepts the first transfer. With zero "
-            "pinned peers, errors: run `nomnom pair` to add a new device."
+            "Long-poll every pinned peer's rendezvous slot and write each "
+            "received file into the current directory. Default: keep "
+            "listening (Ctrl-C exits). With zero pinned peers, errors: "
+            "run `nomnom pair` to add a new device."
+        ),
+    )
+    sub.add_argument(
+        "--once", action="store_true",
+        help=(
+            "Exit after the first received file. Use for scripting; the "
+            "default is to keep listening for subsequent transfers."
         ),
     )
     sub.add_argument(
@@ -6617,7 +6913,7 @@ def _build_pair_parser() -> argparse.ArgumentParser:
             "per-relay first-contact slot. Trust is gated by a TOFU "
             "fingerprint prompt on both sides. Both sides must share the "
             "relay HMAC secret. Send a file separately afterwards with "
-            "`nomnom encrypt` / `nomnom decrypt`."
+            "`nomnom send` / `nomnom receive`."
         ),
     )
     sub.add_argument(
@@ -6644,17 +6940,44 @@ def _build_relay_parser() -> argparse.ArgumentParser:
         "addresses (e.g., a local dev Worker). Default refuses them to "
         "block SSRF via a hostile relay blob."
     )
-    p_setup = sp.add_parser(
-        "setup", help="Interactive walkthrough: prompt URL + secret, save.",
+    p_init = sp.add_parser(
+        "init",
+        help=(
+            "First-device setup: prompt URL, generate HMAC secret, save, "
+            "print the wrangler commands to push the secret + deploy."
+        ),
     )
-    p_setup.add_argument("--allow-private", action="store_true", help=private_help)
-    p_set = sp.add_parser("set", help="Set the relay URL and secret directly.")
-    p_set.add_argument("url", help="Worker URL, e.g. https://relay.workers.dev")
-    p_set.add_argument("--secret", required=True, help="Shared HMAC secret.")
-    p_set.add_argument("--allow-private", action="store_true", help=private_help)
+    p_init.add_argument("--allow-private", action="store_true", help=private_help)
     sp.add_parser("test", help="Round-trip check: hits /health then PUT + GET.")
-    sp.add_parser("show", help="Print current config (secret redacted).")
+    p_show = sp.add_parser("show", help="Print current config (secret redacted).")
+    p_show.add_argument(
+        "--token", action="store_true",
+        help=(
+            "Print the shareable `host#secret` join token for `nomnom join` "
+            "on another device. The secret is NOT redacted."
+        ),
+    )
     sp.add_parser("clear", help="Delete relay.json after confirmation.")
+    return sub
+
+
+def _build_join_parser() -> argparse.ArgumentParser:
+    sub = argparse.ArgumentParser(
+        prog="nomnom join",
+        description=(
+            "Join an existing nomnom relay using a `host#secret` token "
+            "produced by `nomnom relay show --token` on the first device. "
+            "Self-tests the relay before saving."
+        ),
+    )
+    sub.add_argument("token", help="Join token of the form `host#secret`.")
+    sub.add_argument(
+        "--allow-private", action="store_true",
+        help=(
+            "Allow tokens whose host resolves to a private / loopback / "
+            "link-local address. Default refuses to block SSRF."
+        ),
+    )
     return sub
 
 
@@ -6724,13 +7047,13 @@ _DISPATCH = {
         _build_rebuild_parser,
         lambda a: cmd_rebuild(a.bundle, a.name),
     ),
-    "encrypt": (
-        _build_encrypt_parser,
-        lambda a: cmd_encrypt(a.file, to=a.to, trust_new=a.trust_new),
+    "send": (
+        _build_send_parser,
+        lambda a: cmd_send(a.file, to=a.to, trust_new=a.trust_new),
     ),
-    "decrypt": (
-        _build_decrypt_parser,
-        lambda a: cmd_decrypt(trust_new=a.trust_new),
+    "receive": (
+        _build_receive_parser,
+        lambda a: cmd_receive(once=a.once, trust_new=a.trust_new),
     ),
     "pair": (
         _build_pair_parser,
@@ -6739,6 +7062,10 @@ _DISPATCH = {
     "relay": (
         _build_relay_parser,
         cmd_relay,
+    ),
+    "join": (
+        _build_join_parser,
+        cmd_join,
     ),
     "peers": (
         _build_peers_parser,
@@ -6840,11 +7167,12 @@ def main() -> int:
             "subcommands: register / unregister edit the auto-managed "
             "extension lists; commit / pr / review bundle git context for "
             "an LLM; rebuild reconstructs a file tree from a bundle .txt; "
-            "pair adds a new device through the relay; encrypt / decrypt "
-            "move a file between two pinned machines via the Cloudflare "
-            "Worker relay you deploy yourself (encrypt sends, decrypt "
-            "receives); relay manages the relay config; peers manages "
-            "pinned identities; reset wipes ~/.config/nomnom/. "
+            "relay init sets up a new relay on this machine; join <token> "
+            "joins an existing relay from another device; pair adds a new "
+            "device through the relay; send / receive move files between "
+            "pinned machines via the Cloudflare Worker relay you deploy "
+            "yourself (receive listens until Ctrl-C); peers manages pinned "
+            "identities; reset wipes ~/.config/nomnom/. "
             "run `nomnom <subcommand> --help`."
         ),
     )
