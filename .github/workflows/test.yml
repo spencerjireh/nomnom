@@ -48,6 +48,17 @@ jobs:
         run: npm test
       - name: Build
         run: npm run build
+      - name: Install Playwright browser
+        run: npx playwright install --with-deps chromium
+      - name: E2E UI smoke (Playwright)
+        run: npm run test:e2e
+      - name: Upload Playwright report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: nomnom-web/playwright-report/
+          retention-days: 7
 
   fixtures-no-drift:
     # Regenerate the cross-language crypto fixtures from nomnom.py and fail if they
