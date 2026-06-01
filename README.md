@@ -157,6 +157,14 @@ nomnom peers nickname dev-abc spencer   # short alias for --to
 nomnom peers forget spencer-mac      # drop a pin (then `nomnom pair` to re-pair)
 ```
 
+### From a browser
+
+[`nomnom-web/`](nomnom-web/README.md) is a browser client (Vite + React) that
+sends / receives / pairs against the same relay, fully interoperable with the CLI —
+its crypto is a byte-for-byte TypeScript port of `nomnom.py`, verified by committed
+cross-language fixtures. Deployed to Cloudflare Pages; the relay Worker allowlists
+its origin for CORS.
+
 <details>
 <summary><b>Trust on first use</b></summary>
 

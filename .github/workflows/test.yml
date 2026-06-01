@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
 
+# All jobs only read the repo; scope the token to least privilege.
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ${{ matrix.os }}
@@ -24,3 +28,39 @@ jobs:
         run: pip install -r requirements-dev.txt
       - name: Run tests
         run: pytest -v
+
+  web:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: nomnom-web
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: nomnom-web/package-lock.json
+      - run: npm ci
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Crypto interop vectors
+        run: npm test
+      - name: Build
+        run: npm run build
+
+  fixtures-no-drift:
+    # Regenerate the cross-language crypto fixtures from nomnom.py and fail if they
+    # differ from what's committed — keeps the Python source of truth and the TS
+    # port in lockstep.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v5
+      - name: Regenerate fixtures
+        run: uv run python tools/gen_crypto_fixtures.py --out nomnom-web/test/fixtures/crypto-vectors.json
+      - name: Assert no drift
+        run: git diff --exit-code -- nomnom-web/test/fixtures/crypto-vectors.json

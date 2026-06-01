@@ -1,0 +1,10 @@
+# Cloudflare Pages serves these headers. Strict CSP keeps the origin script-clean,
+# which is the mitigation for the accepted "secret + key live in localStorage"
+# tradeoff (no third-party scripts can read them). connect-src must allow the
+# relay; worker-src allows the crypto Web Worker; style-src 'unsafe-inline' covers
+# React inline style attributes (e.g. the progress-bar width).
+/*
+  Content-Security-Policy: default-src 'self'; connect-src 'self' https://relay.spencerjireh.com; worker-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: no-referrer
+  Permissions-Policy: clipboard-read=(), geolocation=(), microphone=(), camera=()
