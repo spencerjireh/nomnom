@@ -3645,6 +3645,62 @@ class TestCmdReceiveNoFeed:
         assert "no feed named 'ghost'" in capsys.readouterr().err
 
 
+class TestFeedTofu:
+    def test_check_auto_pins_with_trust_new(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        card = {"member_id": "m1", "identity_pubkey": "aa" * 32, "name": "alice"}
+        assert nomnom._tofu_check_feed_member(card, trust_new=True) is True
+        assert nomnom._find_pinned_sig("aa" * 32) is not None
+
+    def test_check_silent_on_already_pinned(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        nomnom._save_feed_pin("aa" * 32, "alice")
+        # input() must not be called.
+        monkeypatch.setattr(
+            "builtins.input",
+            lambda *a, **k: pytest.fail("TOFU prompt fired on already-pinned"),
+        )
+        card = {"member_id": "m1", "identity_pubkey": "aa" * 32, "name": "alice"}
+        assert nomnom._tofu_check_feed_member(card) is True
+
+    def test_check_prompts_and_accepts(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        monkeypatch.setattr("builtins.input", lambda *a, **k: "y")
+        card = {"member_id": "m1", "identity_pubkey": "aa" * 32, "name": "alice"}
+        assert nomnom._tofu_check_feed_member(card) is True
+        assert nomnom._find_pinned_sig("aa" * 32) is not None
+
+    def test_check_prompts_and_declines(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        monkeypatch.setattr("builtins.input", lambda *a, **k: "n")
+        card = {"member_id": "m1", "identity_pubkey": "aa" * 32, "name": "alice"}
+        assert nomnom._tofu_check_feed_member(card) is False
+        assert nomnom._find_pinned_sig("aa" * 32) is None
+
+    def test_check_eof_treated_as_decline(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+
+        def raise_eof(*_a, **_k):
+            raise EOFError
+
+        monkeypatch.setattr("builtins.input", raise_eof)
+        card = {"member_id": "m1", "identity_pubkey": "aa" * 32, "name": "alice"}
+        assert nomnom._tofu_check_feed_member(card) is False
+
+    def test_pin_global_across_feeds(self, tmp_path, monkeypatch):
+        # Pinning under one feed makes the identity recognized in any later feed.
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        card_feed_a = {"member_id": "alice-in-a", "identity_pubkey": "aa" * 32, "name": "alice"}
+        card_feed_b = {"member_id": "alice-in-b", "identity_pubkey": "aa" * 32, "name": "alice"}
+        nomnom._tofu_check_feed_member(card_feed_a, trust_new=True)
+        # Different feed, same identity → silent (input must not fire).
+        monkeypatch.setattr(
+            "builtins.input",
+            lambda *a, **k: pytest.fail("TOFU re-prompted across feeds"),
+        )
+        assert nomnom._tofu_check_feed_member(card_feed_b) is True
+
+
 class TestCmdSendFeed:
     @pytest.fixture
     def env(self, tmp_path, monkeypatch):

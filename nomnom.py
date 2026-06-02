@@ -3045,6 +3045,91 @@ def _tofu_check_join(peer: dict) -> bool:
     return True
 
 
+# ----- feed TOFU (global identity pinning, keyed by Ed25519 sig_pub) -----
+#
+# Feed posts are signed by the sender's Ed25519 identity key. We pin those
+# identities globally (across all feeds) so the same person stays trusted no
+# matter how many feeds they join. The synthetic peer id is `feed-<sig_pub16>`
+# so v2-pinned identities don't collide with any legacy DH pins still on disk.
+
+
+def _feed_peer_id(sig_pub_hex: str) -> str:
+    return f"feed-{sig_pub_hex[:16]}"
+
+
+def _find_pinned_sig(sig_pub_hex: str) -> tuple[str, dict] | None:
+    """Return (peer_id, record) for an existing global pin on this sig_pub."""
+    if not sig_pub_hex:
+        return None
+    for pid, rec in _load_known_peers().items():
+        if isinstance(rec, dict) and rec.get("sig_pub") == sig_pub_hex:
+            return pid, rec
+    return None
+
+
+def _save_feed_pin(sig_pub_hex: str, name: str) -> None:
+    """Pin (or refresh) a feed member's Ed25519 identity globally."""
+    peers = _load_known_peers()
+    existing = _find_pinned_sig(sig_pub_hex)
+    if existing is not None:
+        pid, rec = existing
+        rec["name"] = name
+        peers[pid] = rec
+    else:
+        pid = _feed_peer_id(sig_pub_hex)
+        peers[pid] = {
+            "name": name,
+            "sig_pub": sig_pub_hex,
+            "first_seen": int(time.time()),
+        }
+    _save_known_peers(peers)
+
+
+def _tofu_check_feed_member(
+    card: dict, *, trust_new: bool = False,
+) -> bool:
+    """Run TOFU on a feed member card. Returns True if trusted, False if declined.
+
+    The card looks like {member_id, identity_pubkey, name}. We pin globally by
+    identity_pubkey (sig_pub_hex). On first-ever sighting we either auto-pin
+    (trust_new) or prompt; subsequent feeds where the same identity appears
+    are silent. A mismatch (same person's sig_pub seen with a DIFFERENT
+    fingerprint we already pinned) can't happen since the pin IS keyed by
+    sig_pub — a different sig_pub is a different identity from our POV.
+    """
+    sig_pub = card.get("identity_pubkey")
+    name = card.get("name") or "(no name)"
+    if not isinstance(sig_pub, str) or not sig_pub:
+        return False
+    if _find_pinned_sig(sig_pub) is not None:
+        return True
+    if trust_new:
+        _save_feed_pin(sig_pub, name)
+        if not _in_tui():
+            sys.stderr.write(
+                f"audit: TOFU pinned {name!r} (fingerprint "
+                f"{_ik_fingerprint(sig_pub)})\n",
+            )
+        return True
+    _tofu_assert_main_thread()
+    sys.stderr.write("\n")
+    sys.stderr.write(f"  first contact with {name!r}.\n")
+    sys.stderr.write(f"    fingerprint: {_ik_fingerprint(sig_pub)}\n")
+    sys.stderr.write(
+        "  verify out-of-band if it matters.\n",
+    )
+    sys.stderr.write("  trust and pin this device? [y/N]: ")
+    sys.stderr.flush()
+    try:
+        ans = input().strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return False
+    if ans in ("y", "yes"):
+        _save_feed_pin(sig_pub, name)
+        return True
+    return False
+
+
 # ---------- feed crypto ----------
 #
 # Feeds v2 transport.
@@ -5059,6 +5144,40 @@ def _resolve_target_feed(feed_name: str | None) -> Feed | None:
     return feed
 
 
+def _refresh_roster_with_tofu(
+    feed: Feed, host: str, feed_key: bytes, *, trust_new: bool,
+) -> list[dict] | None:
+    """Fetch the live roster and prompt TOFU on any newly-seen identities.
+
+    Returns the fresh roster on success, None if the relay errored. Updates
+    `feed.members_cache` in place but does NOT persist — the caller decides
+    when to write feeds.json.
+    """
+    try:
+        resp = _relay_list_members(host, feed.feed_id, feed_key)
+    except NomnomError as e:
+        sys.stderr.write(f"error: {e}\n")
+        return None
+    roster = resp.get("members") or []
+    known_in_cache = {
+        m.get("identity_pubkey")
+        for m in (feed.members_cache or [])
+        if isinstance(m, dict)
+    }
+    for m in roster:
+        if not isinstance(m, dict):
+            continue
+        if m.get("member_id") == feed.member_id:
+            continue
+        sig_pub = m.get("identity_pubkey")
+        if sig_pub in known_in_cache:
+            # Seen locally before; either already pinned or previously declined.
+            continue
+        _tofu_check_feed_member(m, trust_new=trust_new)
+    feed.members_cache = roster
+    return roster
+
+
 def cmd_send(path: str, *, feed: str | None = None, trust_new: bool = False) -> int:
     """Broadcast a file into the default feed (or --feed)."""
     p = Path(path).expanduser()
@@ -5075,16 +5194,10 @@ def cmd_send(path: str, *, feed: str | None = None, trust_new: bool = False) -> 
     feed_key = _feed_key_from_token(target.feed_token)
     host, _ = _parse_feed_url(target.url)
 
-    # Always-fresh roster on send: lets us print accurate member counts and
-    # ensures we'd notice a new joiner with an unpinned identity (TOFU prompt
-    # comes in slice 6).
-    try:
-        roster_resp = _relay_list_members(host, target.feed_id, feed_key)
-    except NomnomError as e:
-        sys.stderr.write(f"error: {e}\n")
+    # Always-fresh roster on send: accurate member counts + TOFU on new identities.
+    roster = _refresh_roster_with_tofu(target, host, feed_key, trust_new=trust_new)
+    if roster is None:
         return 1
-    roster = roster_resp.get("members") or []
-    target.members_cache = roster
     others = [m for m in roster if m.get("member_id") != target.member_id]
     if not others:
         sys.stderr.write(
@@ -5191,6 +5304,18 @@ def cmd_receive(
 
     last_ts = target.last_post_ts
     while True:
+        # Roster refresh + TOFU prompts before each slot long-poll. Up to a
+        # 30s lag between a new member joining and the prompt firing, but
+        # interleaving keeps the I/O on a single thread.
+        roster = _refresh_roster_with_tofu(
+            target, host, feed_key, trust_new=trust_new,
+        )
+        if roster is not None:
+            cfg_now = _load_feeds_config()
+            existing = _find_feed(cfg_now, target.name)
+            if existing is not None:
+                existing.members_cache = roster
+                _save_feeds_config(cfg_now)
         try:
             slots = _relay_list_feed_slots(
                 host, target.feed_id, feed_key,
