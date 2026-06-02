@@ -5122,3 +5122,252 @@ class TestCmdReset:
         assert rc == 0
         assert "nothing to reset" in capsys.readouterr().err.lower()
 
+
+# ---------- feed crypto (v2) ----------
+
+
+class TestHkdf:
+    def test_known_answer_rfc5869_test_case_1(self):
+        # RFC 5869 §A.1 test case 1 for HKDF-SHA256.
+        ikm = bytes.fromhex("0b" * 22)
+        salt = bytes.fromhex("000102030405060708090a0b0c")
+        info = bytes.fromhex("f0f1f2f3f4f5f6f7f8f9")
+        out = nomnom._hkdf(salt=salt, ikm=ikm, info=info, length=42)
+        assert out.hex() == (
+            "3cb25f25faacd57a90434f64d0362f2a"
+            "2d2d0a90cf1a5a4c5db02d56ecc4c5bf"
+            "34007208d5b887185865"
+        )
+
+    def test_deterministic(self):
+        a = nomnom._hkdf(salt=b"s", ikm=b"k", info=b"i", length=32)
+        b = nomnom._hkdf(salt=b"s", ikm=b"k", info=b"i", length=32)
+        assert a == b
+
+    def test_length_varies(self):
+        full = nomnom._hkdf(salt=b"s", ikm=b"k", info=b"i", length=64)
+        half = nomnom._hkdf(salt=b"s", ikm=b"k", info=b"i", length=32)
+        assert full[:32] == half
+
+    def test_info_changes_output(self):
+        a = nomnom._hkdf(salt=b"s", ikm=b"k", info=b"x", length=32)
+        b = nomnom._hkdf(salt=b"s", ikm=b"k", info=b"y", length=32)
+        assert a != b
+
+
+class TestEd25519:
+    def test_rfc8032_test_vector_1(self):
+        # RFC 8032 §7.1 test 1: empty message.
+        seed = bytes.fromhex(
+            "9d61b19deffd5a60ba844af492ec2cc4"
+            "4449c5697b326919703bac031cae7f60"
+        )
+        expected_pub = bytes.fromhex(
+            "d75a980182b10ab7d54bfed3c964073a"
+            "0ee172f3daa62325af021a68f707511a"
+        )
+        expected_sig = bytes.fromhex(
+            "e5564300c360ac729086e2cc806e828a"
+            "84877f1eb8e5d974d873e06522490155"
+            "5fb8821590a33bacc61e39701cf9b46b"
+            "d25bf5f0595bbe24655141438e7a100b"
+        )
+        pub = nomnom.ed25519_pub_from_seed(seed)
+        assert pub == expected_pub
+        sig = nomnom.ed25519_sign(b"", seed)
+        assert sig == expected_sig
+        assert nomnom.ed25519_verify(b"", sig, pub)
+
+    def test_sign_verify_roundtrip(self):
+        seed, pub = nomnom.ed25519_keypair()
+        msg = b"hello feeds"
+        sig = nomnom.ed25519_sign(msg, seed)
+        assert nomnom.ed25519_verify(msg, sig, pub)
+
+    def test_verify_rejects_tampered_message(self):
+        seed, pub = nomnom.ed25519_keypair()
+        sig = nomnom.ed25519_sign(b"original", seed)
+        assert not nomnom.ed25519_verify(b"tampered", sig, pub)
+
+    def test_verify_rejects_wrong_key(self):
+        seed1, _ = nomnom.ed25519_keypair()
+        _, pub2 = nomnom.ed25519_keypair()
+        sig = nomnom.ed25519_sign(b"msg", seed1)
+        assert not nomnom.ed25519_verify(b"msg", sig, pub2)
+
+    def test_verify_rejects_bad_sizes(self):
+        seed, pub = nomnom.ed25519_keypair()
+        sig = nomnom.ed25519_sign(b"msg", seed)
+        assert not nomnom.ed25519_verify(b"msg", sig[:63], pub)
+        assert not nomnom.ed25519_verify(b"msg", sig, pub[:31])
+
+    def test_keygen_yields_distinct_keys(self):
+        a, _ = nomnom.ed25519_keypair()
+        b, _ = nomnom.ed25519_keypair()
+        assert a != b
+
+
+class TestFeedKeyDerivation:
+    def test_deterministic(self):
+        token = "k4n2pX9qLm3T"
+        a = nomnom._feed_key_from_token(token)
+        b = nomnom._feed_key_from_token(token)
+        assert a == b
+        assert len(a) == 32
+
+    def test_different_tokens_yield_different_keys(self):
+        a = nomnom._feed_key_from_token("k4n2pX9qLm3T")
+        b = nomnom._feed_key_from_token("k4n2pX9qLm3U")
+        assert a != b
+
+    def test_rejects_empty_token(self):
+        with pytest.raises(ValueError):
+            nomnom._feed_key_from_token("")
+
+    def test_rejects_non_base64_token(self):
+        with pytest.raises(ValueError):
+            nomnom._feed_key_from_token("not!base64!at!all")
+
+    def test_request_mac_matches_worker_scheme(self):
+        # Same shape the Worker's verifyFeedKey expects.
+        key = b"\x01" * 32
+        mac1 = nomnom._feed_request_mac(key, "GET", "/feeds/abc/meta", 100)
+        mac2 = nomnom._feed_request_mac(key, "GET", "/feeds/abc/meta", 100)
+        assert mac1 == mac2
+        mac3 = nomnom._feed_request_mac(key, "GET", "/feeds/abc/meta", 101)
+        assert mac3 != mac1
+
+
+class TestFeedSeal:
+    def _seed_and_pub(self) -> tuple[str, str]:
+        seed, pub = nomnom.ed25519_keypair()
+        return seed.hex(), pub.hex()
+
+    def test_seal_open_roundtrip(self):
+        feed_key = nomnom._feed_key_from_token("k4n2pX9qLm3T")
+        sig_priv, sig_pub = self._seed_and_pub()
+        body = b"file contents here"
+        blob = nomnom.feed_seal(
+            feed_key=feed_key,
+            feed_id="k4n2pX9qLm3T",
+            sender_member_id="mem-abc",
+            sender_sig_priv_hex=sig_priv,
+            sender_sig_pub_hex=sig_pub,
+            filename="hello.txt",
+            body=body,
+        )
+        header, recovered = nomnom.feed_open(
+            feed_key=feed_key,
+            feed_id="k4n2pX9qLm3T",
+            blob=blob,
+        )
+        assert recovered == body
+        assert header["fn"] == "hello.txt"
+        assert header["smid"] == "mem-abc"
+        assert header["sik"] == sig_pub
+        assert header["fs"] == len(body)
+
+    def test_open_rejects_wrong_feed_key(self):
+        feed_key = nomnom._feed_key_from_token("k4n2pX9qLm3T")
+        wrong_key = nomnom._feed_key_from_token("k4n2pX9qLm3U")
+        sig_priv, sig_pub = self._seed_and_pub()
+        blob = nomnom.feed_seal(
+            feed_key=feed_key,
+            feed_id="k4n2pX9qLm3T",
+            sender_member_id="mem-abc",
+            sender_sig_priv_hex=sig_priv,
+            sender_sig_pub_hex=sig_pub,
+            filename="hello.txt",
+            body=b"data",
+        )
+        with pytest.raises(ValueError, match="authentication failed"):
+            nomnom.feed_open(feed_key=wrong_key, feed_id="k4n2pX9qLm3T", blob=blob)
+
+    def test_open_rejects_wrong_feed_id(self):
+        feed_key = nomnom._feed_key_from_token("k4n2pX9qLm3T")
+        sig_priv, sig_pub = self._seed_and_pub()
+        blob = nomnom.feed_seal(
+            feed_key=feed_key,
+            feed_id="k4n2pX9qLm3T",
+            sender_member_id="mem-abc",
+            sender_sig_priv_hex=sig_priv,
+            sender_sig_pub_hex=sig_pub,
+            filename="hello.txt",
+            body=b"data",
+        )
+        # Decryption succeeds (same feed_key), but the transcript signature
+        # binds to feed_id "k4n2pX9qLm3T" — opening under a different feed_id
+        # fails signature verification.
+        with pytest.raises(ValueError, match="sender signature failed"):
+            nomnom.feed_open(feed_key=feed_key, feed_id="other-feed", blob=blob)
+
+    def test_open_rejects_body_tamper(self):
+        feed_key = nomnom._feed_key_from_token("k4n2pX9qLm3T")
+        sig_priv, sig_pub = self._seed_and_pub()
+        blob = nomnom.feed_seal(
+            feed_key=feed_key,
+            feed_id="k4n2pX9qLm3T",
+            sender_member_id="mem-abc",
+            sender_sig_priv_hex=sig_priv,
+            sender_sig_pub_hex=sig_pub,
+            filename="hello.txt",
+            body=b"data",
+        )
+        tampered = bytearray(blob)
+        tampered[-1] ^= 0xFF
+        with pytest.raises(ValueError, match="authentication failed"):
+            nomnom.feed_open(
+                feed_key=feed_key, feed_id="k4n2pX9qLm3T", blob=bytes(tampered),
+            )
+
+    def test_open_rejects_truncated(self):
+        feed_key = nomnom._feed_key_from_token("k4n2pX9qLm3T")
+        with pytest.raises(ValueError, match="too short"):
+            nomnom.feed_open(
+                feed_key=feed_key, feed_id="k4n2pX9qLm3T", blob=b"\x00" * 5,
+            )
+
+    def test_open_with_expected_member_id_match(self):
+        feed_key = nomnom._feed_key_from_token("k4n2pX9qLm3T")
+        sig_priv, sig_pub = self._seed_and_pub()
+        blob = nomnom.feed_seal(
+            feed_key=feed_key,
+            feed_id="k4n2pX9qLm3T",
+            sender_member_id="mem-abc",
+            sender_sig_priv_hex=sig_priv,
+            sender_sig_pub_hex=sig_pub,
+            filename="hello.txt",
+            body=b"data",
+        )
+        nomnom.feed_open(
+            feed_key=feed_key, feed_id="k4n2pX9qLm3T", blob=blob,
+            expect_member_id="mem-abc",
+        )
+        with pytest.raises(ValueError, match="sender_member_id mismatch"):
+            nomnom.feed_open(
+                feed_key=feed_key, feed_id="k4n2pX9qLm3T", blob=blob,
+                expect_member_id="mem-other",
+            )
+
+
+class TestIdentitySigKeys:
+    def test_load_identity_adds_sig_keys(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        ident = nomnom._load_identity()
+        assert "sig_priv" in ident
+        assert "sig_pub" in ident
+        assert len(bytes.fromhex(ident["sig_priv"])) == 32
+        assert len(bytes.fromhex(ident["sig_pub"])) == 32
+        # Pub key is the deterministic Ed25519 derivation of the priv seed.
+        derived = nomnom.ed25519_pub_from_seed(bytes.fromhex(ident["sig_priv"]))
+        assert derived.hex() == ident["sig_pub"]
+
+    def test_load_identity_preserves_sig_keys_across_calls(
+        self, tmp_path, monkeypatch,
+    ):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        first = nomnom._load_identity()
+        second = nomnom._load_identity()
+        assert first["sig_priv"] == second["sig_priv"]
+        assert first["sig_pub"] == second["sig_pub"]
+

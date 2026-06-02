@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import ast
 import base64
+import binascii
 import contextlib
 import curses
 import enum
@@ -2470,6 +2471,166 @@ def _pick_decrypted_path(parent: Path, name: str) -> Path:
     return _unique_path(parent / name, start=1)
 
 
+# ----- HKDF (RFC 5869) -----
+
+def _hkdf(*, salt: bytes, ikm: bytes, info: bytes, length: int) -> bytes:
+    """HKDF-SHA256: Extract-then-Expand. Returns `length` bytes (<=255*32)."""
+    if length > 255 * 32:
+        raise ValueError("hkdf: length too large")
+    prk = hmac.new(salt, ikm, hashlib.sha256).digest()
+    out = b""
+    t = b""
+    counter = 1
+    while len(out) < length:
+        t = hmac.new(prk, t + info + bytes([counter]), hashlib.sha256).digest()
+        out += t
+        counter += 1
+    return out[:length]
+
+
+# ----- Ed25519 (RFC 8032 reference, pure Python) -----
+#
+# A minimal Ed25519 implementation for sender authentication on feed posts.
+# Sign / verify take ~50ms each on CPython. The interface (sign / verify
+# / pub-from-seed) is a strict subset of PyNaCl's signing module so the
+# logic is easy to spot-check against the spec.
+
+_ED_P = 2 ** 255 - 19
+_ED_L = 2 ** 252 + 27742317777372353535851937790883648493
+_ED_D = -121665 * pow(121666, _ED_P - 2, _ED_P) % _ED_P
+_ED_I = pow(2, (_ED_P - 1) // 4, _ED_P)
+
+
+def _ed_h(m: bytes) -> bytes:
+    return hashlib.sha512(m).digest()
+
+
+def _ed_recover_x(y: int, sign: int) -> int | None:
+    if y >= _ED_P:
+        return None
+    x2 = (y * y - 1) * pow(_ED_D * y * y + 1, _ED_P - 2, _ED_P) % _ED_P
+    if x2 == 0:
+        return 0 if sign == 0 else None
+    x = pow(x2, (_ED_P + 3) // 8, _ED_P)
+    if (x * x - x2) % _ED_P != 0:
+        x = x * _ED_I % _ED_P
+    if (x * x - x2) % _ED_P != 0:
+        return None
+    if (x & 1) != sign:
+        x = _ED_P - x
+    return x
+
+
+# Generator B = (Bx, By) on curve -x^2 + y^2 = 1 + d x^2 y^2 (Edwards).
+_ED_BY = 4 * pow(5, _ED_P - 2, _ED_P) % _ED_P
+_ED_BX = _ed_recover_x(_ED_BY, 0)
+if _ED_BX is None:
+    raise RuntimeError("ed25519: failed to recover base point x")
+_ED_B = (_ED_BX % _ED_P, _ED_BY % _ED_P, 1, _ED_BX * _ED_BY % _ED_P)
+
+
+def _ed_point_add(P, Q):
+    # Extended Edwards coordinates: (X, Y, Z, T). Affine point is (X/Z, Y/Z).
+    x1, y1, z1, t1 = P
+    x2, y2, z2, t2 = Q
+    a = (y1 - x1) * (y2 - x2) % _ED_P
+    b = (y1 + x1) * (y2 + x2) % _ED_P
+    c = 2 * t1 * t2 * _ED_D % _ED_P
+    d = 2 * z1 * z2 % _ED_P
+    e = b - a
+    f = d - c
+    g = d + c
+    h = b + a
+    return (e * f % _ED_P, g * h % _ED_P, f * g % _ED_P, e * h % _ED_P)
+
+
+def _ed_scalar_mult(P, n: int):
+    Q = (0, 1, 1, 0)  # identity
+    while n > 0:
+        if n & 1:
+            Q = _ed_point_add(Q, P)
+        P = _ed_point_add(P, P)
+        n >>= 1
+    return Q
+
+
+def _ed_point_encode(P) -> bytes:
+    x, y, z, _ = P
+    zi = pow(z, _ED_P - 2, _ED_P)
+    x = x * zi % _ED_P
+    y = y * zi % _ED_P
+    return ((y & ((1 << 255) - 1)) | ((x & 1) << 255)).to_bytes(32, "little")
+
+
+def _ed_point_decode(s: bytes):
+    if len(s) != 32:
+        return None
+    raw = int.from_bytes(s, "little")
+    sign = (raw >> 255) & 1
+    y = raw & ((1 << 255) - 1)
+    x = _ed_recover_x(y, sign)
+    if x is None:
+        return None
+    return (x, y, 1, x * y % _ED_P)
+
+
+def _ed_clamp(seed_hash: bytes) -> int:
+    a = bytearray(seed_hash[:32])
+    a[0] &= 248
+    a[31] &= 127
+    a[31] |= 64
+    return int.from_bytes(a, "little")
+
+
+def ed25519_pub_from_seed(seed: bytes) -> bytes:
+    """Derive the 32-byte public key from a 32-byte Ed25519 seed."""
+    if len(seed) != 32:
+        raise ValueError("ed25519: seed must be 32 bytes")
+    h = _ed_h(seed)
+    a = _ed_clamp(h)
+    return _ed_point_encode(_ed_scalar_mult(_ED_B, a))
+
+
+def ed25519_keypair() -> tuple[bytes, bytes]:
+    """Return (seed, pub) where seed is 32 random bytes, pub is 32 bytes."""
+    seed = secrets.token_bytes(32)
+    return seed, ed25519_pub_from_seed(seed)
+
+
+def ed25519_sign(msg: bytes, seed: bytes) -> bytes:
+    """Sign `msg` under the 32-byte Ed25519 seed. Returns 64 bytes."""
+    if len(seed) != 32:
+        raise ValueError("ed25519: seed must be 32 bytes")
+    h = _ed_h(seed)
+    a = _ed_clamp(h)
+    prefix = h[32:64]
+    pub = _ed_point_encode(_ed_scalar_mult(_ED_B, a))
+    r = int.from_bytes(_ed_h(prefix + msg), "little") % _ED_L
+    R = _ed_scalar_mult(_ED_B, r)
+    R_enc = _ed_point_encode(R)
+    k = int.from_bytes(_ed_h(R_enc + pub + msg), "little") % _ED_L
+    s = (r + k * a) % _ED_L
+    return R_enc + s.to_bytes(32, "little")
+
+
+def ed25519_verify(msg: bytes, sig: bytes, pub: bytes) -> bool:
+    """Verify a 64-byte signature on `msg` under a 32-byte pubkey."""
+    if len(sig) != 64 or len(pub) != 32:
+        return False
+    R = _ed_point_decode(sig[:32])
+    A = _ed_point_decode(pub)
+    if R is None or A is None:
+        return False
+    s = int.from_bytes(sig[32:64], "little")
+    if s >= _ED_L:
+        return False
+    k = int.from_bytes(_ed_h(sig[:32] + pub + msg), "little") % _ED_L
+    sB = _ed_scalar_mult(_ED_B, s)
+    kA = _ed_scalar_mult(A, k)
+    rhs = _ed_point_add(R, kA)
+    return _ed_point_encode(sB) == _ed_point_encode(rhs)
+
+
 # ----- identity + known-peer (TOFU) store -----
 
 def _nomnom_config_dir() -> Path:
@@ -2483,8 +2644,13 @@ def _nomnom_config_dir() -> Path:
 def _load_identity() -> dict:
     """Return this machine's identity, creating/upgrading it on first use.
 
-    Identity is {device_id, name, ik_priv, ik_pub} where ik_* is a long-term
-    Diffie-Hellman keypair (hex) used to authenticate transfers under TOFU.
+    Identity holds:
+      - device_id, name
+      - sig_priv / sig_pub: Ed25519 seed + public key (hex), used to sign
+        outgoing feed posts so receivers can verify a post under the URL-token
+        crypto came from this machine and not from another URL holder.
+      - ik_priv / ik_pub: long-term DH keypair (hex), kept for backwards
+        compatibility with v1 transfer code; unused by feeds v2.
     """
     path = _nomnom_config_dir() / "identity.json"
     ident: dict = {}
@@ -2505,6 +2671,11 @@ def _load_identity() -> dict:
         priv, pub = _dh_keypair()
         ident["ik_priv"] = format(priv, "x")
         ident["ik_pub"] = format(pub, "x")
+        changed = True
+    if not ident.get("sig_priv") or not ident.get("sig_pub"):
+        seed, pub = ed25519_keypair()
+        ident["sig_priv"] = seed.hex()
+        ident["sig_pub"] = pub.hex()
         changed = True
     if changed:
         try:
@@ -2872,6 +3043,275 @@ def _tofu_check_join(peer: dict) -> bool:
             peer["name"], _known_peer_ik(peer["id"]), peer["ik"],
         )
     return True
+
+
+# ---------- feed crypto ----------
+#
+# Feeds v2 transport.
+#
+# The user-facing URL is host/f/<token>. The token is the credential, and
+# every member of the feed derives the same symmetric AEAD key from it. The
+# Worker authenticates per-request signatures the same way (HMAC keyed by the
+# feed_key), so anyone holding the URL can talk to the Worker for that feed
+# but nothing else on the relay.
+#
+# Sender authenticity comes from a separate Ed25519 signature over each post's
+# transcript: posts unsigned (or signed by a key that doesn't match the
+# claimed member's pinned identity) are dropped.
+
+_FEED_MAGIC = b"NMNF\x01"  # 4-byte tag + 1-byte format version
+_FEED_NONCE_LEN = 12
+_FEED_MAC_LEN = 32
+_FEED_HEADER_LEN = len(_FEED_MAGIC) + _FEED_NONCE_LEN + _FEED_MAC_LEN
+_FEED_KEY_SALT = b"nomnom-feed-v1"
+_FEED_ENC_INFO = b"nomnom-feed-enc"
+_FEED_MAC_INFO = b"nomnom-feed-mac"
+_FEED_SIG_DOMAIN = b"nomnom-feed-sig-v1"
+
+
+def _urlsafe_b64decode_loose(s: str) -> bytes:
+    """Decode URL-safe base64, tolerating missing padding."""
+    s = s.strip()
+    pad = (-len(s)) % 4
+    return base64.urlsafe_b64decode(s + "=" * pad)
+
+
+_FEED_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{8,32}$")
+
+
+def _feed_key_from_token(token: str) -> bytes:
+    """Derive the 32-byte feed key from the URL token.
+
+    Mirrors the Worker's HKDF-SHA256 derivation: salt=`nomnom-feed-v1`,
+    ikm=raw bytes of the URL token, info=the token's string form. Both ends
+    must agree byte-for-byte; the Worker derives the same key on every
+    /feeds/:id/* request to verify signatures.
+    """
+    if not token:
+        raise ValueError("feed token must not be empty")
+    if not _FEED_TOKEN_RE.match(token):
+        raise ValueError(
+            "feed token must be 8-32 url-safe base64 chars",
+        )
+    try:
+        ikm = _urlsafe_b64decode_loose(token)
+    except (binascii.Error, ValueError) as e:
+        raise ValueError(f"feed token is not valid url-safe base64: {e}") from e
+    return _hkdf(salt=_FEED_KEY_SALT, ikm=ikm, info=token.encode("ascii"), length=32)
+
+
+def _feed_subkeys(feed_key: bytes) -> tuple[bytes, bytes]:
+    """Derive (enc_key, mac_key) from the feed key via HKDF-Expand."""
+    enc = _hkdf(salt=b"", ikm=feed_key, info=_FEED_ENC_INFO, length=32)
+    mac = _hkdf(salt=b"", ikm=feed_key, info=_FEED_MAC_INFO, length=32)
+    return enc, mac
+
+
+def _feed_request_mac(feed_key: bytes, method: str, path: str, ts: int) -> str:
+    """Compute the per-request signature for /feeds/:id/* endpoints."""
+    msg = f"{method}\n{path}\n{ts}".encode("ascii")
+    return hmac.new(feed_key, msg, hashlib.sha256).hexdigest()
+
+
+def _feed_sig_transcript(
+    *,
+    feed_id: str,
+    sender_member_id: str,
+    sender_sig_pub_hex: str,
+    filename: str,
+    file_size: int,
+    content_hash: bytes,
+    posted_at: int,
+    nonce: bytes,
+) -> bytes:
+    """Hash the bound-together fields a sender signs over.
+
+    Includes the AEAD nonce so a captured signature can't be replayed against
+    a different ciphertext for the same logical message.
+    """
+    parts = [
+        _FEED_SIG_DOMAIN,
+        feed_id.encode("ascii"),
+        sender_member_id.encode("ascii"),
+        bytes.fromhex(sender_sig_pub_hex),
+        filename.encode("utf-8"),
+        file_size.to_bytes(8, "big"),
+        content_hash,
+        posted_at.to_bytes(8, "big"),
+        nonce,
+    ]
+    h = hashlib.sha256()
+    for p in parts:
+        h.update(len(p).to_bytes(2, "big"))
+        h.update(p)
+    return h.digest()
+
+
+def _feed_pack_header(header: dict) -> bytes:
+    """Pack a JSON header with a 2-byte length prefix (max 64 KB)."""
+    raw = json.dumps(header, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    if len(raw) > 0xFFFF:
+        raise ValueError("feed header too large")
+    return len(raw).to_bytes(2, "big") + raw
+
+
+def _feed_unpack_header(plaintext: bytes) -> tuple[dict, bytes]:
+    """Inverse of _feed_pack_header. Returns (header_dict, body_bytes)."""
+    if len(plaintext) < 2:
+        raise ValueError("feed plaintext truncated")
+    n = int.from_bytes(plaintext[:2], "big")
+    if len(plaintext) < 2 + n:
+        raise ValueError("feed plaintext truncated")
+    try:
+        header = json.loads(plaintext[2:2 + n].decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as e:
+        raise ValueError(f"feed header is not valid JSON: {e}") from e
+    if not isinstance(header, dict):
+        raise ValueError("feed header is not a JSON object")
+    return header, plaintext[2 + n:]
+
+
+def feed_seal(
+    *,
+    feed_key: bytes,
+    feed_id: str,
+    sender_member_id: str,
+    sender_sig_priv_hex: str,
+    sender_sig_pub_hex: str,
+    filename: str,
+    body: bytes,
+    posted_at: int | None = None,
+    _nonce: bytes | None = None,
+) -> bytes:
+    """Encrypt and authenticate a single feed post.
+
+    Wire format:
+        magic(5) || nonce(12) || mac(32) || ciphertext
+
+    The ciphertext encrypts a length-prefixed JSON header followed by the raw
+    file body. The header carries the sender's identity, the file metadata,
+    and an Ed25519 signature over a transcript that includes the nonce.
+
+    `_nonce` is a test hook; production callers leave it None.
+    """
+    nonce = _nonce if _nonce is not None else secrets.token_bytes(_FEED_NONCE_LEN)
+    content_hash = hashlib.sha256(body).digest()
+    when = posted_at if posted_at is not None else int(time.time())
+    transcript = _feed_sig_transcript(
+        feed_id=feed_id,
+        sender_member_id=sender_member_id,
+        sender_sig_pub_hex=sender_sig_pub_hex,
+        filename=filename,
+        file_size=len(body),
+        content_hash=content_hash,
+        posted_at=when,
+        nonce=nonce,
+    )
+    sig = ed25519_sign(transcript, bytes.fromhex(sender_sig_priv_hex))
+    header = {
+        "v": 1,
+        "fid": feed_id,
+        "smid": sender_member_id,
+        "sik": sender_sig_pub_hex,
+        "fn": filename,
+        "fs": len(body),
+        "ch": content_hash.hex(),
+        "pa": when,
+        "sig": sig.hex(),
+    }
+    plaintext = _feed_pack_header(header) + body
+    enc_key, mac_key = _feed_subkeys(feed_key)
+    ciphertext = _stream_xor(enc_key, nonce, plaintext)
+    mac = hmac.new(
+        mac_key, _FEED_MAGIC + nonce + ciphertext, hashlib.sha256,
+    ).digest()
+    return _FEED_MAGIC + nonce + mac + ciphertext
+
+
+def feed_open(
+    *,
+    feed_key: bytes,
+    feed_id: str,
+    blob: bytes,
+    expect_member_id: str | None = None,
+    expect_sig_pub_hex: str | None = None,
+) -> tuple[dict, bytes]:
+    """Verify and decrypt a single feed post.
+
+    Returns (header_dict, body_bytes). Raises ValueError on tamper, signature
+    mismatch, or content-hash mismatch. `expect_member_id` /
+    `expect_sig_pub_hex` are optional callsite assertions: if set, the
+    decoded post must match them or verification fails.
+    """
+    if len(blob) < _FEED_HEADER_LEN:
+        raise ValueError("feed blob too short")
+    if blob[:len(_FEED_MAGIC)] != _FEED_MAGIC:
+        raise ValueError("not a feed post (bad magic)")
+    off = len(_FEED_MAGIC)
+    nonce = blob[off:off + _FEED_NONCE_LEN]; off += _FEED_NONCE_LEN
+    mac = blob[off:off + _FEED_MAC_LEN]; off += _FEED_MAC_LEN
+    ciphertext = blob[off:]
+    enc_key, mac_key = _feed_subkeys(feed_key)
+    expected = hmac.new(
+        mac_key, _FEED_MAGIC + nonce + ciphertext, hashlib.sha256,
+    ).digest()
+    if not hmac.compare_digest(expected, mac):
+        raise ValueError("feed authentication failed")
+    plaintext = _stream_xor(enc_key, nonce, ciphertext)
+    header, body = _feed_unpack_header(plaintext)
+    try:
+        sender_member_id = header["smid"]
+        sender_sig_pub_hex = header["sik"]
+        filename = header["fn"]
+        file_size = header["fs"]
+        content_hash_hex = header["ch"]
+        posted_at = header["pa"]
+        sig_hex = header["sig"]
+    except KeyError as e:
+        raise ValueError(f"feed header missing field: {e}") from e
+    if (not isinstance(sender_member_id, str)
+            or not isinstance(sender_sig_pub_hex, str)
+            or not isinstance(filename, str)
+            or not isinstance(file_size, int)
+            or not isinstance(content_hash_hex, str)
+            or not isinstance(posted_at, int)
+            or not isinstance(sig_hex, str)):
+        raise ValueError("feed header has wrong field types")
+    if "/" in filename or "\\" in filename or filename in (".", ".."):
+        raise ValueError(f"refusing unsafe filename in feed post: {filename!r}")
+    if file_size != len(body):
+        raise ValueError(
+            f"feed file_size mismatch: header says {file_size}, body has {len(body)}",
+        )
+    actual_hash = hashlib.sha256(body).digest()
+    try:
+        claimed_hash = bytes.fromhex(content_hash_hex)
+    except ValueError as e:
+        raise ValueError("feed content_hash is not hex") from e
+    if not hmac.compare_digest(actual_hash, claimed_hash):
+        raise ValueError("feed content_hash mismatch (body corrupted)")
+    if expect_member_id is not None and sender_member_id != expect_member_id:
+        raise ValueError("feed sender_member_id mismatch")
+    if expect_sig_pub_hex is not None and sender_sig_pub_hex != expect_sig_pub_hex:
+        raise ValueError("feed sender_sig_pub mismatch")
+    try:
+        sig = bytes.fromhex(sig_hex)
+        pub = bytes.fromhex(sender_sig_pub_hex)
+    except ValueError as e:
+        raise ValueError(f"feed signature/pubkey not hex: {e}") from e
+    transcript = _feed_sig_transcript(
+        feed_id=feed_id,
+        sender_member_id=sender_member_id,
+        sender_sig_pub_hex=sender_sig_pub_hex,
+        filename=filename,
+        file_size=file_size,
+        content_hash=actual_hash,
+        posted_at=posted_at,
+        nonce=nonce,
+    )
+    if not ed25519_verify(transcript, sig, pub):
+        raise ValueError("feed sender signature failed")
+    return header, body
 
 
 # ---------- Relay transport ----------
