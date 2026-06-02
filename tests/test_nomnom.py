@@ -3651,6 +3651,67 @@ class TestCmdReceiveNoFeed:
         assert "no feed named 'ghost'" in capsys.readouterr().err
 
 
+class TestRetiredVerbs:
+    """`nomnom pair` and friends print a helpful migration message."""
+
+    def test_pair_is_retired(self, monkeypatch, capsys):
+        monkeypatch.setattr(sys, "argv", ["nomnom", "pair"])
+        rc = nomnom.main()
+        assert rc == 2
+        err = capsys.readouterr().err
+        assert "pair" in err.lower()
+        assert "open" in err.lower()
+        assert "join" in err.lower()
+
+    def test_encrypt_is_retired(self, monkeypatch, capsys):
+        monkeypatch.setattr(sys, "argv", ["nomnom", "encrypt"])
+        rc = nomnom.main()
+        assert rc == 2
+        assert "send" in capsys.readouterr().err.lower()
+
+    def test_decrypt_is_retired(self, monkeypatch, capsys):
+        monkeypatch.setattr(sys, "argv", ["nomnom", "decrypt"])
+        rc = nomnom.main()
+        assert rc == 2
+        assert "receive" in capsys.readouterr().err.lower()
+
+    def test_pair_not_in_subcommands(self):
+        assert "pair" not in nomnom.SUBCOMMANDS
+        assert "open" in nomnom.SUBCOMMANDS
+        assert "feeds" in nomnom.SUBCOMMANDS
+        assert "join" in nomnom.SUBCOMMANDS
+
+
+class TestV2MigrationNotice:
+    def test_notice_fires_for_legacy_pin_and_no_feeds(
+        self, tmp_path, monkeypatch, capsys,
+    ):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        nomnom._save_known_peer("dev_legacy", "alice-legacy", "aa" * 32)
+        nomnom._maybe_print_v2_migration_notice()
+        err = capsys.readouterr().err
+        assert "v2 introduces feeds" in err
+        assert "legacy pin" in err
+
+    def test_no_notice_when_feeds_exist(
+        self, tmp_path, monkeypatch, capsys,
+    ):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        nomnom._save_known_peer("dev_legacy", "alice-legacy", "aa" * 32)
+        cfg = nomnom._empty_feeds_config()
+        nomnom._add_or_replace_feed(cfg, _make_feed(name="home"))
+        nomnom._save_feeds_config(cfg)
+        nomnom._maybe_print_v2_migration_notice()
+        assert capsys.readouterr().err == ""
+
+    def test_no_notice_for_v2_pin(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        nomnom._save_feed_pin("aa" * 32, "alice")
+        nomnom._maybe_print_v2_migration_notice()
+        # Only sig_pub-bearing records exist → no legacy notice.
+        assert capsys.readouterr().err == ""
+
+
 class TestFeedsScreen:
     def test_empty_when_no_feeds(self, tmp_path, monkeypatch):
         monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))

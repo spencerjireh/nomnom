@@ -5956,7 +5956,9 @@ def cmd_reset(_args) -> int:
     sys.stderr.write(
         f"about to delete {target} and {len(entries)} entries "
         f"({', '.join(entries)}).\n"
-        f"identity rotation will invalidate every pin on every paired device.\n",
+        f"this wipes identity, pinned identities, joined feeds, and relay "
+        f"config. identity rotation invalidates every remote pin; rejoining "
+        f"feeds requires a fresh URL from another member.\n",
     )
     try:
         ans = input("proceed? [y/N]: ").strip().lower()
@@ -8683,10 +8685,6 @@ _DISPATCH = {
             feed=a.feed, once=a.once, trust_new=a.trust_new,
         ),
     ),
-    "pair": (
-        _build_pair_parser,
-        lambda a: cmd_pair(trust_new=a.trust_new),
-    ),
     "relay": (
         _build_relay_parser,
         cmd_relay,
@@ -8778,10 +8776,59 @@ def _emit_bundle(
     return 0, messages
 
 
+_RETIRED_VERBS = {
+    "pair": (
+        "`nomnom pair` was retired in feeds v2. To onboard another device, "
+        "run `nomnom open` on this device to mint a feed and share the "
+        "printed URL; then run `nomnom join <url>` on the other device."
+    ),
+    "encrypt": (
+        "`nomnom encrypt` was renamed in v1.5 and removed in feeds v2. "
+        "Use `nomnom send` (broadcast to your default feed)."
+    ),
+    "decrypt": (
+        "`nomnom decrypt` was renamed in v1.5 and removed in feeds v2. "
+        "Use `nomnom receive` (watch your default feed)."
+    ),
+}
+
+
+def _maybe_print_v2_migration_notice() -> None:
+    """Print a one-shot heads-up when legacy pins exist but no feeds do.
+
+    Detects v1/v2 pin records (no `sig_pub` field) and points the user at
+    the new `open`/`join` flow. Best-effort — failure to print never blocks
+    startup.
+    """
+    try:
+        peers = _load_known_peers()
+    except Exception:
+        return
+    legacy = [
+        rec for rec in peers.values()
+        if isinstance(rec, dict) and not rec.get("sig_pub")
+    ]
+    if not legacy:
+        return
+    cfg = _load_feeds_config()
+    if cfg["feeds"]:
+        return
+    sys.stderr.write(
+        f"nomnom: v2 introduces feeds; pair is retired. "
+        f"{len(legacy)} legacy pin(s) preserved as identity records but no "
+        "longer transport. open or join a feed to send/receive.\n",
+    )
+
+
 def main() -> int:
     # Trip any pin-store migration up front so the notice lands on stderr
     # before either entry point claims the terminal (curses or CLI).
     _load_known_peers()
+    _maybe_print_v2_migration_notice()
+
+    if len(sys.argv) >= 2 and sys.argv[1] in _RETIRED_VERBS:
+        print(f"error: {_RETIRED_VERBS[sys.argv[1]]}", file=sys.stderr)
+        return 2
 
     if len(sys.argv) >= 2 and sys.argv[1] in SUBCOMMANDS:
         return _dispatch_subcommand(sys.argv[1:])
