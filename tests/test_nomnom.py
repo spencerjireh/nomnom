@@ -5371,3 +5371,200 @@ class TestIdentitySigKeys:
         assert first["sig_priv"] == second["sig_priv"]
         assert first["sig_pub"] == second["sig_pub"]
 
+
+# ---------- feeds.json store ----------
+
+
+def _make_feed(name: str = "home", feed_id: str = "k4n2pX9qLm3T") -> nomnom.Feed:
+    return nomnom.Feed(
+        name=name,
+        feed_id=feed_id,
+        feed_token=feed_id,
+        url=f"https://relay.example.com/f/{feed_id}",
+        expires_at=2_000_000_000,
+        joined_at=1_700_000_000,
+        member_id="a" * 32,
+    )
+
+
+class TestFeedDataclass:
+    def test_to_from_dict_roundtrip(self):
+        f = _make_feed()
+        d = f.to_dict()
+        g = nomnom.Feed.from_dict(d)
+        assert g == f
+
+    def test_from_dict_rejects_missing_field(self):
+        d = _make_feed().to_dict()
+        del d["url"]
+        with pytest.raises(ValueError, match="missing/invalid"):
+            nomnom.Feed.from_dict(d)
+
+    def test_from_dict_rejects_non_dict(self):
+        with pytest.raises(ValueError, match="not a JSON object"):
+            nomnom.Feed.from_dict("not-a-dict")
+
+    def test_feed_token_defaults_to_feed_id(self):
+        d = _make_feed().to_dict()
+        del d["feed_token"]
+        g = nomnom.Feed.from_dict(d)
+        assert g.feed_token == g.feed_id
+
+
+class TestFeedsConfig:
+    def test_load_empty_when_no_file(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        cfg = nomnom._load_feeds_config()
+        assert cfg["default"] is None
+        assert cfg["feeds"] == []
+
+    def test_save_then_load_roundtrip(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        cfg = nomnom._empty_feeds_config()
+        nomnom._add_or_replace_feed(cfg, _make_feed())
+        nomnom._save_feeds_config(cfg)
+        loaded = nomnom._load_feeds_config()
+        assert loaded["default"] == "home"
+        assert len(loaded["feeds"]) == 1
+        assert loaded["feeds"][0].name == "home"
+        assert loaded["feeds"][0].feed_id == "k4n2pX9qLm3T"
+
+    def test_first_feed_becomes_default(self):
+        cfg = nomnom._empty_feeds_config()
+        nomnom._add_or_replace_feed(cfg, _make_feed(name="home"))
+        assert cfg["default"] == "home"
+
+    def test_second_feed_does_not_steal_default(self):
+        cfg = nomnom._empty_feeds_config()
+        nomnom._add_or_replace_feed(cfg, _make_feed(name="home"))
+        nomnom._add_or_replace_feed(
+            cfg, _make_feed(name="work", feed_id="abcDEFghi123"),
+        )
+        assert cfg["default"] == "home"
+
+    def test_replace_existing_by_name(self):
+        cfg = nomnom._empty_feeds_config()
+        nomnom._add_or_replace_feed(cfg, _make_feed(name="home"))
+        replacement = _make_feed(name="home", feed_id="zzzz0000xxxx")
+        nomnom._add_or_replace_feed(cfg, replacement)
+        assert len(cfg["feeds"]) == 1
+        assert cfg["feeds"][0].feed_id == "zzzz0000xxxx"
+
+    def test_load_drops_default_pointing_at_missing_feed(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        path = nomnom._feeds_config_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            "version": 1,
+            "default": "nonexistent",
+            "feeds": [_make_feed(name="home").to_dict()],
+        }))
+        cfg = nomnom._load_feeds_config()
+        assert cfg["default"] is None
+
+    def test_load_rejects_wrong_schema_version(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        path = nomnom._feeds_config_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"version": 999, "feeds": []}))
+        cfg = nomnom._load_feeds_config()
+        assert cfg["default"] is None
+        assert cfg["feeds"] == []
+
+    def test_load_skips_corrupt_entries(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        path = nomnom._feeds_config_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            "version": 1,
+            "default": None,
+            "feeds": [
+                {"name": "broken"},
+                _make_feed(name="ok").to_dict(),
+            ],
+        }))
+        cfg = nomnom._load_feeds_config()
+        assert len(cfg["feeds"]) == 1
+        assert cfg["feeds"][0].name == "ok"
+
+    def test_find_feed_match(self):
+        cfg = nomnom._empty_feeds_config()
+        nomnom._add_or_replace_feed(cfg, _make_feed(name="home"))
+        f = nomnom._find_feed(cfg, "home")
+        assert f is not None
+        assert f.name == "home"
+
+    def test_find_feed_miss(self):
+        cfg = nomnom._empty_feeds_config()
+        nomnom._add_or_replace_feed(cfg, _make_feed(name="home"))
+        assert nomnom._find_feed(cfg, "work") is None
+
+    def test_default_feed_returns_dataclass(self):
+        cfg = nomnom._empty_feeds_config()
+        nomnom._add_or_replace_feed(cfg, _make_feed(name="home"))
+        d = nomnom._default_feed(cfg)
+        assert isinstance(d, nomnom.Feed)
+        assert d.name == "home"
+
+
+class TestFeedNicknameValidation:
+    @pytest.mark.parametrize("name", ["home", "feed-1", "a", "abc-def-ghi"])
+    def test_accepts_valid(self, name):
+        nomnom._validate_feed_nickname(name)  # must not raise
+
+    @pytest.mark.parametrize(
+        "name",
+        ["", "Home", "feed_1", "-leading", "feed!", "ÜberFeed", "x" * 33],
+    )
+    def test_rejects_invalid(self, name):
+        with pytest.raises(nomnom.NomnomError):
+            nomnom._validate_feed_nickname(name)
+
+
+class TestAutogenFeedNickname:
+    def test_first_nickname_is_feed_1(self):
+        assert nomnom._autogen_feed_nickname([]) == "feed-1"
+
+    def test_skips_taken_names(self):
+        feeds = [
+            _make_feed(name="feed-1"),
+            _make_feed(name="feed-2", feed_id="aaaaaaaa1234"),
+        ]
+        assert nomnom._autogen_feed_nickname(feeds) == "feed-3"
+
+
+class TestFeedUrl:
+    def test_format_with_bare_host(self):
+        url = nomnom._format_feed_url("relay.example.com", "abc12345")
+        assert url == "https://relay.example.com/f/abc12345"
+
+    def test_format_with_scheme(self):
+        url = nomnom._format_feed_url("https://relay.example.com/", "abc12345")
+        assert url == "https://relay.example.com/f/abc12345"
+
+    def test_parse_https(self):
+        host, token = nomnom._parse_feed_url("https://relay.example.com/f/abc12345")
+        assert host == "relay.example.com"
+        assert token == "abc12345"
+
+    def test_parse_without_scheme(self):
+        host, token = nomnom._parse_feed_url("relay.example.com/f/abc12345")
+        assert host == "relay.example.com"
+        assert token == "abc12345"
+
+    def test_parse_rejects_missing_f_path(self):
+        with pytest.raises(nomnom.NomnomError, match="/f/"):
+            nomnom._parse_feed_url("https://relay.example.com/")
+
+    def test_parse_rejects_empty(self):
+        with pytest.raises(nomnom.NomnomError, match="empty"):
+            nomnom._parse_feed_url("")
+
+    def test_parse_rejects_bad_token(self):
+        with pytest.raises(nomnom.NomnomError, match="url-safe base64"):
+            nomnom._parse_feed_url("https://relay.example.com/f/has spaces")
+
+    def test_parse_rejects_extra_path(self):
+        with pytest.raises(nomnom.NomnomError, match="malformed"):
+            nomnom._parse_feed_url("https://relay.example.com/f/abc/extra")
+

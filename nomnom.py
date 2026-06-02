@@ -3314,6 +3314,209 @@ def feed_open(
     return header, body
 
 
+# ---------- feeds.json local store ----------
+#
+# Local persistence of joined feeds. One small file at ~/.config/nomnom/feeds.json
+# tracks every feed this device has opened or joined: nickname, URL token,
+# expiry, the member id this device uses inside the feed, a roster cache (for
+# UI / TOFU prompts), and the last-seen post timestamp (for resume).
+#
+# Schema:
+#   {
+#     "version": 1,
+#     "default": "<nickname>" | null,
+#     "feeds": [Feed.to_dict(), ...]
+#   }
+
+_FEEDS_CONFIG_SCHEMA = 1
+_FEED_NICKNAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
+
+
+@dataclass
+class Feed:
+    """A feed this device has joined.
+
+    `feed_id` and `feed_token` are currently the same string — they're kept
+    distinct for forward compatibility if the URL anatomy ever splits the
+    identifier from the credential (e.g. fragment-style URLs).
+    """
+
+    name: str
+    feed_id: str
+    feed_token: str
+    url: str
+    expires_at: int
+    joined_at: int
+    member_id: str
+    members_cache: list = field(default_factory=list)
+    last_post_ts: int = 0
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "feed_id": self.feed_id,
+            "feed_token": self.feed_token,
+            "url": self.url,
+            "expires_at": self.expires_at,
+            "joined_at": self.joined_at,
+            "member_id": self.member_id,
+            "members_cache": list(self.members_cache),
+            "last_post_ts": self.last_post_ts,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> Feed:
+        if not isinstance(d, dict):
+            raise ValueError("feed entry is not a JSON object")
+        try:
+            return cls(
+                name=str(d["name"]),
+                feed_id=str(d["feed_id"]),
+                feed_token=str(d.get("feed_token", d["feed_id"])),
+                url=str(d["url"]),
+                expires_at=int(d["expires_at"]),
+                joined_at=int(d["joined_at"]),
+                member_id=str(d["member_id"]),
+                members_cache=list(d.get("members_cache", [])),
+                last_post_ts=int(d.get("last_post_ts", 0)),
+            )
+        except (KeyError, TypeError, ValueError) as e:
+            raise ValueError(f"feed entry missing/invalid field: {e}") from e
+
+
+def _feeds_config_path() -> Path:
+    return _nomnom_config_dir() / "feeds.json"
+
+
+def _empty_feeds_config() -> dict:
+    return {"version": _FEEDS_CONFIG_SCHEMA, "default": None, "feeds": []}
+
+
+def _load_feeds_config() -> dict:
+    """Return the current feeds config; empty config on missing/malformed file."""
+    path = _feeds_config_path()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return _empty_feeds_config()
+    if not isinstance(data, dict):
+        return _empty_feeds_config()
+    if data.get("version") != _FEEDS_CONFIG_SCHEMA:
+        return _empty_feeds_config()
+    raw_feeds = data.get("feeds") if isinstance(data.get("feeds"), list) else []
+    feeds: list[Feed] = []
+    for entry in raw_feeds:
+        try:
+            feeds.append(Feed.from_dict(entry))
+        except ValueError:
+            continue
+    default = data.get("default")
+    if not isinstance(default, str):
+        default = None
+    # Default must point at an existing feed; otherwise drop it.
+    if default is not None and not any(f.name == default for f in feeds):
+        default = None
+    return {
+        "version": _FEEDS_CONFIG_SCHEMA,
+        "default": default,
+        "feeds": feeds,
+    }
+
+
+def _save_feeds_config(config: dict) -> None:
+    """Write the feeds config atomically. Accepts the shape returned by _load."""
+    feeds = config.get("feeds") or []
+    body = {
+        "version": _FEEDS_CONFIG_SCHEMA,
+        "default": config.get("default"),
+        "feeds": [
+            f.to_dict() if isinstance(f, Feed) else f
+            for f in feeds
+        ],
+    }
+    _atomic_write_text(_feeds_config_path(), json.dumps(body, indent=2))
+
+
+def _find_feed(config: dict, nickname: str) -> Feed | None:
+    """Return the Feed with the given nickname, or None."""
+    for f in config.get("feeds") or []:
+        if isinstance(f, Feed) and f.name == nickname:
+            return f
+    return None
+
+
+def _default_feed(config: dict) -> Feed | None:
+    """Return the configured default feed, or None."""
+    name = config.get("default")
+    if not isinstance(name, str):
+        return None
+    return _find_feed(config, name)
+
+
+def _validate_feed_nickname(name: str) -> None:
+    """Raise NomnomError if `name` doesn't match the nickname format."""
+    if not _FEED_NICKNAME_RE.match(name):
+        raise NomnomError(
+            "feed nickname must be 1-32 chars of lowercase letters, "
+            "digits, or '-', and start with a letter or digit",
+        )
+
+
+def _autogen_feed_nickname(existing: list[Feed]) -> str:
+    """Return a fresh `feed-N` that doesn't collide with any existing feed."""
+    taken = {f.name for f in existing if isinstance(f, Feed)}
+    for i in range(1, 10_000):
+        candidate = f"feed-{i}"
+        if candidate not in taken:
+            return candidate
+    raise NomnomError("too many feeds; pick an explicit --name")
+
+
+def _format_feed_url(host: str, feed_id: str) -> str:
+    """Build the shareable feed URL. Always https://."""
+    if "://" not in host:
+        host = f"https://{host}"
+    return f"{host.rstrip('/')}/f/{feed_id}"
+
+
+def _parse_feed_url(url: str) -> tuple[str, str]:
+    """Split a feed URL into (host, feed_id). Strict: requires /f/<token>."""
+    raw = url.strip()
+    if not raw:
+        raise NomnomError("feed url must not be empty")
+    if raw.startswith("https://"):
+        rest = raw[len("https://"):]
+    elif raw.startswith("http://"):
+        rest = raw[len("http://"):]
+    else:
+        rest = raw
+    if "/f/" not in rest:
+        raise NomnomError("feed url must contain '/f/<token>'")
+    host, _, token = rest.partition("/f/")
+    if not host or "/" in token or not token:
+        raise NomnomError("malformed feed url")
+    if not _FEED_TOKEN_RE.match(token):
+        raise NomnomError(
+            "feed token in url must be 8-32 url-safe base64 chars",
+        )
+    return host, token
+
+
+def _add_or_replace_feed(config: dict, feed: Feed) -> dict:
+    """Insert `feed` into config (replacing any existing entry with the same name).
+
+    If this is the first feed, mark it as the default. Returns the updated
+    config dict (mutated in place for convenience).
+    """
+    feeds = config.get("feeds") or []
+    feeds = [f for f in feeds if not (isinstance(f, Feed) and f.name == feed.name)]
+    feeds.append(feed)
+    config["feeds"] = feeds
+    if not config.get("default") and len(feeds) == 1:
+        config["default"] = feed.name
+    return config
+
+
 # ---------- Relay transport ----------
 # nomnom moves files through a Cloudflare Worker the user deploys to their
 # own account. The Worker is intentionally dumb: it stores HMAC-authenticated
