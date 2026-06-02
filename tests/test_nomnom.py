@@ -8,6 +8,7 @@ loop itself is excluded — it needs a TTY.
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import subprocess
@@ -5531,6 +5532,238 @@ class TestAutogenFeedNickname:
             _make_feed(name="feed-2", feed_id="aaaaaaaa1234"),
         ]
         assert nomnom._autogen_feed_nickname(feeds) == "feed-3"
+
+
+class TestCmdOpen:
+    @pytest.fixture
+    def fake_relay_and_identity(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        nomnom._save_relay_config(
+            "https://relay.example.com", "test-secret", allow_private=True,
+        )
+        captured: dict = {}
+
+        def fake_mint(relay, *, ttl_seconds, member_card):
+            captured["relay"] = relay
+            captured["ttl"] = ttl_seconds
+            captured["card"] = member_card
+            return {
+                "feed_id": "abcDEF12_-xy",
+                "expires_at": 1_700_000_000 + ttl_seconds,
+                "created_at": 1_700_000_000,
+            }
+
+        monkeypatch.setattr(nomnom, "_relay_mint_feed", fake_mint)
+        yield captured
+
+    def test_open_mints_feed_and_writes_config(
+        self, fake_relay_and_identity, tmp_path, capsys,
+    ):
+        args = argparse.Namespace(name=None, ttl=3600, default=False)
+        rc = nomnom.cmd_open(args)
+        assert rc == 0
+        cfg = nomnom._load_feeds_config()
+        assert len(cfg["feeds"]) == 1
+        feed = cfg["feeds"][0]
+        assert feed.feed_id == "abcDEF12_-xy"
+        assert feed.url == "https://relay.example.com/f/abcDEF12_-xy"
+        assert cfg["default"] == feed.name  # first feed auto-defaults
+        out = capsys.readouterr()
+        assert "https://relay.example.com/f/abcDEF12_-xy" in out.out
+        # Member card contains the identity sig pubkey, not the DH key.
+        ident = nomnom._load_identity()
+        assert fake_relay_and_identity["card"]["identity_pubkey"] == ident["sig_pub"]
+
+    def test_open_respects_explicit_name(
+        self, fake_relay_and_identity, capsys,
+    ):
+        args = argparse.Namespace(name="standup", ttl=3600, default=False)
+        rc = nomnom.cmd_open(args)
+        assert rc == 0
+        cfg = nomnom._load_feeds_config()
+        assert cfg["feeds"][0].name == "standup"
+
+    def test_open_rejects_duplicate_name(
+        self, fake_relay_and_identity, capsys,
+    ):
+        nomnom.cmd_open(argparse.Namespace(name="alpha", ttl=3600, default=False))
+        rc = nomnom.cmd_open(
+            argparse.Namespace(name="alpha", ttl=3600, default=False),
+        )
+        assert rc == 1
+        assert "already exists" in capsys.readouterr().err
+
+    def test_open_default_flag(self, fake_relay_and_identity, capsys):
+        nomnom.cmd_open(argparse.Namespace(name="first", ttl=3600, default=False))
+        # Need a new fake feed_id for the second mint.
+        nomnom._relay_mint_feed = lambda relay, *, ttl_seconds, member_card: {  # type: ignore
+            "feed_id": "ZZZ987654321",
+            "expires_at": 1_700_000_000 + ttl_seconds,
+            "created_at": 1_700_000_000,
+        }
+        nomnom.cmd_open(
+            argparse.Namespace(name="second", ttl=3600, default=True),
+        )
+        cfg = nomnom._load_feeds_config()
+        assert cfg["default"] == "second"
+
+    def test_open_aborts_when_no_relay(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        # Refuse the interactive prompt: simulate no TTY.
+        monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+        rc = nomnom.cmd_open(
+            argparse.Namespace(name=None, ttl=3600, default=False),
+        )
+        assert rc == 1
+
+
+class TestCmdJoin:
+    @pytest.fixture
+    def fake_feed_endpoints(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        roster: list[dict] = []
+
+        def fake_meta(host, feed_id, feed_key):
+            return {"expires_at": 1_800_000_000, "created_at": 1_700_000_000}
+
+        def fake_put_member(host, feed_id, feed_key, member_id, card):
+            roster.append({**card, "joined_at": int(time.time())})
+
+        def fake_list_members(host, feed_id, feed_key, *, since_ts=0, wait_ms=0):
+            return {"members": list(roster)}
+
+        monkeypatch.setattr(nomnom, "_relay_get_feed_meta", fake_meta)
+        monkeypatch.setattr(nomnom, "_relay_put_member", fake_put_member)
+        monkeypatch.setattr(nomnom, "_relay_list_members", fake_list_members)
+        return roster
+
+    def test_join_saves_feed_with_member_card(
+        self, fake_feed_endpoints, capsys,
+    ):
+        url = "https://relay.example.com/f/abcDEF12_-xy"
+        rc = nomnom.cmd_join(argparse.Namespace(url=url, name=None, default=False))
+        assert rc == 0
+        cfg = nomnom._load_feeds_config()
+        assert len(cfg["feeds"]) == 1
+        feed = cfg["feeds"][0]
+        assert feed.url == url
+        assert feed.feed_id == "abcDEF12_-xy"
+        assert feed.member_id  # was published
+        assert len(feed.members_cache) == 1
+
+    def test_join_rejects_malformed_url(self, fake_feed_endpoints, capsys):
+        rc = nomnom.cmd_join(
+            argparse.Namespace(url="not-a-url", name=None, default=False),
+        )
+        assert rc == 1
+
+
+class TestCmdFeedsList:
+    def test_lists_default_marker(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        cfg = nomnom._empty_feeds_config()
+        nomnom._add_or_replace_feed(cfg, _make_feed(name="home"))
+        nomnom._add_or_replace_feed(
+            cfg, _make_feed(name="work", feed_id="abcDEF99_-zy"),
+        )
+        nomnom._save_feeds_config(cfg)
+        rc = nomnom.cmd_feeds(argparse.Namespace(action="list"))
+        assert rc == 0
+        out = capsys.readouterr().out
+        # default marker on the first feed
+        assert " * home" in out
+        assert "   work" in out
+
+    def test_empty_message(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        rc = nomnom.cmd_feeds(argparse.Namespace(action="list"))
+        assert rc == 0
+        assert "no feeds" in capsys.readouterr().err
+
+
+class TestCmdFeedsActions:
+    @pytest.fixture
+    def feed_config(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        cfg = nomnom._empty_feeds_config()
+        nomnom._add_or_replace_feed(cfg, _make_feed(name="home"))
+        nomnom._save_feeds_config(cfg)
+        return tmp_path
+
+    def test_url_prints_feed_url(self, feed_config, capsys):
+        rc = nomnom.cmd_feeds(argparse.Namespace(action="url", name="home"))
+        assert rc == 0
+        assert "https://relay.example.com/f/" in capsys.readouterr().out
+
+    def test_url_missing_feed(self, feed_config, capsys):
+        rc = nomnom.cmd_feeds(argparse.Namespace(action="url", name="missing"))
+        assert rc == 1
+
+    def test_default_updates_default(self, feed_config, capsys):
+        # Add a second feed first.
+        cfg = nomnom._load_feeds_config()
+        nomnom._add_or_replace_feed(
+            cfg, _make_feed(name="work", feed_id="abcDEF99_-zy"),
+        )
+        nomnom._save_feeds_config(cfg)
+        rc = nomnom.cmd_feeds(argparse.Namespace(action="default", name="work"))
+        assert rc == 0
+        assert nomnom._load_feeds_config()["default"] == "work"
+
+    def test_rename_updates_name(self, feed_config, capsys):
+        rc = nomnom.cmd_feeds(argparse.Namespace(
+            action="rename", name="home", new_name="house",
+        ))
+        assert rc == 0
+        cfg = nomnom._load_feeds_config()
+        assert cfg["feeds"][0].name == "house"
+        assert cfg["default"] == "house"  # default tracked the rename
+
+    def test_rename_rejects_existing_target(self, feed_config, capsys):
+        cfg = nomnom._load_feeds_config()
+        nomnom._add_or_replace_feed(
+            cfg, _make_feed(name="work", feed_id="abcDEF99_-zy"),
+        )
+        nomnom._save_feeds_config(cfg)
+        rc = nomnom.cmd_feeds(argparse.Namespace(
+            action="rename", name="home", new_name="work",
+        ))
+        assert rc == 1
+
+    def test_leave_removes_feed_and_calls_relay(
+        self, feed_config, monkeypatch, capsys,
+    ):
+        called = {}
+        monkeypatch.setattr(
+            nomnom, "_relay_delete_member",
+            lambda host, fid, fkey, mid: called.setdefault("ok", True),
+        )
+        rc = nomnom.cmd_feeds(argparse.Namespace(action="leave", name="home"))
+        assert rc == 0
+        cfg = nomnom._load_feeds_config()
+        assert cfg["feeds"] == []
+        assert cfg["default"] is None
+        assert called.get("ok") is True
+
+    def test_extend_calls_relay_and_updates_local(
+        self, feed_config, monkeypatch, capsys,
+    ):
+        monkeypatch.setattr(
+            nomnom, "_relay_extend_feed",
+            lambda host, fid, fkey, ttl: {"expires_at": 3_000_000_000},
+        )
+        rc = nomnom.cmd_feeds(argparse.Namespace(
+            action="extend", name="home", ttl=7200,
+        ))
+        assert rc == 0
+        cfg = nomnom._load_feeds_config()
+        assert cfg["feeds"][0].expires_at == 3_000_000_000
+
+    def test_extend_rejects_short_ttl(self, feed_config, capsys):
+        rc = nomnom.cmd_feeds(argparse.Namespace(
+            action="extend", name="home", ttl=30,
+        ))
+        assert rc == 1
 
 
 class TestFeedUrl:

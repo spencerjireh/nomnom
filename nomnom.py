@@ -3731,11 +3731,11 @@ def _relay_request(
     headers: dict[str, str] = {}
     if signed:
         headers.update(_relay_hmac_headers(relay["secret"], method, full_path))
-    if extra_headers:
-        headers.update(extra_headers)
     if body is not None:
         headers["Content-Length"] = str(len(body))
         headers["Content-Type"] = "application/octet-stream"
+    if extra_headers:
+        headers.update(extra_headers)
     conn = _relay_open(relay)
     try:
         try:
@@ -3799,6 +3799,263 @@ def _relay_delete_slot(relay: dict, slot_id: str) -> None:
         _relay_request(relay, "DELETE", f"/slots/{slot_id}")
     except NomnomError:
         pass
+
+
+# --- feed-key-signed HTTP (parallel to the relay HMAC scheme above) ---
+
+
+_FEED_AUTH_PREFIX = "NMNM-FEEDKEY-SHA256 "
+
+
+def _feed_relay_dict(host: str) -> dict:
+    """Build a relay-shaped dict for feed-key-signed requests.
+
+    Reuses the connection helpers (_relay_open, _relay_full_path) but skips
+    the HMAC scheme — the URL token IS the credential for /feeds/:id/*.
+    """
+    if "://" not in host:
+        host = f"https://{host}"
+    return {"url": host.rstrip("/")}
+
+
+def _feed_auth_headers(feed_key: bytes, method: str, path: str) -> dict[str, str]:
+    """Authorization header for one /feeds/:id/* request.
+
+    Same shape as `_relay_hmac_headers` (method + path + unix_ts), keyed by
+    the per-feed key. The Worker re-derives the same key from the URL token
+    and verifies on receipt. Query strings are stripped so the signed path
+    matches the Worker's `url.pathname`.
+    """
+    bare_path = path.split("?", 1)[0]
+    ts = str(int(time.time()))
+    msg = f"{method}\n{bare_path}\n{ts}".encode("utf-8")
+    mac = hmac.new(feed_key, msg, hashlib.sha256).hexdigest()
+    return {
+        "Authorization": f"{_FEED_AUTH_PREFIX}{ts}:{mac}",
+        "User-Agent": _RELAY_USER_AGENT,
+    }
+
+
+def _feed_request(
+    host: str,
+    feed_key: bytes,
+    method: str,
+    path: str,
+    *,
+    body: bytes | None = None,
+    content_type: str = "application/octet-stream",
+) -> tuple[int, bytes]:
+    """One-shot feed-key-signed request. Returns (status, body)."""
+    relay = _feed_relay_dict(host)
+    full_path = _relay_full_path(relay, path)
+    headers = _feed_auth_headers(feed_key, method, full_path)
+    if body is not None:
+        headers["Content-Length"] = str(len(body))
+        headers["Content-Type"] = content_type
+    conn = _relay_open(relay)
+    try:
+        try:
+            conn.request(method, full_path, body=body, headers=headers)
+            resp = conn.getresponse()
+            data = resp.read(_RELAY_MAX_BODY + 1)
+            if len(data) > _RELAY_MAX_BODY:
+                raise NomnomError(
+                    f"relay returned oversized body (> {_RELAY_MAX_BODY} bytes)",
+                )
+            return resp.status, data
+        except (OSError, http.client.HTTPException) as e:
+            raise NomnomError(f"relay request failed: {e}") from e
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _raise_feed_error(status: int, body: bytes) -> None:
+    reason = body.decode("utf-8", errors="replace").strip()
+    if status == 401:
+        if reason == "clock-skew":
+            raise NomnomError(
+                "relay rejected feed request (clock skew). sync the system clock.",
+            )
+        raise NomnomError(
+            "relay rejected feed-key signature. the feed URL may be wrong or stale.",
+        )
+    if status == 403:
+        raise NomnomError(f"relay refused feed request: {reason or '(no detail)'}")
+    if status == 404:
+        raise NomnomError("feed not found on relay")
+    if status == 409:
+        raise NomnomError(f"relay returned 409: {reason or '(no detail)'}")
+    if status == 410:
+        raise NomnomError("feed has expired on the relay")
+    if status == 413:
+        raise NomnomError("payload too large for relay")
+    raise NomnomError(f"relay returned HTTP {status}: {reason or '(no body)'}")
+
+
+def _relay_mint_feed(
+    relay: dict, *, ttl_seconds: int, member_card: dict,
+) -> dict:
+    """POST /feeds — HMAC-gated. Returns {feed_id, expires_at, created_at}."""
+    body = json.dumps(
+        {"ttl_seconds": int(ttl_seconds), "member_card": member_card},
+        separators=(",", ":"),
+    ).encode("utf-8")
+    status, data = _relay_request(
+        relay, "POST", "/feeds", body=body,
+        extra_headers={"Content-Type": "application/json"},
+    )
+    if status == 201:
+        try:
+            return json.loads(data)
+        except json.JSONDecodeError as e:
+            raise NomnomError(f"relay returned bad JSON: {e}") from e
+    _raise_relay_error(status, data)
+    return {}  # unreachable
+
+
+def _relay_get_feed_meta(host: str, feed_id: str, feed_key: bytes) -> dict:
+    status, data = _feed_request(
+        host, feed_key, "GET", f"/feeds/{feed_id}/meta",
+    )
+    if status == 200:
+        try:
+            return json.loads(data)
+        except json.JSONDecodeError as e:
+            raise NomnomError(f"relay returned bad JSON: {e}") from e
+    _raise_feed_error(status, data)
+    return {}
+
+
+def _relay_put_member(
+    host: str, feed_id: str, feed_key: bytes, member_id: str, card: dict,
+) -> None:
+    body = json.dumps(card, separators=(",", ":")).encode("utf-8")
+    status, data = _feed_request(
+        host, feed_key, "PUT", f"/feeds/{feed_id}/members/{member_id}",
+        body=body, content_type="application/json",
+    )
+    if status == 204:
+        return
+    _raise_feed_error(status, data)
+
+
+def _relay_delete_member(
+    host: str, feed_id: str, feed_key: bytes, member_id: str,
+) -> None:
+    try:
+        status, data = _feed_request(
+            host, feed_key, "DELETE", f"/feeds/{feed_id}/members/{member_id}",
+        )
+    except NomnomError:
+        return  # leave is best-effort
+    if status not in (204, 404):
+        _raise_feed_error(status, data)
+
+
+def _relay_list_members(
+    host: str, feed_id: str, feed_key: bytes,
+    *, since_ts: int = 0, wait_ms: int = 0,
+) -> dict:
+    q = []
+    if wait_ms > 0:
+        q.append(f"wait={int(wait_ms)}")
+    if since_ts > 0:
+        q.append(f"since={int(since_ts)}")
+    qs = ("?" + "&".join(q)) if q else ""
+    status, data = _feed_request(
+        host, feed_key, "GET", f"/feeds/{feed_id}/members{qs}",
+    )
+    if status == 200:
+        try:
+            return json.loads(data)
+        except json.JSONDecodeError as e:
+            raise NomnomError(f"relay returned bad JSON: {e}") from e
+    _raise_feed_error(status, data)
+    return {}
+
+
+def _relay_extend_feed(
+    host: str, feed_id: str, feed_key: bytes, new_ttl_seconds: int,
+) -> dict:
+    body = json.dumps({"new_ttl_seconds": int(new_ttl_seconds)}).encode("utf-8")
+    status, data = _feed_request(
+        host, feed_key, "POST", f"/feeds/{feed_id}/extend",
+        body=body, content_type="application/json",
+    )
+    if status == 200:
+        try:
+            return json.loads(data)
+        except json.JSONDecodeError as e:
+            raise NomnomError(f"relay returned bad JSON: {e}") from e
+    _raise_feed_error(status, data)
+    return {}
+
+
+def _relay_close_feed(host: str, feed_id: str, feed_key: bytes) -> None:
+    status, data = _feed_request(
+        host, feed_key, "DELETE", f"/feeds/{feed_id}",
+    )
+    if status in (204, 404):
+        return
+    _raise_feed_error(status, data)
+
+
+def _relay_put_feed_slot(
+    host: str, feed_id: str, feed_key: bytes, slot_id: str, body: bytes,
+) -> None:
+    if len(body) > _RELAY_MAX_BODY:
+        raise NomnomError(
+            f"payload too large for relay: {len(body)} > {_RELAY_MAX_BODY} bytes",
+        )
+    status, data = _feed_request(
+        host, feed_key, "PUT", f"/feeds/{feed_id}/slots/{slot_id}",
+        body=body,
+    )
+    if status == 204:
+        return
+    _raise_feed_error(status, data)
+
+
+def _relay_get_feed_slot(
+    host: str, feed_id: str, feed_key: bytes, slot_id: str,
+    *, wait_ms: int = 0,
+) -> bytes | None:
+    qs = f"?wait={int(wait_ms)}" if wait_ms > 0 else ""
+    status, data = _feed_request(
+        host, feed_key, "GET", f"/feeds/{feed_id}/slots/{slot_id}{qs}",
+    )
+    if status == 200:
+        return data
+    if status == 404:
+        return None
+    _raise_feed_error(status, data)
+    return None
+
+
+def _relay_list_feed_slots(
+    host: str, feed_id: str, feed_key: bytes,
+    *, since_ts: int = 0, wait_ms: int = 0,
+) -> list:
+    q = []
+    if wait_ms > 0:
+        q.append(f"wait={int(wait_ms)}")
+    if since_ts > 0:
+        q.append(f"since={int(since_ts)}")
+    qs = ("?" + "&".join(q)) if q else ""
+    status, data = _feed_request(
+        host, feed_key, "GET", f"/feeds/{feed_id}/slots{qs}",
+    )
+    if status == 200:
+        try:
+            parsed = json.loads(data)
+        except json.JSONDecodeError as e:
+            raise NomnomError(f"relay returned bad JSON: {e}") from e
+        return parsed.get("slots") or []
+    _raise_feed_error(status, data)
+    return []
 
 
 def _relay_health(relay: dict) -> bool:
@@ -5088,29 +5345,309 @@ def _cmd_relay_init(args) -> int:
     return 0 if cfg is not None else 1
 
 
+def cmd_open(args) -> int:
+    """Mint a new feed on the configured relay and save it locally.
+
+    Requires relay.json (the relay HMAC gates feed minting). Generates a
+    random member_id, publishes a member card for this device, and prints
+    the shareable URL.
+    """
+    relay = _ensure_relay_configured(
+        interactive=getattr(args, "interactive", True),
+    )
+    if relay is None:
+        return 1
+
+    cfg = _load_feeds_config()
+    name = getattr(args, "name", None)
+    if name:
+        try:
+            _validate_feed_nickname(name)
+        except NomnomError as e:
+            sys.stderr.write(f"error: {e}\n")
+            return 1
+        if _find_feed(cfg, name) is not None:
+            sys.stderr.write(f"error: feed nickname {name!r} already exists.\n")
+            return 1
+    else:
+        try:
+            name = _autogen_feed_nickname(cfg["feeds"])
+        except NomnomError as e:
+            sys.stderr.write(f"error: {e}\n")
+            return 1
+
+    ttl = int(getattr(args, "ttl", 0) or 86_400)
+    ident = _load_identity()
+    member_id = secrets.token_hex(16)
+    card = {
+        "member_id": member_id,
+        "identity_pubkey": ident["sig_pub"],
+        "name": ident["name"],
+    }
+    try:
+        result = _relay_mint_feed(relay, ttl_seconds=ttl, member_card=card)
+    except NomnomError as e:
+        sys.stderr.write(f"error: {e}\n")
+        return 1
+
+    feed_id = str(result.get("feed_id") or "")
+    if not feed_id:
+        sys.stderr.write("error: relay did not return a feed_id.\n")
+        return 1
+    expires_at = int(result.get("expires_at") or (int(time.time()) + ttl))
+    created_at = int(result.get("created_at") or time.time())
+    host = _relay_split_url(relay["url"])[0]
+    feed = Feed(
+        name=name,
+        feed_id=feed_id,
+        feed_token=feed_id,
+        url=_format_feed_url(host, feed_id),
+        expires_at=expires_at,
+        joined_at=created_at,
+        member_id=member_id,
+        members_cache=[
+            {
+                "member_id": member_id,
+                "identity_pubkey": ident["sig_pub"],
+                "name": ident["name"],
+                "joined_at": created_at,
+            },
+        ],
+    )
+    _add_or_replace_feed(cfg, feed)
+    if getattr(args, "default", False):
+        cfg["default"] = name
+    _save_feeds_config(cfg)
+
+    sys.stderr.write(
+        f"opened feed '{name}' (TTL {ttl}s, expires at {expires_at}).\n"
+        f"share this URL with the other device:\n",
+    )
+    print(feed.url)
+    return 0
+
+
 def cmd_join(args) -> int:
-    """Second-device flow: parse `host#secret`, self-test, save."""
+    """Join an existing feed by URL.
+
+    Doesn't require relay.json — feed-key signatures are the credential for
+    /feeds/:id/* endpoints. The local `relay.json` is only needed for
+    minting new feeds via `nomnom open`.
+    """
     try:
-        host, secret = _parse_join_token(args.token)
+        host, feed_id = _parse_feed_url(args.url)
     except NomnomError as e:
         sys.stderr.write(f"error: {e}\n")
         return 1
-    url = f"https://{host}"
-    candidate = {"url": url, "secret": secret}
-    rc, msg = _relay_self_test(candidate)
-    if rc != 0:
-        sys.stderr.write(f"error: {msg}\nconfig NOT saved.\n")
-        return 1
+
+    cfg = _load_feeds_config()
+    name = getattr(args, "name", None)
+    if name:
+        try:
+            _validate_feed_nickname(name)
+        except NomnomError as e:
+            sys.stderr.write(f"error: {e}\n")
+            return 1
+        if _find_feed(cfg, name) is not None:
+            sys.stderr.write(f"error: feed nickname {name!r} already exists.\n")
+            return 1
+    else:
+        try:
+            name = _autogen_feed_nickname(cfg["feeds"])
+        except NomnomError as e:
+            sys.stderr.write(f"error: {e}\n")
+            return 1
+
+    feed_key = _feed_key_from_token(feed_id)
+    # Probe the feed exists + the URL is correct before publishing anything.
     try:
-        _save_relay_config(
-            url, secret,
-            allow_private=getattr(args, "allow_private", False),
-        )
+        meta = _relay_get_feed_meta(host, feed_id, feed_key)
+    except NomnomError as e:
+        sys.stderr.write(f"error: {e}\nfeed NOT joined.\n")
+        return 1
+
+    ident = _load_identity()
+    member_id = secrets.token_hex(16)
+    card = {
+        "member_id": member_id,
+        "identity_pubkey": ident["sig_pub"],
+        "name": ident["name"],
+    }
+    try:
+        _relay_put_member(host, feed_id, feed_key, member_id, card)
+        roster = _relay_list_members(host, feed_id, feed_key)
     except NomnomError as e:
         sys.stderr.write(f"error: {e}\n")
         return 1
-    sys.stderr.write(f"saved to {_relay_config_path()} ({msg})\n")
-    sys.stderr.write("run `nomnom pair` on both devices to add this peer.\n")
+
+    feed = Feed(
+        name=name,
+        feed_id=feed_id,
+        feed_token=feed_id,
+        url=_format_feed_url(host, feed_id),
+        expires_at=int(meta.get("expires_at") or 0),
+        joined_at=int(time.time()),
+        member_id=member_id,
+        members_cache=list(roster.get("members") or []),
+    )
+    _add_or_replace_feed(cfg, feed)
+    if getattr(args, "default", False):
+        cfg["default"] = name
+    _save_feeds_config(cfg)
+    sys.stderr.write(
+        f"joined feed '{name}' with {len(feed.members_cache)} member(s).\n",
+    )
+    return 0
+
+
+def cmd_feeds(args) -> int:
+    action = getattr(args, "action", None)
+    if action is None:
+        sys.stderr.write("error: feeds requires an action (try `feeds list`).\n")
+        return 2
+    handler = {
+        "list": _cmd_feeds_list,
+        "members": _cmd_feeds_members,
+        "url": _cmd_feeds_url,
+        "default": _cmd_feeds_default,
+        "rename": _cmd_feeds_rename,
+        "leave": _cmd_feeds_leave,
+        "extend": _cmd_feeds_extend,
+    }.get(action)
+    if handler is None:
+        sys.stderr.write(f"error: unknown feeds action {action!r}.\n")
+        return 2
+    return handler(args)
+
+
+def _cmd_feeds_list(_args) -> int:
+    cfg = _load_feeds_config()
+    feeds = cfg["feeds"]
+    if not feeds:
+        sys.stderr.write("no feeds joined. mint one with `nomnom open`.\n")
+        return 0
+    default = cfg.get("default")
+    now = int(time.time())
+    for f in feeds:
+        marker = " *" if f.name == default else "  "
+        ttl_remaining = max(0, f.expires_at - now)
+        members = len(f.members_cache)
+        status = "expired" if ttl_remaining == 0 else f"expires in {ttl_remaining}s"
+        print(f"{marker} {f.name:<24} {members} member(s)  {status}")
+    return 0
+
+
+def _cmd_feeds_members(args) -> int:
+    cfg = _load_feeds_config()
+    feed = _find_feed(cfg, args.name)
+    if feed is None:
+        sys.stderr.write(f"error: no feed named {args.name!r}.\n")
+        return 1
+    feed_key = _feed_key_from_token(feed.feed_token)
+    host, _ = _parse_feed_url(feed.url)
+    try:
+        roster = _relay_list_members(host, feed.feed_id, feed_key)
+    except NomnomError as e:
+        sys.stderr.write(f"error: {e}\n")
+        return 1
+    members = roster.get("members") or []
+    if not members:
+        sys.stderr.write("(no members)\n")
+        return 0
+    for m in members:
+        marker = " *" if m.get("member_id") == feed.member_id else "  "
+        fp = _ik_fingerprint(m.get("identity_pubkey", "")) if m.get("identity_pubkey") else "(no key)"
+        print(f"{marker} {m.get('name', '?'):<28} {fp}  ({m.get('member_id', '?')[:12]}...)")
+    # Refresh the local cache opportunistically.
+    feed.members_cache = members
+    _save_feeds_config(cfg)
+    return 0
+
+
+def _cmd_feeds_url(args) -> int:
+    cfg = _load_feeds_config()
+    feed = _find_feed(cfg, args.name)
+    if feed is None:
+        sys.stderr.write(f"error: no feed named {args.name!r}.\n")
+        return 1
+    print(feed.url)
+    return 0
+
+
+def _cmd_feeds_default(args) -> int:
+    cfg = _load_feeds_config()
+    feed = _find_feed(cfg, args.name)
+    if feed is None:
+        sys.stderr.write(f"error: no feed named {args.name!r}.\n")
+        return 1
+    cfg["default"] = feed.name
+    _save_feeds_config(cfg)
+    sys.stderr.write(f"default feed is now '{feed.name}'.\n")
+    return 0
+
+
+def _cmd_feeds_rename(args) -> int:
+    cfg = _load_feeds_config()
+    feed = _find_feed(cfg, args.name)
+    if feed is None:
+        sys.stderr.write(f"error: no feed named {args.name!r}.\n")
+        return 1
+    try:
+        _validate_feed_nickname(args.new_name)
+    except NomnomError as e:
+        sys.stderr.write(f"error: {e}\n")
+        return 1
+    if _find_feed(cfg, args.new_name) is not None:
+        sys.stderr.write(f"error: feed nickname {args.new_name!r} already exists.\n")
+        return 1
+    old = feed.name
+    feed.name = args.new_name
+    if cfg.get("default") == old:
+        cfg["default"] = args.new_name
+    _save_feeds_config(cfg)
+    sys.stderr.write(f"renamed '{old}' to '{args.new_name}'.\n")
+    return 0
+
+
+def _cmd_feeds_leave(args) -> int:
+    cfg = _load_feeds_config()
+    feed = _find_feed(cfg, args.name)
+    if feed is None:
+        sys.stderr.write(f"error: no feed named {args.name!r}.\n")
+        return 1
+    feed_key = _feed_key_from_token(feed.feed_token)
+    host, _ = _parse_feed_url(feed.url)
+    _relay_delete_member(host, feed.feed_id, feed_key, feed.member_id)
+    cfg["feeds"] = [f for f in cfg["feeds"] if f.name != feed.name]
+    if cfg.get("default") == feed.name:
+        cfg["default"] = cfg["feeds"][0].name if cfg["feeds"] else None
+    _save_feeds_config(cfg)
+    sys.stderr.write(f"left feed '{feed.name}' (member card deleted).\n")
+    return 0
+
+
+def _cmd_feeds_extend(args) -> int:
+    cfg = _load_feeds_config()
+    feed = _find_feed(cfg, args.name)
+    if feed is None:
+        sys.stderr.write(f"error: no feed named {args.name!r}.\n")
+        return 1
+    new_ttl = int(args.ttl)
+    if new_ttl < 60:
+        sys.stderr.write("error: --ttl must be at least 60 seconds.\n")
+        return 1
+    feed_key = _feed_key_from_token(feed.feed_token)
+    host, _ = _parse_feed_url(feed.url)
+    try:
+        result = _relay_extend_feed(host, feed.feed_id, feed_key, new_ttl)
+    except NomnomError as e:
+        sys.stderr.write(f"error: {e}\n")
+        return 1
+    feed.expires_at = int(result.get("expires_at") or (int(time.time()) + new_ttl))
+    _save_feeds_config(cfg)
+    sys.stderr.write(
+        f"extended '{feed.name}'; new expiry: {feed.expires_at}.\n",
+    )
     return 0
 
 
@@ -7608,18 +8145,71 @@ def _build_join_parser() -> argparse.ArgumentParser:
     sub = argparse.ArgumentParser(
         prog="nomnom join",
         description=(
-            "Join an existing nomnom relay using a `host#secret` token "
-            "produced by `nomnom relay show --token` on the first device. "
-            "Self-tests the relay before saving."
+            "Join an existing feed by URL (host/f/<token>). The URL alone "
+            "is the credential; no relay HMAC is needed on the joiner's side."
         ),
     )
-    sub.add_argument("token", help="Join token of the form `host#secret`.")
+    sub.add_argument("url", help="Feed URL (host/f/<token>).")
     sub.add_argument(
-        "--allow-private", action="store_true",
-        help=(
-            "Allow tokens whose host resolves to a private / loopback / "
-            "link-local address. Default refuses to block SSRF."
+        "--name", default=None,
+        help="Local nickname for this feed (default: auto-generated `feed-N`).",
+    )
+    sub.add_argument(
+        "--default", action="store_true",
+        help="Set this feed as the default for `send`/`receive`.",
+    )
+    return sub
+
+
+def _build_open_parser() -> argparse.ArgumentParser:
+    sub = argparse.ArgumentParser(
+        prog="nomnom open",
+        description=(
+            "Mint a new feed on the configured relay and save it locally. "
+            "Prints a shareable join URL for other devices."
         ),
+    )
+    sub.add_argument(
+        "--name", default=None,
+        help="Local nickname for this feed (default: auto-generated `feed-N`).",
+    )
+    sub.add_argument(
+        "--ttl", type=int, default=86_400,
+        help="Time-to-live in seconds (default: 86400 = 1 day).",
+    )
+    sub.add_argument(
+        "--default", action="store_true",
+        help="Set this feed as the default for `send`/`receive`.",
+    )
+    return sub
+
+
+def _build_feeds_parser() -> argparse.ArgumentParser:
+    sub = argparse.ArgumentParser(
+        prog="nomnom feeds",
+        description="Inspect and manage joined feeds.",
+    )
+    sp = sub.add_subparsers(dest="action", metavar="ACTION")
+    sp.add_parser("list", help="Show joined feeds, default marker, TTL.")
+    p_members = sp.add_parser("members", help="Fetch and show feed roster.")
+    p_members.add_argument("name", help="Local feed nickname.")
+    p_url = sp.add_parser("url", help="Print the shareable join URL.")
+    p_url.add_argument("name", help="Local feed nickname.")
+    p_default = sp.add_parser("default", help="Set the default feed.")
+    p_default.add_argument("name", help="Local feed nickname.")
+    p_rename = sp.add_parser("rename", help="Rename a feed locally.")
+    p_rename.add_argument("name", help="Current local nickname.")
+    p_rename.add_argument("new_name", help="New local nickname.")
+    p_leave = sp.add_parser(
+        "leave",
+        help="Leave a feed (deletes your member card, removes locally).",
+    )
+    p_leave.add_argument("name", help="Local feed nickname.")
+    p_extend = sp.add_parser("extend", help="Extend a feed's TTL.")
+    p_extend.add_argument("name", help="Local feed nickname.")
+    p_extend.add_argument(
+        "--ttl", type=int, required=True,
+        help="New TTL in seconds (relative to now).",
     )
     return sub
 
@@ -7709,6 +8299,14 @@ _DISPATCH = {
     "join": (
         _build_join_parser,
         cmd_join,
+    ),
+    "open": (
+        _build_open_parser,
+        cmd_open,
+    ),
+    "feeds": (
+        _build_feeds_parser,
+        cmd_feeds,
     ),
     "peers": (
         _build_peers_parser,
