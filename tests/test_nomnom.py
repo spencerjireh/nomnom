@@ -8,6 +8,7 @@ loop itself is excluded — it needs a TTY.
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import subprocess
@@ -719,8 +720,14 @@ class TestLauncherScreen:
         s = nomnom.LauncherScreen()
         labels = [t[0] for t in s.tiles]
         for v in ("Bundle", "Commit", "PR", "Review", "Rebuild",
-                  "Send", "Receive", "Extensions", "Pins"):
+                  "Send", "Receive", "Extensions", "Feeds"):
             assert v in labels
+
+    def test_pair_tile_removed_in_v2(self):
+        s = nomnom.LauncherScreen()
+        labels = [t[0] for t in s.tiles]
+        assert "Pair" not in labels
+        assert "Pins" not in labels
 
     def test_cursor_wraps_down(self):
         s = nomnom.LauncherScreen()
@@ -3626,83 +3633,375 @@ class TestAtomicWrite:
         assert "new" in target.read_text()
 
 
-class TestCmdReceiveNoPeers:
-    """cmd_receive errors when no peers are pinned; no silent rendezvous."""
+class TestCmdReceiveNoFeed:
+    """cmd_receive errors when no feeds are joined and no --feed specified."""
 
-    def test_no_peers_errors(self, tmp_path, monkeypatch, capsys):
+    def test_no_default_feed_errors(self, tmp_path, monkeypatch, capsys):
         monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
-        nomnom._save_relay_config("https://example.invalid", "secret",
-                                  allow_private=True)
         rc = nomnom.cmd_receive()
         assert rc == 1
-        assert "no pinned peers" in capsys.readouterr().err.lower()
+        err = capsys.readouterr().err.lower()
+        assert "no default feed" in err
+        assert "nomnom open" in err
 
-
-class TestCmdReceiveWatch:
-    """cmd_receive default watch loop accumulates results until interrupted;
-    --once exits after the first received file."""
-
-    def _setup_env(self, tmp_path, monkeypatch):
+    def test_named_feed_missing_errors(self, tmp_path, monkeypatch, capsys):
         monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
-        nomnom._save_relay_config("https://example.invalid", "secret",
-                                  allow_private=True)
-        nomnom._save_known_peer("alice", "alice-mac", "aa" * 32)
+        rc = nomnom.cmd_receive(feed="ghost")
+        assert rc == 1
+        assert "no feed named 'ghost'" in capsys.readouterr().err
 
-    def test_loops_on_multiple_results(self, tmp_path, monkeypatch, capsys):
-        self._setup_env(tmp_path, monkeypatch)
-        results = [
-            {"name": "foo.txt", "bytes": 12, "peer_name": "alice",
-             "out_path": str(tmp_path / "foo.txt")},
-            {"name": "bar.txt", "bytes": 34, "peer_name": "alice",
-             "out_path": str(tmp_path / "bar.txt")},
-        ]
-        call_count = {"n": 0}
 
-        def fake_recv(*, identity, relay, on_result, on_tofu):
-            i = call_count["n"]
-            call_count["n"] += 1
-            if i < len(results):
-                on_result(results[i])
-                return 0
-            # third iteration: simulate Ctrl-C inside the long-poll
-            raise KeyboardInterrupt
+class TestRetiredVerbs:
+    """`nomnom pair` and friends print a helpful migration message."""
 
-        monkeypatch.setattr(nomnom, "_relay_recv_pinned", fake_recv)
-        rc = nomnom.cmd_receive()
-        # received_any was True before the KeyboardInterrupt → clean exit
+    def test_pair_is_retired(self, monkeypatch, capsys):
+        monkeypatch.setattr(sys, "argv", ["nomnom", "pair"])
+        rc = nomnom.main()
+        assert rc == 2
+        err = capsys.readouterr().err
+        assert "pair" in err.lower()
+        assert "open" in err.lower()
+        assert "join" in err.lower()
+
+    def test_encrypt_is_retired(self, monkeypatch, capsys):
+        monkeypatch.setattr(sys, "argv", ["nomnom", "encrypt"])
+        rc = nomnom.main()
+        assert rc == 2
+        assert "send" in capsys.readouterr().err.lower()
+
+    def test_decrypt_is_retired(self, monkeypatch, capsys):
+        monkeypatch.setattr(sys, "argv", ["nomnom", "decrypt"])
+        rc = nomnom.main()
+        assert rc == 2
+        assert "receive" in capsys.readouterr().err.lower()
+
+    def test_pair_not_in_subcommands(self):
+        assert "pair" not in nomnom.SUBCOMMANDS
+        assert "open" in nomnom.SUBCOMMANDS
+        assert "feeds" in nomnom.SUBCOMMANDS
+        assert "join" in nomnom.SUBCOMMANDS
+
+
+class TestV2MigrationNotice:
+    def test_notice_fires_for_legacy_pin_and_no_feeds(
+        self, tmp_path, monkeypatch, capsys,
+    ):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        nomnom._save_known_peer("dev_legacy", "alice-legacy", "aa" * 32)
+        nomnom._maybe_print_v2_migration_notice()
+        err = capsys.readouterr().err
+        assert "v2 introduces feeds" in err
+        assert "legacy pin" in err
+
+    def test_no_notice_when_feeds_exist(
+        self, tmp_path, monkeypatch, capsys,
+    ):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        nomnom._save_known_peer("dev_legacy", "alice-legacy", "aa" * 32)
+        cfg = nomnom._empty_feeds_config()
+        nomnom._add_or_replace_feed(cfg, _make_feed(name="home"))
+        nomnom._save_feeds_config(cfg)
+        nomnom._maybe_print_v2_migration_notice()
+        assert capsys.readouterr().err == ""
+
+    def test_no_notice_for_v2_pin(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        nomnom._save_feed_pin("aa" * 32, "alice")
+        nomnom._maybe_print_v2_migration_notice()
+        # Only sig_pub-bearing records exist → no legacy notice.
+        assert capsys.readouterr().err == ""
+
+
+class TestFeedsScreen:
+    def test_empty_when_no_feeds(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        screen = nomnom.FeedsScreen()
+        assert screen.feeds == []
+
+    def test_loads_feeds_sorted_by_name(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        cfg = nomnom._empty_feeds_config()
+        nomnom._add_or_replace_feed(cfg, _make_feed(name="zebra"))
+        nomnom._add_or_replace_feed(cfg, _make_feed(name="alpha", feed_id="abcDEF99_-zy"))
+        nomnom._save_feeds_config(cfg)
+        screen = nomnom.FeedsScreen()
+        assert [f.name for f, _ in screen.feeds] == ["alpha", "zebra"]
+
+    def test_marks_default(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        cfg = nomnom._empty_feeds_config()
+        nomnom._add_or_replace_feed(cfg, _make_feed(name="home"))
+        nomnom._save_feeds_config(cfg)
+        screen = nomnom.FeedsScreen()
+        assert any(is_default for _, is_default in screen.feeds)
+
+    def test_esc_returns_back(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        screen = nomnom.FeedsScreen()
+        assert screen.handle_key(27) == nomnom.ScreenAction.BACK
+        assert screen.handle_key(ord("q")) == nomnom.ScreenAction.BACK
+
+    def test_d_sets_default(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        cfg = nomnom._empty_feeds_config()
+        nomnom._add_or_replace_feed(cfg, _make_feed(name="home"))
+        nomnom._add_or_replace_feed(cfg, _make_feed(name="work", feed_id="abcDEF99_-zy"))
+        nomnom._save_feeds_config(cfg)
+        screen = nomnom.FeedsScreen()
+        # cursor starts at 0 ("home" — alphabetical); 'd' makes it default.
+        screen.cursor = 1
+        screen.handle_key(ord("d"))
+        assert nomnom._load_feeds_config()["default"] == "work"
+
+
+class TestFeedTofu:
+    def test_check_auto_pins_with_trust_new(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        card = {"member_id": "m1", "identity_pubkey": "aa" * 32, "name": "alice"}
+        assert nomnom._tofu_check_feed_member(card, trust_new=True) is True
+        assert nomnom._find_pinned_sig("aa" * 32) is not None
+
+    def test_check_silent_on_already_pinned(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        nomnom._save_feed_pin("aa" * 32, "alice")
+        # input() must not be called.
+        monkeypatch.setattr(
+            "builtins.input",
+            lambda *a, **k: pytest.fail("TOFU prompt fired on already-pinned"),
+        )
+        card = {"member_id": "m1", "identity_pubkey": "aa" * 32, "name": "alice"}
+        assert nomnom._tofu_check_feed_member(card) is True
+
+    def test_check_prompts_and_accepts(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        monkeypatch.setattr("builtins.input", lambda *a, **k: "y")
+        card = {"member_id": "m1", "identity_pubkey": "aa" * 32, "name": "alice"}
+        assert nomnom._tofu_check_feed_member(card) is True
+        assert nomnom._find_pinned_sig("aa" * 32) is not None
+
+    def test_check_prompts_and_declines(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        monkeypatch.setattr("builtins.input", lambda *a, **k: "n")
+        card = {"member_id": "m1", "identity_pubkey": "aa" * 32, "name": "alice"}
+        assert nomnom._tofu_check_feed_member(card) is False
+        assert nomnom._find_pinned_sig("aa" * 32) is None
+
+    def test_check_eof_treated_as_decline(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+
+        def raise_eof(*_a, **_k):
+            raise EOFError
+
+        monkeypatch.setattr("builtins.input", raise_eof)
+        card = {"member_id": "m1", "identity_pubkey": "aa" * 32, "name": "alice"}
+        assert nomnom._tofu_check_feed_member(card) is False
+
+    def test_pin_global_across_feeds(self, tmp_path, monkeypatch):
+        # Pinning under one feed makes the identity recognized in any later feed.
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        card_feed_a = {"member_id": "alice-in-a", "identity_pubkey": "aa" * 32, "name": "alice"}
+        card_feed_b = {"member_id": "alice-in-b", "identity_pubkey": "aa" * 32, "name": "alice"}
+        nomnom._tofu_check_feed_member(card_feed_a, trust_new=True)
+        # Different feed, same identity → silent (input must not fire).
+        monkeypatch.setattr(
+            "builtins.input",
+            lambda *a, **k: pytest.fail("TOFU re-prompted across feeds"),
+        )
+        assert nomnom._tofu_check_feed_member(card_feed_b) is True
+
+
+class TestCmdSendFeed:
+    @pytest.fixture
+    def env(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        ident = nomnom._load_identity()
+        member_id = "a" * 32
+        token = nomnom.secrets.token_urlsafe(9)
+        feed = nomnom.Feed(
+            name="home",
+            feed_id=token,
+            feed_token=token,
+            url=f"https://relay.example.com/f/{token}",
+            expires_at=2_000_000_000,
+            joined_at=1_700_000_000,
+            member_id=member_id,
+            members_cache=[
+                {"member_id": member_id, "identity_pubkey": ident["sig_pub"], "name": ident["name"]},
+            ],
+        )
+        cfg = nomnom._empty_feeds_config()
+        nomnom._add_or_replace_feed(cfg, feed)
+        nomnom._save_feeds_config(cfg)
+        # Track what gets PUT to the Worker.
+        posts: list = []
+
+        def fake_list_members(host, fid, fkey, *, since_ts=0, wait_ms=0):
+            return {"members": feed.members_cache}
+
+        def fake_put_slot(host, fid, fkey, slot_id, body):
+            posts.append({"slot_id": slot_id, "body": body, "feed_id": fid})
+
+        monkeypatch.setattr(nomnom, "_relay_list_members", fake_list_members)
+        monkeypatch.setattr(nomnom, "_relay_put_feed_slot", fake_put_slot)
+        return tmp_path, feed, posts
+
+    def test_send_posts_to_default_feed(self, env, capsys):
+        tmp_path, feed, posts = env
+        f = tmp_path / "hello.txt"
+        f.write_text("hi from cmd_send")
+        rc = nomnom.cmd_send(str(f))
+        assert rc == 0
+        assert len(posts) == 1
+        assert posts[0]["feed_id"] == feed.feed_id
+        # Verify the post decrypts to our payload.
+        feed_key = nomnom._feed_key_from_token(feed.feed_token)
+        header, body = nomnom.feed_open(
+            feed_key=feed_key, feed_id=feed.feed_id, blob=posts[0]["body"],
+        )
+        assert body == b"hi from cmd_send"
+        assert header["fn"] == "hello.txt"
+        assert header["smid"] == feed.member_id
+
+    def test_send_warns_on_lonely_feed(self, env, capsys):
+        tmp_path, feed, _ = env
+        f = tmp_path / "ghost.txt"
+        f.write_bytes(b"x")
+        rc = nomnom.cmd_send(str(f))
         assert rc == 0
         err = capsys.readouterr().err
-        assert "foo.txt" in err
-        assert "bar.txt" in err
-        assert call_count["n"] == 3  # two results + one interrupted iteration
+        assert "no other members" in err
 
-    def test_once_exits_after_one(self, tmp_path, monkeypatch, capsys):
-        self._setup_env(tmp_path, monkeypatch)
-        call_count = {"n": 0}
+    def test_send_explicit_feed(self, env, capsys):
+        tmp_path, feed, posts = env
+        f = tmp_path / "hi.txt"
+        f.write_bytes(b"x")
+        rc = nomnom.cmd_send(str(f), feed="home")
+        assert rc == 0
+        assert len(posts) == 1
 
-        def fake_recv(*, identity, relay, on_result, on_tofu):
-            call_count["n"] += 1
-            on_result({"name": "foo.txt", "bytes": 1, "peer_name": "alice",
-                       "out_path": str(tmp_path / "foo.txt")})
-            return 0
+    def test_send_unknown_feed_errors(self, env, capsys):
+        tmp_path, _, _ = env
+        f = tmp_path / "a.txt"
+        f.write_bytes(b"x")
+        rc = nomnom.cmd_send(str(f), feed="missing")
+        assert rc == 1
+        assert "no feed named 'missing'" in capsys.readouterr().err
 
-        monkeypatch.setattr(nomnom, "_relay_recv_pinned", fake_recv)
+    def test_send_nonexistent_file_errors(self, env, capsys):
+        rc = nomnom.cmd_send("/nope/does/not/exist.txt")
+        assert rc == 1
+
+
+class TestCmdReceiveFeed:
+    @pytest.fixture
+    def env(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        # Set up "alice" as the receiver and "bob" as the sender.
+        alice_ident = nomnom._load_identity()
+        bob_seed, bob_pub = nomnom.ed25519_keypair()
+        bob_member = "b" * 32
+        alice_member = "a" * 32
+        token = nomnom.secrets.token_urlsafe(9)
+        feed = nomnom.Feed(
+            name="home",
+            feed_id=token,
+            feed_token=token,
+            url=f"https://relay.example.com/f/{token}",
+            expires_at=2_000_000_000,
+            joined_at=1_700_000_000,
+            member_id=alice_member,
+            members_cache=[
+                {"member_id": alice_member, "identity_pubkey": alice_ident["sig_pub"], "name": "alice"},
+                {"member_id": bob_member, "identity_pubkey": bob_pub.hex(), "name": "bob"},
+            ],
+        )
+        cfg = nomnom._empty_feeds_config()
+        nomnom._add_or_replace_feed(cfg, feed)
+        nomnom._save_feeds_config(cfg)
+
+        feed_key = nomnom._feed_key_from_token(token)
+        bob_post = nomnom.feed_seal(
+            feed_key=feed_key,
+            feed_id=token,
+            sender_member_id=bob_member,
+            sender_sig_priv_hex=bob_seed.hex(),
+            sender_sig_pub_hex=bob_pub.hex(),
+            filename="from-bob.txt",
+            body=b"hello alice",
+        )
+
+        slots: list = [{"slot_id": "slot-1", "created_at": 1, "body": bob_post}]
+
+        def fake_list_slots(host, fid, fkey, *, since_ts=0, wait_ms=0):
+            fresh = [s for s in slots if s["created_at"] > since_ts]
+            if not fresh and wait_ms > 0:
+                # Simulate a 30s timeout returning empty (avoid actually sleeping).
+                return []
+            return [{"slot_id": s["slot_id"], "created_at": s["created_at"]} for s in fresh]
+
+        def fake_get_slot(host, fid, fkey, slot_id, *, wait_ms=0):
+            for s in slots:
+                if s["slot_id"] == slot_id:
+                    return s["body"]
+            return None
+
+        monkeypatch.setattr(nomnom, "_relay_list_feed_slots", fake_list_slots)
+        monkeypatch.setattr(nomnom, "_relay_get_feed_slot", fake_get_slot)
+        return tmp_path, feed, slots
+
+    def test_receive_once_decodes_post(self, env, capsys, monkeypatch):
+        tmp_path, feed, slots = env
+        monkeypatch.chdir(tmp_path)
         rc = nomnom.cmd_receive(once=True)
         assert rc == 0
-        assert call_count["n"] == 1
-        assert "foo.txt" in capsys.readouterr().err
+        err = capsys.readouterr().err
+        assert "from-bob.txt" in err
+        assert "from bob" in err
+        assert (tmp_path / "from-bob.txt").read_bytes() == b"hello alice"
 
-    def test_relay_error_exits_loop(self, tmp_path, monkeypatch, capsys):
-        # A NomnomError from the relay should NOT cause a tight retry loop.
-        self._setup_env(tmp_path, monkeypatch)
+    def test_receive_skips_own_post(self, env, capsys, monkeypatch):
+        tmp_path, feed, slots = env
+        monkeypatch.chdir(tmp_path)
+        # Add a post authored by alice (this device); should be skipped.
+        alice_ident = nomnom._load_identity()
+        feed_key = nomnom._feed_key_from_token(feed.feed_token)
+        alice_post = nomnom.feed_seal(
+            feed_key=feed_key,
+            feed_id=feed.feed_id,
+            sender_member_id=feed.member_id,
+            sender_sig_priv_hex=alice_ident["sig_priv"],
+            sender_sig_pub_hex=alice_ident["sig_pub"],
+            filename="echo.txt",
+            body=b"my own",
+        )
+        slots.insert(0, {"slot_id": "slot-0", "created_at": 0.5, "body": alice_post})
+        rc = nomnom.cmd_receive(once=True)
+        assert rc == 0
+        # Only bob's file was written; alice's echo was skipped.
+        assert not (tmp_path / "echo.txt").exists()
+        assert (tmp_path / "from-bob.txt").exists()
 
-        def fake_recv(*, identity, relay, on_result, on_tofu):
-            raise nomnom.NomnomError("relay is on fire")
-
-        monkeypatch.setattr(nomnom, "_relay_recv_pinned", fake_recv)
-        rc = nomnom.cmd_receive()
+    def test_receive_once_no_post_returns_failure(
+        self, tmp_path, monkeypatch, capsys,
+    ):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        token = nomnom.secrets.token_urlsafe(9)
+        feed = nomnom.Feed(
+            name="home", feed_id=token, feed_token=token,
+            url=f"https://relay.example.com/f/{token}",
+            expires_at=2_000_000_000, joined_at=1_700_000_000,
+            member_id="a" * 32, members_cache=[],
+        )
+        cfg = nomnom._empty_feeds_config()
+        nomnom._add_or_replace_feed(cfg, feed)
+        nomnom._save_feeds_config(cfg)
+        monkeypatch.setattr(
+            nomnom, "_relay_list_feed_slots",
+            lambda *a, **k: [],
+        )
+        rc = nomnom.cmd_receive(once=True)
         assert rc == 1
-        assert "on fire" in capsys.readouterr().err
+        assert "no transfer" in capsys.readouterr().err
 
 
 class TestFirstContactPromptDefaultsNo:
@@ -5121,4 +5420,682 @@ class TestCmdReset:
         rc = nomnom.cmd_reset(None)
         assert rc == 0
         assert "nothing to reset" in capsys.readouterr().err.lower()
+
+
+# ---------- feed crypto (v2) ----------
+
+
+class TestHkdf:
+    def test_known_answer_rfc5869_test_case_1(self):
+        # RFC 5869 §A.1 test case 1 for HKDF-SHA256.
+        ikm = bytes.fromhex("0b" * 22)
+        salt = bytes.fromhex("000102030405060708090a0b0c")
+        info = bytes.fromhex("f0f1f2f3f4f5f6f7f8f9")
+        out = nomnom._hkdf(salt=salt, ikm=ikm, info=info, length=42)
+        assert out.hex() == (
+            "3cb25f25faacd57a90434f64d0362f2a"
+            "2d2d0a90cf1a5a4c5db02d56ecc4c5bf"
+            "34007208d5b887185865"
+        )
+
+    def test_deterministic(self):
+        a = nomnom._hkdf(salt=b"s", ikm=b"k", info=b"i", length=32)
+        b = nomnom._hkdf(salt=b"s", ikm=b"k", info=b"i", length=32)
+        assert a == b
+
+    def test_length_varies(self):
+        full = nomnom._hkdf(salt=b"s", ikm=b"k", info=b"i", length=64)
+        half = nomnom._hkdf(salt=b"s", ikm=b"k", info=b"i", length=32)
+        assert full[:32] == half
+
+    def test_info_changes_output(self):
+        a = nomnom._hkdf(salt=b"s", ikm=b"k", info=b"x", length=32)
+        b = nomnom._hkdf(salt=b"s", ikm=b"k", info=b"y", length=32)
+        assert a != b
+
+
+class TestEd25519:
+    def test_rfc8032_test_vector_1(self):
+        # RFC 8032 §7.1 test 1: empty message.
+        seed = bytes.fromhex(
+            "9d61b19deffd5a60ba844af492ec2cc4"
+            "4449c5697b326919703bac031cae7f60"
+        )
+        expected_pub = bytes.fromhex(
+            "d75a980182b10ab7d54bfed3c964073a"
+            "0ee172f3daa62325af021a68f707511a"
+        )
+        expected_sig = bytes.fromhex(
+            "e5564300c360ac729086e2cc806e828a"
+            "84877f1eb8e5d974d873e06522490155"
+            "5fb8821590a33bacc61e39701cf9b46b"
+            "d25bf5f0595bbe24655141438e7a100b"
+        )
+        pub = nomnom.ed25519_pub_from_seed(seed)
+        assert pub == expected_pub
+        sig = nomnom.ed25519_sign(b"", seed)
+        assert sig == expected_sig
+        assert nomnom.ed25519_verify(b"", sig, pub)
+
+    def test_sign_verify_roundtrip(self):
+        seed, pub = nomnom.ed25519_keypair()
+        msg = b"hello feeds"
+        sig = nomnom.ed25519_sign(msg, seed)
+        assert nomnom.ed25519_verify(msg, sig, pub)
+
+    def test_verify_rejects_tampered_message(self):
+        seed, pub = nomnom.ed25519_keypair()
+        sig = nomnom.ed25519_sign(b"original", seed)
+        assert not nomnom.ed25519_verify(b"tampered", sig, pub)
+
+    def test_verify_rejects_wrong_key(self):
+        seed1, _ = nomnom.ed25519_keypair()
+        _, pub2 = nomnom.ed25519_keypair()
+        sig = nomnom.ed25519_sign(b"msg", seed1)
+        assert not nomnom.ed25519_verify(b"msg", sig, pub2)
+
+    def test_verify_rejects_bad_sizes(self):
+        seed, pub = nomnom.ed25519_keypair()
+        sig = nomnom.ed25519_sign(b"msg", seed)
+        assert not nomnom.ed25519_verify(b"msg", sig[:63], pub)
+        assert not nomnom.ed25519_verify(b"msg", sig, pub[:31])
+
+    def test_keygen_yields_distinct_keys(self):
+        a, _ = nomnom.ed25519_keypair()
+        b, _ = nomnom.ed25519_keypair()
+        assert a != b
+
+
+class TestFeedKeyDerivation:
+    def test_deterministic(self):
+        token = "k4n2pX9qLm3T"
+        a = nomnom._feed_key_from_token(token)
+        b = nomnom._feed_key_from_token(token)
+        assert a == b
+        assert len(a) == 32
+
+    def test_different_tokens_yield_different_keys(self):
+        a = nomnom._feed_key_from_token("k4n2pX9qLm3T")
+        b = nomnom._feed_key_from_token("k4n2pX9qLm3U")
+        assert a != b
+
+    def test_rejects_empty_token(self):
+        with pytest.raises(ValueError):
+            nomnom._feed_key_from_token("")
+
+    def test_rejects_non_base64_token(self):
+        with pytest.raises(ValueError):
+            nomnom._feed_key_from_token("not!base64!at!all")
+
+    def test_request_mac_matches_worker_scheme(self):
+        # Same shape the Worker's verifyFeedKey expects.
+        key = b"\x01" * 32
+        mac1 = nomnom._feed_request_mac(key, "GET", "/feeds/abc/meta", 100)
+        mac2 = nomnom._feed_request_mac(key, "GET", "/feeds/abc/meta", 100)
+        assert mac1 == mac2
+        mac3 = nomnom._feed_request_mac(key, "GET", "/feeds/abc/meta", 101)
+        assert mac3 != mac1
+
+
+class TestFeedSeal:
+    def _seed_and_pub(self) -> tuple[str, str]:
+        seed, pub = nomnom.ed25519_keypair()
+        return seed.hex(), pub.hex()
+
+    def test_seal_open_roundtrip(self):
+        feed_key = nomnom._feed_key_from_token("k4n2pX9qLm3T")
+        sig_priv, sig_pub = self._seed_and_pub()
+        body = b"file contents here"
+        blob = nomnom.feed_seal(
+            feed_key=feed_key,
+            feed_id="k4n2pX9qLm3T",
+            sender_member_id="mem-abc",
+            sender_sig_priv_hex=sig_priv,
+            sender_sig_pub_hex=sig_pub,
+            filename="hello.txt",
+            body=body,
+        )
+        header, recovered = nomnom.feed_open(
+            feed_key=feed_key,
+            feed_id="k4n2pX9qLm3T",
+            blob=blob,
+        )
+        assert recovered == body
+        assert header["fn"] == "hello.txt"
+        assert header["smid"] == "mem-abc"
+        assert header["sik"] == sig_pub
+        assert header["fs"] == len(body)
+
+    def test_open_rejects_wrong_feed_key(self):
+        feed_key = nomnom._feed_key_from_token("k4n2pX9qLm3T")
+        wrong_key = nomnom._feed_key_from_token("k4n2pX9qLm3U")
+        sig_priv, sig_pub = self._seed_and_pub()
+        blob = nomnom.feed_seal(
+            feed_key=feed_key,
+            feed_id="k4n2pX9qLm3T",
+            sender_member_id="mem-abc",
+            sender_sig_priv_hex=sig_priv,
+            sender_sig_pub_hex=sig_pub,
+            filename="hello.txt",
+            body=b"data",
+        )
+        with pytest.raises(ValueError, match="authentication failed"):
+            nomnom.feed_open(feed_key=wrong_key, feed_id="k4n2pX9qLm3T", blob=blob)
+
+    def test_open_rejects_wrong_feed_id(self):
+        feed_key = nomnom._feed_key_from_token("k4n2pX9qLm3T")
+        sig_priv, sig_pub = self._seed_and_pub()
+        blob = nomnom.feed_seal(
+            feed_key=feed_key,
+            feed_id="k4n2pX9qLm3T",
+            sender_member_id="mem-abc",
+            sender_sig_priv_hex=sig_priv,
+            sender_sig_pub_hex=sig_pub,
+            filename="hello.txt",
+            body=b"data",
+        )
+        # Decryption succeeds (same feed_key), but the transcript signature
+        # binds to feed_id "k4n2pX9qLm3T" — opening under a different feed_id
+        # fails signature verification.
+        with pytest.raises(ValueError, match="sender signature failed"):
+            nomnom.feed_open(feed_key=feed_key, feed_id="other-feed", blob=blob)
+
+    def test_open_rejects_body_tamper(self):
+        feed_key = nomnom._feed_key_from_token("k4n2pX9qLm3T")
+        sig_priv, sig_pub = self._seed_and_pub()
+        blob = nomnom.feed_seal(
+            feed_key=feed_key,
+            feed_id="k4n2pX9qLm3T",
+            sender_member_id="mem-abc",
+            sender_sig_priv_hex=sig_priv,
+            sender_sig_pub_hex=sig_pub,
+            filename="hello.txt",
+            body=b"data",
+        )
+        tampered = bytearray(blob)
+        tampered[-1] ^= 0xFF
+        with pytest.raises(ValueError, match="authentication failed"):
+            nomnom.feed_open(
+                feed_key=feed_key, feed_id="k4n2pX9qLm3T", blob=bytes(tampered),
+            )
+
+    def test_open_rejects_truncated(self):
+        feed_key = nomnom._feed_key_from_token("k4n2pX9qLm3T")
+        with pytest.raises(ValueError, match="too short"):
+            nomnom.feed_open(
+                feed_key=feed_key, feed_id="k4n2pX9qLm3T", blob=b"\x00" * 5,
+            )
+
+    def test_open_with_expected_member_id_match(self):
+        feed_key = nomnom._feed_key_from_token("k4n2pX9qLm3T")
+        sig_priv, sig_pub = self._seed_and_pub()
+        blob = nomnom.feed_seal(
+            feed_key=feed_key,
+            feed_id="k4n2pX9qLm3T",
+            sender_member_id="mem-abc",
+            sender_sig_priv_hex=sig_priv,
+            sender_sig_pub_hex=sig_pub,
+            filename="hello.txt",
+            body=b"data",
+        )
+        nomnom.feed_open(
+            feed_key=feed_key, feed_id="k4n2pX9qLm3T", blob=blob,
+            expect_member_id="mem-abc",
+        )
+        with pytest.raises(ValueError, match="sender_member_id mismatch"):
+            nomnom.feed_open(
+                feed_key=feed_key, feed_id="k4n2pX9qLm3T", blob=blob,
+                expect_member_id="mem-other",
+            )
+
+
+class TestIdentitySigKeys:
+    def test_load_identity_adds_sig_keys(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        ident = nomnom._load_identity()
+        assert "sig_priv" in ident
+        assert "sig_pub" in ident
+        assert len(bytes.fromhex(ident["sig_priv"])) == 32
+        assert len(bytes.fromhex(ident["sig_pub"])) == 32
+        # Pub key is the deterministic Ed25519 derivation of the priv seed.
+        derived = nomnom.ed25519_pub_from_seed(bytes.fromhex(ident["sig_priv"]))
+        assert derived.hex() == ident["sig_pub"]
+
+    def test_load_identity_preserves_sig_keys_across_calls(
+        self, tmp_path, monkeypatch,
+    ):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        first = nomnom._load_identity()
+        second = nomnom._load_identity()
+        assert first["sig_priv"] == second["sig_priv"]
+        assert first["sig_pub"] == second["sig_pub"]
+
+
+# ---------- feeds.json store ----------
+
+
+def _make_feed(name: str = "home", feed_id: str = "k4n2pX9qLm3T") -> nomnom.Feed:
+    return nomnom.Feed(
+        name=name,
+        feed_id=feed_id,
+        feed_token=feed_id,
+        url=f"https://relay.example.com/f/{feed_id}",
+        expires_at=2_000_000_000,
+        joined_at=1_700_000_000,
+        member_id="a" * 32,
+    )
+
+
+class TestFeedDataclass:
+    def test_to_from_dict_roundtrip(self):
+        f = _make_feed()
+        d = f.to_dict()
+        g = nomnom.Feed.from_dict(d)
+        assert g == f
+
+    def test_from_dict_rejects_missing_field(self):
+        d = _make_feed().to_dict()
+        del d["url"]
+        with pytest.raises(ValueError, match="missing/invalid"):
+            nomnom.Feed.from_dict(d)
+
+    def test_from_dict_rejects_non_dict(self):
+        with pytest.raises(ValueError, match="not a JSON object"):
+            nomnom.Feed.from_dict("not-a-dict")
+
+    def test_feed_token_defaults_to_feed_id(self):
+        d = _make_feed().to_dict()
+        del d["feed_token"]
+        g = nomnom.Feed.from_dict(d)
+        assert g.feed_token == g.feed_id
+
+
+class TestFeedsConfig:
+    def test_load_empty_when_no_file(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        cfg = nomnom._load_feeds_config()
+        assert cfg["default"] is None
+        assert cfg["feeds"] == []
+
+    def test_save_then_load_roundtrip(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        cfg = nomnom._empty_feeds_config()
+        nomnom._add_or_replace_feed(cfg, _make_feed())
+        nomnom._save_feeds_config(cfg)
+        loaded = nomnom._load_feeds_config()
+        assert loaded["default"] == "home"
+        assert len(loaded["feeds"]) == 1
+        assert loaded["feeds"][0].name == "home"
+        assert loaded["feeds"][0].feed_id == "k4n2pX9qLm3T"
+
+    def test_first_feed_becomes_default(self):
+        cfg = nomnom._empty_feeds_config()
+        nomnom._add_or_replace_feed(cfg, _make_feed(name="home"))
+        assert cfg["default"] == "home"
+
+    def test_second_feed_does_not_steal_default(self):
+        cfg = nomnom._empty_feeds_config()
+        nomnom._add_or_replace_feed(cfg, _make_feed(name="home"))
+        nomnom._add_or_replace_feed(
+            cfg, _make_feed(name="work", feed_id="abcDEFghi123"),
+        )
+        assert cfg["default"] == "home"
+
+    def test_replace_existing_by_name(self):
+        cfg = nomnom._empty_feeds_config()
+        nomnom._add_or_replace_feed(cfg, _make_feed(name="home"))
+        replacement = _make_feed(name="home", feed_id="zzzz0000xxxx")
+        nomnom._add_or_replace_feed(cfg, replacement)
+        assert len(cfg["feeds"]) == 1
+        assert cfg["feeds"][0].feed_id == "zzzz0000xxxx"
+
+    def test_load_drops_default_pointing_at_missing_feed(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        path = nomnom._feeds_config_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            "version": 1,
+            "default": "nonexistent",
+            "feeds": [_make_feed(name="home").to_dict()],
+        }))
+        cfg = nomnom._load_feeds_config()
+        assert cfg["default"] is None
+
+    def test_load_rejects_wrong_schema_version(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        path = nomnom._feeds_config_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"version": 999, "feeds": []}))
+        cfg = nomnom._load_feeds_config()
+        assert cfg["default"] is None
+        assert cfg["feeds"] == []
+
+    def test_load_skips_corrupt_entries(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        path = nomnom._feeds_config_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            "version": 1,
+            "default": None,
+            "feeds": [
+                {"name": "broken"},
+                _make_feed(name="ok").to_dict(),
+            ],
+        }))
+        cfg = nomnom._load_feeds_config()
+        assert len(cfg["feeds"]) == 1
+        assert cfg["feeds"][0].name == "ok"
+
+    def test_find_feed_match(self):
+        cfg = nomnom._empty_feeds_config()
+        nomnom._add_or_replace_feed(cfg, _make_feed(name="home"))
+        f = nomnom._find_feed(cfg, "home")
+        assert f is not None
+        assert f.name == "home"
+
+    def test_find_feed_miss(self):
+        cfg = nomnom._empty_feeds_config()
+        nomnom._add_or_replace_feed(cfg, _make_feed(name="home"))
+        assert nomnom._find_feed(cfg, "work") is None
+
+    def test_default_feed_returns_dataclass(self):
+        cfg = nomnom._empty_feeds_config()
+        nomnom._add_or_replace_feed(cfg, _make_feed(name="home"))
+        d = nomnom._default_feed(cfg)
+        assert isinstance(d, nomnom.Feed)
+        assert d.name == "home"
+
+
+class TestFeedNicknameValidation:
+    @pytest.mark.parametrize("name", ["home", "feed-1", "a", "abc-def-ghi"])
+    def test_accepts_valid(self, name):
+        nomnom._validate_feed_nickname(name)  # must not raise
+
+    @pytest.mark.parametrize(
+        "name",
+        ["", "Home", "feed_1", "-leading", "feed!", "ÜberFeed", "x" * 33],
+    )
+    def test_rejects_invalid(self, name):
+        with pytest.raises(nomnom.NomnomError):
+            nomnom._validate_feed_nickname(name)
+
+
+class TestAutogenFeedNickname:
+    def test_first_nickname_is_feed_1(self):
+        assert nomnom._autogen_feed_nickname([]) == "feed-1"
+
+    def test_skips_taken_names(self):
+        feeds = [
+            _make_feed(name="feed-1"),
+            _make_feed(name="feed-2", feed_id="aaaaaaaa1234"),
+        ]
+        assert nomnom._autogen_feed_nickname(feeds) == "feed-3"
+
+
+class TestCmdOpen:
+    @pytest.fixture
+    def fake_relay_and_identity(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        nomnom._save_relay_config(
+            "https://relay.example.com", "test-secret", allow_private=True,
+        )
+        captured: dict = {}
+
+        def fake_mint(relay, *, ttl_seconds, member_card):
+            captured["relay"] = relay
+            captured["ttl"] = ttl_seconds
+            captured["card"] = member_card
+            return {
+                "feed_id": "abcDEF12_-xy",
+                "expires_at": 1_700_000_000 + ttl_seconds,
+                "created_at": 1_700_000_000,
+            }
+
+        monkeypatch.setattr(nomnom, "_relay_mint_feed", fake_mint)
+        yield captured
+
+    def test_open_mints_feed_and_writes_config(
+        self, fake_relay_and_identity, tmp_path, capsys,
+    ):
+        args = argparse.Namespace(name=None, ttl=3600, default=False)
+        rc = nomnom.cmd_open(args)
+        assert rc == 0
+        cfg = nomnom._load_feeds_config()
+        assert len(cfg["feeds"]) == 1
+        feed = cfg["feeds"][0]
+        assert feed.feed_id == "abcDEF12_-xy"
+        assert feed.url == "https://relay.example.com/f/abcDEF12_-xy"
+        assert cfg["default"] == feed.name  # first feed auto-defaults
+        out = capsys.readouterr()
+        assert "https://relay.example.com/f/abcDEF12_-xy" in out.out
+        # Member card contains the identity sig pubkey, not the DH key.
+        ident = nomnom._load_identity()
+        assert fake_relay_and_identity["card"]["identity_pubkey"] == ident["sig_pub"]
+
+    def test_open_respects_explicit_name(
+        self, fake_relay_and_identity, capsys,
+    ):
+        args = argparse.Namespace(name="standup", ttl=3600, default=False)
+        rc = nomnom.cmd_open(args)
+        assert rc == 0
+        cfg = nomnom._load_feeds_config()
+        assert cfg["feeds"][0].name == "standup"
+
+    def test_open_rejects_duplicate_name(
+        self, fake_relay_and_identity, capsys,
+    ):
+        nomnom.cmd_open(argparse.Namespace(name="alpha", ttl=3600, default=False))
+        rc = nomnom.cmd_open(
+            argparse.Namespace(name="alpha", ttl=3600, default=False),
+        )
+        assert rc == 1
+        assert "already exists" in capsys.readouterr().err
+
+    def test_open_default_flag(self, fake_relay_and_identity, capsys):
+        nomnom.cmd_open(argparse.Namespace(name="first", ttl=3600, default=False))
+        # Need a new fake feed_id for the second mint.
+        nomnom._relay_mint_feed = lambda relay, *, ttl_seconds, member_card: {  # type: ignore
+            "feed_id": "ZZZ987654321",
+            "expires_at": 1_700_000_000 + ttl_seconds,
+            "created_at": 1_700_000_000,
+        }
+        nomnom.cmd_open(
+            argparse.Namespace(name="second", ttl=3600, default=True),
+        )
+        cfg = nomnom._load_feeds_config()
+        assert cfg["default"] == "second"
+
+    def test_open_aborts_when_no_relay(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        # Refuse the interactive prompt: simulate no TTY.
+        monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+        rc = nomnom.cmd_open(
+            argparse.Namespace(name=None, ttl=3600, default=False),
+        )
+        assert rc == 1
+
+
+class TestCmdJoin:
+    @pytest.fixture
+    def fake_feed_endpoints(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        roster: list[dict] = []
+
+        def fake_meta(host, feed_id, feed_key):
+            return {"expires_at": 1_800_000_000, "created_at": 1_700_000_000}
+
+        def fake_put_member(host, feed_id, feed_key, member_id, card):
+            roster.append({**card, "joined_at": int(time.time())})
+
+        def fake_list_members(host, feed_id, feed_key, *, since_ts=0, wait_ms=0):
+            return {"members": list(roster)}
+
+        monkeypatch.setattr(nomnom, "_relay_get_feed_meta", fake_meta)
+        monkeypatch.setattr(nomnom, "_relay_put_member", fake_put_member)
+        monkeypatch.setattr(nomnom, "_relay_list_members", fake_list_members)
+        return roster
+
+    def test_join_saves_feed_with_member_card(
+        self, fake_feed_endpoints, capsys,
+    ):
+        url = "https://relay.example.com/f/abcDEF12_-xy"
+        rc = nomnom.cmd_join(argparse.Namespace(url=url, name=None, default=False))
+        assert rc == 0
+        cfg = nomnom._load_feeds_config()
+        assert len(cfg["feeds"]) == 1
+        feed = cfg["feeds"][0]
+        assert feed.url == url
+        assert feed.feed_id == "abcDEF12_-xy"
+        assert feed.member_id  # was published
+        assert len(feed.members_cache) == 1
+
+    def test_join_rejects_malformed_url(self, fake_feed_endpoints, capsys):
+        rc = nomnom.cmd_join(
+            argparse.Namespace(url="not-a-url", name=None, default=False),
+        )
+        assert rc == 1
+
+
+class TestCmdFeedsList:
+    def test_lists_default_marker(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        cfg = nomnom._empty_feeds_config()
+        nomnom._add_or_replace_feed(cfg, _make_feed(name="home"))
+        nomnom._add_or_replace_feed(
+            cfg, _make_feed(name="work", feed_id="abcDEF99_-zy"),
+        )
+        nomnom._save_feeds_config(cfg)
+        rc = nomnom.cmd_feeds(argparse.Namespace(action="list"))
+        assert rc == 0
+        out = capsys.readouterr().out
+        # default marker on the first feed
+        assert " * home" in out
+        assert "   work" in out
+
+    def test_empty_message(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        rc = nomnom.cmd_feeds(argparse.Namespace(action="list"))
+        assert rc == 0
+        assert "no feeds" in capsys.readouterr().err
+
+
+class TestCmdFeedsActions:
+    @pytest.fixture
+    def feed_config(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        cfg = nomnom._empty_feeds_config()
+        nomnom._add_or_replace_feed(cfg, _make_feed(name="home"))
+        nomnom._save_feeds_config(cfg)
+        return tmp_path
+
+    def test_url_prints_feed_url(self, feed_config, capsys):
+        rc = nomnom.cmd_feeds(argparse.Namespace(action="url", name="home"))
+        assert rc == 0
+        assert "https://relay.example.com/f/" in capsys.readouterr().out
+
+    def test_url_missing_feed(self, feed_config, capsys):
+        rc = nomnom.cmd_feeds(argparse.Namespace(action="url", name="missing"))
+        assert rc == 1
+
+    def test_default_updates_default(self, feed_config, capsys):
+        # Add a second feed first.
+        cfg = nomnom._load_feeds_config()
+        nomnom._add_or_replace_feed(
+            cfg, _make_feed(name="work", feed_id="abcDEF99_-zy"),
+        )
+        nomnom._save_feeds_config(cfg)
+        rc = nomnom.cmd_feeds(argparse.Namespace(action="default", name="work"))
+        assert rc == 0
+        assert nomnom._load_feeds_config()["default"] == "work"
+
+    def test_rename_updates_name(self, feed_config, capsys):
+        rc = nomnom.cmd_feeds(argparse.Namespace(
+            action="rename", name="home", new_name="house",
+        ))
+        assert rc == 0
+        cfg = nomnom._load_feeds_config()
+        assert cfg["feeds"][0].name == "house"
+        assert cfg["default"] == "house"  # default tracked the rename
+
+    def test_rename_rejects_existing_target(self, feed_config, capsys):
+        cfg = nomnom._load_feeds_config()
+        nomnom._add_or_replace_feed(
+            cfg, _make_feed(name="work", feed_id="abcDEF99_-zy"),
+        )
+        nomnom._save_feeds_config(cfg)
+        rc = nomnom.cmd_feeds(argparse.Namespace(
+            action="rename", name="home", new_name="work",
+        ))
+        assert rc == 1
+
+    def test_leave_removes_feed_and_calls_relay(
+        self, feed_config, monkeypatch, capsys,
+    ):
+        called = {}
+        monkeypatch.setattr(
+            nomnom, "_relay_delete_member",
+            lambda host, fid, fkey, mid: called.setdefault("ok", True),
+        )
+        rc = nomnom.cmd_feeds(argparse.Namespace(action="leave", name="home"))
+        assert rc == 0
+        cfg = nomnom._load_feeds_config()
+        assert cfg["feeds"] == []
+        assert cfg["default"] is None
+        assert called.get("ok") is True
+
+    def test_extend_calls_relay_and_updates_local(
+        self, feed_config, monkeypatch, capsys,
+    ):
+        monkeypatch.setattr(
+            nomnom, "_relay_extend_feed",
+            lambda host, fid, fkey, ttl: {"expires_at": 3_000_000_000},
+        )
+        rc = nomnom.cmd_feeds(argparse.Namespace(
+            action="extend", name="home", ttl=7200,
+        ))
+        assert rc == 0
+        cfg = nomnom._load_feeds_config()
+        assert cfg["feeds"][0].expires_at == 3_000_000_000
+
+    def test_extend_rejects_short_ttl(self, feed_config, capsys):
+        rc = nomnom.cmd_feeds(argparse.Namespace(
+            action="extend", name="home", ttl=30,
+        ))
+        assert rc == 1
+
+
+class TestFeedUrl:
+    def test_format_with_bare_host(self):
+        url = nomnom._format_feed_url("relay.example.com", "abc12345")
+        assert url == "https://relay.example.com/f/abc12345"
+
+    def test_format_with_scheme(self):
+        url = nomnom._format_feed_url("https://relay.example.com/", "abc12345")
+        assert url == "https://relay.example.com/f/abc12345"
+
+    def test_parse_https(self):
+        host, token = nomnom._parse_feed_url("https://relay.example.com/f/abc12345")
+        assert host == "relay.example.com"
+        assert token == "abc12345"
+
+    def test_parse_without_scheme(self):
+        host, token = nomnom._parse_feed_url("relay.example.com/f/abc12345")
+        assert host == "relay.example.com"
+        assert token == "abc12345"
+
+    def test_parse_rejects_missing_f_path(self):
+        with pytest.raises(nomnom.NomnomError, match="/f/"):
+            nomnom._parse_feed_url("https://relay.example.com/")
+
+    def test_parse_rejects_empty(self):
+        with pytest.raises(nomnom.NomnomError, match="empty"):
+            nomnom._parse_feed_url("")
+
+    def test_parse_rejects_bad_token(self):
+        with pytest.raises(nomnom.NomnomError, match="url-safe base64"):
+            nomnom._parse_feed_url("https://relay.example.com/f/has spaces")
+
+    def test_parse_rejects_extra_path(self):
+        with pytest.raises(nomnom.NomnomError, match="malformed"):
+            nomnom._parse_feed_url("https://relay.example.com/f/abc/extra")
 

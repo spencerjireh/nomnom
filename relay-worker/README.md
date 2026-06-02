@@ -60,23 +60,24 @@ npx wrangler r2 bucket lifecycle list nomnom-relay
 
 This is belt-and-suspenders for the 5-minute protocol TTL. Without it, abandoned slots sit indefinitely.
 
-## Add more devices
+## Onboarding other devices
 
-On the first device you already ran `nomnom relay init`. To onboard a second device, grab a shareable join token:
-
-```sh
-# device 1
-nomnom relay show --token
-# relay.your-subdomain.workers.dev#k4n2pX9qLm3T
-```
-
-On the new device:
+In feeds v2 a join URL is per-feed, not per-relay. The first device mints a feed and shares the URL; other devices paste it. The relay HMAC stays on the device(s) that mint feeds.
 
 ```sh
-nomnom join 'relay.your-subdomain.workers.dev#k4n2pX9qLm3T'
+# device 1 (with relay configured)
+nomnom open --name home --default
+# opened feed 'home' (TTL 86400s).
+# share this URL with the other device:
+# https://relay.your-subdomain.workers.dev/f/k4n2pX9qLm3T
+
+# device 2 (no relay setup needed)
+nomnom join 'https://relay.your-subdomain.workers.dev/f/k4n2pX9qLm3T'
 ```
 
-`join` self-tests the relay and saves the config. Confirm end-to-end at any time:
+If you want to give another device permission to mint feeds on the same relay (i.e. fully share the deployment), copy `relay.json` over or hand them the relay-HMAC token from `nomnom relay show --token`. Most users won't need this — one minting device + many joiners is the usual shape.
+
+Verify end-to-end at any time:
 
 ```sh
 nomnom relay test
@@ -85,44 +86,57 @@ nomnom relay test
 
 ## Endpoints
 
-All requests except `/health` require:
+Two auth schemes:
 
-```
-Authorization: NMNM-HMAC-SHA256 <unix_ts>:<hex_mac>
-   mac = HMAC-SHA256(NOMNOM_HMAC_SECRET, method + "\n" + path + "\n" + unix_ts)
-```
+- **Relay HMAC** (per-deployment secret) gates `POST /feeds` and the legacy `/slots/*` paths:
 
-`unix_ts` must be within ±300 seconds of the Worker's clock.
+  ```
+  Authorization: NMNM-HMAC-SHA256 <unix_ts>:<hex_mac>
+     mac = HMAC-SHA256(NOMNOM_HMAC_SECRET, method + "\n" + path + "\n" + unix_ts)
+  ```
 
-| Method | Path | Body | Notes |
+- **Feed-key signature** (per-feed key derived from the URL token) gates `/feeds/:id/*`:
+
+  ```
+  Authorization: NMNM-FEEDKEY-SHA256 <unix_ts>:<hex_mac>
+     feed_key = HKDF-SHA256(salt="nomnom-feed-v1", ikm=urlsafeB64(feed_id), info=feed_id, length=32)
+     mac      = HMAC-SHA256(feed_key, method + "\n" + path + "\n" + unix_ts)
+  ```
+
+Either way, `unix_ts` must be within ±300 seconds of the Worker's clock.
+
+| Method | Path | Auth | Notes |
 |---|---|---|---|
-| `PUT` | `/slots/:slot_id` | raw bytes | 204 on success; 409 if slot occupied; 413 if Content-Length > 256 MB |
-| `GET` | `/slots/:slot_id?wait=<ms>` | — | 200 + body (deletes slot); 404 if empty after wait; 410 if expired. `wait` caps at 30000. |
-| `DELETE` | `/slots/:slot_id` | — | 204 (idempotent) — clients call this on cancel |
-| `GET` | `/health` | — | 200 "ok"; no HMAC |
+| `GET` | `/health` | none | `200 "ok"` |
+| `POST` | `/feeds` | relay HMAC | Body: `{ttl_seconds, member_card}`. Returns `{feed_id, created_at, expires_at}`. |
+| `GET` | `/feeds/:id/meta` | feed-key | Returns `{created_at, expires_at}` or 404/410. |
+| `POST` | `/feeds/:id/extend` | feed-key | Body: `{new_ttl_seconds}`. Anyone with the URL can extend. |
+| `DELETE` | `/feeds/:id` | feed-key | Closes the feed and purges its members + slots. |
+| `PUT` | `/feeds/:id/members/:mid` | feed-key | Publish a member card (identity_pubkey, name). |
+| `DELETE` | `/feeds/:id/members/:mid` | feed-key | Leave (deletes the card). |
+| `GET` | `/feeds/:id/members?wait=&since=` | feed-key | List roster, long-poll on `wait` until a new joiner appears since `since`. |
+| `PUT` | `/feeds/:id/slots/:slot_id` | feed-key | Write a post. Slots live until feed TTL; broadcast (no delete-on-read). |
+| `GET` | `/feeds/:id/slots/:slot_id?wait=` | feed-key | Long-poll fetch. |
+| `GET` | `/feeds/:id/slots?wait=&since=` | feed-key | List new slot ids since `since`, long-poll on `wait`. |
+| `PUT` | `/slots/:slot_id` | relay HMAC | Legacy: single-shot slot, delete-on-read. |
+| `GET` | `/slots/:slot_id?wait=` | relay HMAC | Legacy: long-poll + delete-on-read. |
+| `DELETE` | `/slots/:slot_id` | relay HMAC | Legacy: idempotent cancel. |
 
-`slot_id` matches `[A-Za-z0-9_-]{1,128}`.
+`feed_id` matches `[A-Za-z0-9_-]{8,32}`; `member_id` matches `[A-Za-z0-9_-]{8,64}`; `slot_id` matches `[A-Za-z0-9_-]{1,128}`.
 
-The HMAC authenticates clients to the Worker; it does not vouch for the body. Body integrity comes from nomnom's AEAD wrapper inside `slot_data` — the receiver's decrypt fails on tampering.
+The HMAC and feed-key signatures authenticate clients to the Worker; they do not vouch for posted bodies. Body integrity + sender authenticity come from nomnom's AEAD wrapper + Ed25519 signature inside the slot payload — the receiver's decrypt fails on tampering and the signature catches impersonation by URL holders.
 
-## Rotating the secret
+## Rotating the relay HMAC
 
-Wipe the local config on one device and re-run `nomnom relay init` to generate a fresh secret, then push + deploy it, then `join` the rest of the devices with a new token.
+Wipe the local config on one device and re-run `nomnom relay init` to generate a fresh secret, then push + deploy it. Other devices keep working without changes — feed-key signatures don't depend on the HMAC, so existing feeds stay reachable. Only minting (`nomnom open`) needs the new secret.
 
 ```sh
-# device that will own the new secret:
 nomnom relay clear
 nomnom relay init
 # follow the printed wrangler commands to push the new secret and deploy
-
-nomnom relay show --token   # share with the other devices
-
-# on every other device:
-nomnom relay clear
-nomnom join '<new-token>'
 ```
 
-There is no `nomnom relay rotate-secret` command in this version. Rotation is intentionally manual because it requires coordination across every device using the relay.
+There is no `nomnom relay rotate-secret` command. Rotation is intentionally manual because it requires coordination with any other device that mints feeds on this deployment.
 
 ## Cost and limits
 
@@ -140,10 +154,15 @@ The Worker itself enforces a 256 MB hard cap regardless of plan.
 ## What the relay sees
 
 - Ciphertext (opaque). The Worker cannot decrypt your files.
-- Slot ids, which deterministically correlate the same peer-pair across transfers. An adversary with read access to your R2 bucket sees "device A and device B exchanged something at time T" — they cannot tell what.
+- Feed ids in URLs and request logs. Feed members publish (encrypted) cards under `/feeds/<id>/members/...`, so an adversary with read access to your R2 bucket sees who participates in which feed and when — they cannot tell what was sent.
 - Source IPs in Cloudflare's standard request logs.
 
-The HMAC secret is a **deployment** credential, not a per-peer credential. Anyone with `relay.json` can publish to slots and consume from slots on your Worker. Peer-to-peer authentication is handled by nomnom's TOFU identity pins, independently of the relay.
+The relay has two credentials:
+
+- The **HMAC secret** is a *deployment* credential. Anyone with `relay.json` can mint new feeds and use the legacy `/slots/*` endpoints on your Worker. Treat it like an SSH key for the relay.
+- A **feed URL** is a *per-feed* credential. Anyone with it can read and post in that feed for as long as the feed lives, but can't touch any other feed or mint new ones. Sharing a feed URL is intentionally a much smaller surface than sharing relay creds.
+
+Sender authentication inside feeds is handled by nomnom's Ed25519 signatures + TOFU identity pins (`~/.config/nomnom/known_peers.json`), independently of the relay.
 
 ## Local development
 

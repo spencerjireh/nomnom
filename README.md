@@ -19,7 +19,7 @@ nomnom .
 
 Opens a picker for the current directory. Pick files, hit `Enter`, get `./<repo>-<timestamp>.txt`. `.gitignore`, junk dirs (`.git`, `node_modules`, …), binaries, symlinks, and obvious secrets are skipped before the picker loads.
 
-Bare `nomnom` on a TTY opens a launcher with tiles for Bundle, Send, Receive, Pair, Commit, PR, Review, Rebuild, Pins, and Extensions. Inside the picker, `v` cycles bundle / `commit` / `pr` / `review` when run from inside a git repo.
+Bare `nomnom` on a TTY opens a launcher with tiles for Bundle, Send, Receive, Feeds, Commit, PR, Review, Rebuild, and Extensions. Inside the picker, `v` cycles bundle / `commit` / `pr` / `review` when run from inside a git repo.
 
 Output mirrors [repomix](https://github.com/yamadashy/repomix)'s shape:
 
@@ -107,128 +107,149 @@ Never overwrites. Path-escape attempts (absolute paths, `..` segments) are refus
 
 ## Send between machines (via your own relay)
 
-`pair`, `send`, and `receive` move files between machines through a Cloudflare Worker you deploy to your own account. Nothing hits disk on the sender. The relay sees only ciphertext + per-pair rendezvous ids.
+`open`, `join`, `send`, and `receive` move files between machines through a
+**feed** on a Cloudflare Worker you deploy to your own account. A feed is a
+durable broadcast channel: one device mints it and shares a short URL; every
+other device pastes the URL to join. Sends to a feed reach every member; the
+URL is the credential. The relay sees only ciphertext + opaque slot ids.
 
 ### One-time setup
 
-Deploy the Worker (see [`relay-worker/README.md`](relay-worker/README.md)). Then on the first device:
+Deploy the Worker (see [`relay-worker/README.md`](relay-worker/README.md)). On the device that will own this relay:
 
 ```sh
-nomnom relay init            # prompts for Worker URL; auto-generates the HMAC secret
-                             # and prints the `wrangler secret put` + `wrangler deploy`
-                             # commands to push the secret and ship the Worker.
+nomnom relay init            # prompts for Worker URL; generates the HMAC secret
+                             # used to mint feeds; prints the `wrangler` commands
+                             # to push the secret and deploy.
 ```
 
-To onboard a second device, grab a single shareable join token from the first device and paste it on the new one — no need to re-type the URL or secret:
+### Open a feed and invite other devices
 
 ```sh
-# device 1
-nomnom relay show --token
-# relay.your-subdomain.workers.dev#k4n2pX9qLm3T
+# device 1 (with relay configured)
+nomnom open --name home --default
+# opened feed 'home' (TTL 86400s, expires at 1717459200).
+# share this URL with the other device:
+# https://relay.your-subdomain.workers.dev/f/k4n2pX9qLm3T
 
-# device 2
-nomnom join 'relay.your-subdomain.workers.dev#k4n2pX9qLm3T'
+# device 2 (no relay setup needed on this side — the URL is the credential)
+nomnom join 'https://relay.your-subdomain.workers.dev/f/k4n2pX9qLm3T'
+# joined feed 'feed-1' with 2 member(s).
 ```
+
+You can also open multiple feeds (`home`, `work`, etc.); `nomnom feeds default <name>` switches which feed `send`/`receive` use by default.
 
 ### Day-to-day
 
 ```sh
-# First contact (no pin yet) — both sides run `pair` at the same time:
-nomnom pair                          # identity-only handshake, TOFU on both ends
-
-# Recurring (after pairing, no extra ceremony):
-nomnom receive                       # listens until Ctrl-C, prints one line per file
-nomnom send report.txt               # auto-targets the single pinned peer
-nomnom send report.txt --to spencer-mac   # disambiguates if many
+nomnom receive                       # watch the default feed; one line per received file
+nomnom send report.txt               # broadcast to every other member of the default feed
+nomnom send report.txt --feed work   # broadcast to a different joined feed
 ```
 
 `receive` keeps the long-poll alive after each delivery, so you can leave a laptop listening and fire off `send` from another machine all afternoon. Pass `--once` to exit after the first received file (for scripting).
 
-`pair` is symmetric: whichever side wins the race at the rendezvous slot becomes the initiator, the other side falls back to responder. Pinning is local, so a one-sided TOFU decline just leaves that side unpinned; the other side times out after 30s with no harm.
+Each post is encrypted with the feed key derived from the URL token, and signed by the sender's Ed25519 identity key. Receivers verify the signature against the sender's pinned identity — a hostile relay (or a URL leak) can't impersonate a member without their identity private key.
 
-`--trust-new` auto-accepts the TOFU prompt (scriptable but loses verification; an audit line is still written to stderr). Max transfer size: 256 MB (capped at 100 MB on Cloudflare's free tier — see relay-worker/README.md).
+`--trust-new` auto-pins TOFU prompts (scriptable but loses verification; an audit line is still written to stderr). Max transfer size: 256 MB (capped at 100 MB on Cloudflare's free tier — see relay-worker/README.md).
 
-### Pinned peers
+### Managing feeds
 
 ```sh
-nomnom peers list                    # show pinned peers + fingerprints
-nomnom peers fingerprint spencer-mac # for out-of-band verification
-nomnom peers nickname dev-abc spencer   # short alias for --to
-nomnom peers forget spencer-mac      # drop a pin (then `nomnom pair` to re-pair)
+nomnom feeds list                                  # joined feeds + default marker + TTL
+nomnom feeds members home                          # fetch and display the live roster
+nomnom feeds url home                              # print the shareable URL
+nomnom feeds default work                          # switch the default
+nomnom feeds rename home house                     # rename a feed locally
+nomnom feeds extend home --ttl 604800              # bump expiry to a week from now
+nomnom feeds leave home                            # delete this device's member card, drop locally
+```
+
+### Pinned identities
+
+Sender authenticity is the load-bearing TOFU surface in v2: the first time
+any feed introduces an identity that this device has never seen, you get a
+prompt. After accepting, that identity is trusted globally — joining another
+feed where the same person already participates is silent.
+
+```sh
+nomnom peers list                    # show pinned identities + fingerprints
+nomnom peers fingerprint alice-mac   # for out-of-band verification
+nomnom peers forget alice-mac        # drop a pin (TOFU fires fresh on next sighting)
 ```
 
 ### From a browser
 
 [`nomnom-web/`](nomnom-web/README.md) is a browser client (Vite + React) that
-sends / receives / pairs against the same relay, fully interoperable with the CLI —
-its crypto is a byte-for-byte TypeScript port of `nomnom.py`, verified by committed
-cross-language fixtures. Deployed to Cloudflare Pages; the relay Worker allowlists
-its origin for CORS.
+participates in the same feeds as the CLI. Its crypto is a byte-for-byte
+TypeScript port of `nomnom.py`. Deployed to Cloudflare Pages; the relay
+Worker allowlists its origin for CORS.
 
 <details>
 <summary><b>Trust on first use</b></summary>
 
-Each machine has a long-term identity key in `~/.config/nomnom/identity.json`. The first transfer pins the peer's key in `~/.config/nomnom/known_peers.json`. If a pinned key changes, nomnom blocks:
+Each machine mints a long-term Ed25519 identity in `~/.config/nomnom/identity.json` on first run. The first time you see a member's identity across all feeds, nomnom prompts:
 
 ```text
-  WARNING: the identity key for 'bob-laptop' has CHANGED.
-    pinned:  b685:2bf3:e978:49de
-    offered: 9c01:7a4f:21bd:0e88
-  trust the new key and continue? [y/N]:
-```
-
-First contact prompts before any pin commits:
-
-```text
-  first contact with 'bob-laptop' (device 7a31f9d2c8b04e15).
+  first contact with 'bob-laptop'.
     fingerprint: 9c01:7a4f:21bd:0e88
-  verify this fingerprint out-of-band with the sender if it matters.
+  verify out-of-band if it matters.
   trust and pin this device? [y/N]:
 ```
 
-Anyone who can talk to your relay can land at the rendezvous, so verify the fingerprint out-of-band if it matters. `--trust-new` skips the prompt for scripted callers and still writes an audit line to stderr.
+Once pinned, that identity is trusted in every feed it appears in. Possessing a feed URL grants access to that one feed, but never impersonates anyone — the signature is the trust anchor, not the URL.
+
+`--trust-new` skips the prompt for scripted callers and writes an audit line to stderr.
 
 </details>
 
 <details>
 <summary><b>Crypto</b></summary>
 
-**Recurring transfers** (`send`/`receive` to an already-pinned peer): Triple-DH over RFC 3526 group 14 derives a fresh session key per transfer (forward secrecy, identity-pinned auth). The canonical pair of identity pubkeys is mixed into the key derivation, so a relay-level adversary cannot land on the same key without the long-term pin. Three-message handshake over the Worker: sender PUTs init blob → receiver fetches + PUTs response → sender encrypts + PUTs ciphertext → receiver fetches + decrypts.
+**Feed transport.** Each feed has a 32-byte symmetric key derived via HKDF-SHA256 from the URL token. Every member with the URL derives the same key; the Worker derives it on the fly per request to verify signatures. Posts are encrypted with ChaCha20-style keystream (HMAC-SHA256 as PRF) and authenticated with HMAC-SHA256 over (magic ‖ nonce ‖ ciphertext). The plaintext is `len(header) ‖ JSON header ‖ raw body`; the header carries the sender's member id, identity pubkey, filename, file size, content hash, posted timestamp, and an Ed25519 signature over the transcript (including the AEAD nonce, so a captured signature can't be replayed against a different ciphertext).
 
-**First contact (`pair`)**: identity-only, two-message exchange. Each side PUTs its identity pubkey + device id + name into the per-relay rendezvous slot derived from `scrypt(relay_secret, "nomnom-first-contact-v2", N=2^16)`; the scrypt cost slows offline brute-force on a captured rendezvous transcript. The secret itself is ~72 bits of url-safe base64 generated by `relay init` and shared via the `host#secret` join token. No DH, no session key, no payload — the trust claim narrows to "anyone with the relay secret can land at the rendezvous; TOFU confirms device identity." Verify the fingerprint out-of-band if it matters.
+**Sender authentication.** Each device has an Ed25519 keypair (`sig_priv` / `sig_pub`) generated on first run. Posts are signed by `sig_priv`; receivers verify against the sender's pinned `sig_pub`. Global TOFU (`~/.config/nomnom/known_peers.json`) gates first sightings; subsequent feeds where the same identity appears are silent.
 
-Each slot expires in 5 min on the Worker; bucket lifecycle deletes orphans after 1 day. The Worker's HMAC authenticates clients to your relay; body integrity comes from the AEAD wrapper (encrypt-then-HMAC-SHA256 in counter mode, keys via scrypt).
+**Worker auth.** Two layers:
+- `POST /feeds` (mint) is gated by the per-deployment HMAC secret. Only people with your relay HMAC can create feeds on your Worker.
+- `/feeds/:id/*` (member roster, slots, extend, close) is gated by a per-request signature derived from the feed key via HKDF. Anyone with the URL can talk to the Worker about that feed; nothing else on the relay is reachable.
+
+This split means a feed URL can be safely shared cross-account: the recipient gets access to that one feed without seeing or holding your relay credential. Each slot lives until feed TTL (default 1 day); the R2 bucket lifecycle collects orphans after 1 day.
 
 </details>
 
 <details>
-<summary><b>Relay config</b></summary>
+<summary><b>Config commands</b></summary>
 
 | Command | Effect |
 | --- | --- |
-| `nomnom relay init` | First-device setup: prompt URL, generate HMAC secret, save, print the `wrangler secret put` + `wrangler deploy` commands. |
-| `nomnom join <token>` | Other-device setup: paste a `host#secret` token from `relay show --token`. |
-| `nomnom relay show` | Prints URL; redacts secret. |
-| `nomnom relay show --token` | Prints the shareable `host#secret` join token (secret in clear). |
-| `nomnom relay test` | Round-trip: hits `/health` then PUT + GET a random slot. |
-| `nomnom relay clear` | Deletes `~/.config/nomnom/relay.json`. |
+| `nomnom relay init` | Prompt URL, generate HMAC secret, save to `relay.json`, print the `wrangler secret put` + `wrangler deploy` commands. |
+| `nomnom relay show [--token]` | Print URL (secret redacted). `--token` prints the `host#secret` token used to give another device permission to mint feeds on your relay. |
+| `nomnom relay test` | Round-trip: HMAC self-check via `/health` + `/slots`. |
+| `nomnom relay clear` | Delete `~/.config/nomnom/relay.json`. |
+| `nomnom open [--name N] [--ttl S] [--default]` | Mint a feed on the configured relay. |
+| `nomnom join <url> [--name N] [--default]` | Join a feed; auto-publishes a member card. |
+| `nomnom feeds list / members / url / default / rename / leave / extend` | Local + remote feed management. |
+| `nomnom send <path> [--feed N]` | Broadcast a file to a feed. |
+| `nomnom receive [--feed N] [--once]` | Watch a feed for incoming posts. |
+| `nomnom peers list / fingerprint / forget` | Global identity pin management. |
 
 </details>
 
 <details>
 <summary><b>Reset all state</b></summary>
 
-`nomnom reset` wipes `~/.config/nomnom/` after a y/N prompt — identity, pinned peers, and relay config in one shot. Refuses on a non-tty stdin so a piped invocation can't accidentally blow it away.
+`nomnom reset` wipes `~/.config/nomnom/` after a y/N prompt — identity, pinned identities, joined feeds, and relay config in one shot. Refuses on a non-tty stdin so a piped invocation can't accidentally blow it away.
 
 ```sh
 nomnom reset
-# about to delete /Users/you/.config/nomnom and 3 entries
-# (identity.json, known_peers.json, relay.json).
-# identity rotation will invalidate every pin on every paired device.
+# about to delete /Users/you/.config/nomnom and N entries
+# (identity.json, known_peers.json, feeds.json, relay.json).
+# this wipes identity, pinned identities, joined feeds, and relay config.
 # proceed? [y/N]: y
 ```
 
-After reset the next `nomnom relay init` (or `nomnom join`) regenerates a fresh identity. Other devices that previously paired with you will see a TOFU mismatch on the next transfer; re-pair to re-establish trust.
+After reset the next `nomnom relay init` (or `nomnom open` / `nomnom join`) regenerates a fresh identity. Other devices that previously had this identity pinned will see a TOFU prompt on the next feed-shared post.
 
 </details>
 

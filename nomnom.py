@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import ast
 import base64
+import binascii
 import contextlib
 import curses
 import enum
@@ -2470,6 +2471,166 @@ def _pick_decrypted_path(parent: Path, name: str) -> Path:
     return _unique_path(parent / name, start=1)
 
 
+# ----- HKDF (RFC 5869) -----
+
+def _hkdf(*, salt: bytes, ikm: bytes, info: bytes, length: int) -> bytes:
+    """HKDF-SHA256: Extract-then-Expand. Returns `length` bytes (<=255*32)."""
+    if length > 255 * 32:
+        raise ValueError("hkdf: length too large")
+    prk = hmac.new(salt, ikm, hashlib.sha256).digest()
+    out = b""
+    t = b""
+    counter = 1
+    while len(out) < length:
+        t = hmac.new(prk, t + info + bytes([counter]), hashlib.sha256).digest()
+        out += t
+        counter += 1
+    return out[:length]
+
+
+# ----- Ed25519 (RFC 8032 reference, pure Python) -----
+#
+# A minimal Ed25519 implementation for sender authentication on feed posts.
+# Sign / verify take ~50ms each on CPython. The interface (sign / verify
+# / pub-from-seed) is a strict subset of PyNaCl's signing module so the
+# logic is easy to spot-check against the spec.
+
+_ED_P = 2 ** 255 - 19
+_ED_L = 2 ** 252 + 27742317777372353535851937790883648493
+_ED_D = -121665 * pow(121666, _ED_P - 2, _ED_P) % _ED_P
+_ED_I = pow(2, (_ED_P - 1) // 4, _ED_P)
+
+
+def _ed_h(m: bytes) -> bytes:
+    return hashlib.sha512(m).digest()
+
+
+def _ed_recover_x(y: int, sign: int) -> int | None:
+    if y >= _ED_P:
+        return None
+    x2 = (y * y - 1) * pow(_ED_D * y * y + 1, _ED_P - 2, _ED_P) % _ED_P
+    if x2 == 0:
+        return 0 if sign == 0 else None
+    x = pow(x2, (_ED_P + 3) // 8, _ED_P)
+    if (x * x - x2) % _ED_P != 0:
+        x = x * _ED_I % _ED_P
+    if (x * x - x2) % _ED_P != 0:
+        return None
+    if (x & 1) != sign:
+        x = _ED_P - x
+    return x
+
+
+# Generator B = (Bx, By) on curve -x^2 + y^2 = 1 + d x^2 y^2 (Edwards).
+_ED_BY = 4 * pow(5, _ED_P - 2, _ED_P) % _ED_P
+_ED_BX = _ed_recover_x(_ED_BY, 0)
+if _ED_BX is None:
+    raise RuntimeError("ed25519: failed to recover base point x")
+_ED_B = (_ED_BX % _ED_P, _ED_BY % _ED_P, 1, _ED_BX * _ED_BY % _ED_P)
+
+
+def _ed_point_add(P, Q):
+    # Extended Edwards coordinates: (X, Y, Z, T). Affine point is (X/Z, Y/Z).
+    x1, y1, z1, t1 = P
+    x2, y2, z2, t2 = Q
+    a = (y1 - x1) * (y2 - x2) % _ED_P
+    b = (y1 + x1) * (y2 + x2) % _ED_P
+    c = 2 * t1 * t2 * _ED_D % _ED_P
+    d = 2 * z1 * z2 % _ED_P
+    e = b - a
+    f = d - c
+    g = d + c
+    h = b + a
+    return (e * f % _ED_P, g * h % _ED_P, f * g % _ED_P, e * h % _ED_P)
+
+
+def _ed_scalar_mult(P, n: int):
+    Q = (0, 1, 1, 0)  # identity
+    while n > 0:
+        if n & 1:
+            Q = _ed_point_add(Q, P)
+        P = _ed_point_add(P, P)
+        n >>= 1
+    return Q
+
+
+def _ed_point_encode(P) -> bytes:
+    x, y, z, _ = P
+    zi = pow(z, _ED_P - 2, _ED_P)
+    x = x * zi % _ED_P
+    y = y * zi % _ED_P
+    return ((y & ((1 << 255) - 1)) | ((x & 1) << 255)).to_bytes(32, "little")
+
+
+def _ed_point_decode(s: bytes):
+    if len(s) != 32:
+        return None
+    raw = int.from_bytes(s, "little")
+    sign = (raw >> 255) & 1
+    y = raw & ((1 << 255) - 1)
+    x = _ed_recover_x(y, sign)
+    if x is None:
+        return None
+    return (x, y, 1, x * y % _ED_P)
+
+
+def _ed_clamp(seed_hash: bytes) -> int:
+    a = bytearray(seed_hash[:32])
+    a[0] &= 248
+    a[31] &= 127
+    a[31] |= 64
+    return int.from_bytes(a, "little")
+
+
+def ed25519_pub_from_seed(seed: bytes) -> bytes:
+    """Derive the 32-byte public key from a 32-byte Ed25519 seed."""
+    if len(seed) != 32:
+        raise ValueError("ed25519: seed must be 32 bytes")
+    h = _ed_h(seed)
+    a = _ed_clamp(h)
+    return _ed_point_encode(_ed_scalar_mult(_ED_B, a))
+
+
+def ed25519_keypair() -> tuple[bytes, bytes]:
+    """Return (seed, pub) where seed is 32 random bytes, pub is 32 bytes."""
+    seed = secrets.token_bytes(32)
+    return seed, ed25519_pub_from_seed(seed)
+
+
+def ed25519_sign(msg: bytes, seed: bytes) -> bytes:
+    """Sign `msg` under the 32-byte Ed25519 seed. Returns 64 bytes."""
+    if len(seed) != 32:
+        raise ValueError("ed25519: seed must be 32 bytes")
+    h = _ed_h(seed)
+    a = _ed_clamp(h)
+    prefix = h[32:64]
+    pub = _ed_point_encode(_ed_scalar_mult(_ED_B, a))
+    r = int.from_bytes(_ed_h(prefix + msg), "little") % _ED_L
+    R = _ed_scalar_mult(_ED_B, r)
+    R_enc = _ed_point_encode(R)
+    k = int.from_bytes(_ed_h(R_enc + pub + msg), "little") % _ED_L
+    s = (r + k * a) % _ED_L
+    return R_enc + s.to_bytes(32, "little")
+
+
+def ed25519_verify(msg: bytes, sig: bytes, pub: bytes) -> bool:
+    """Verify a 64-byte signature on `msg` under a 32-byte pubkey."""
+    if len(sig) != 64 or len(pub) != 32:
+        return False
+    R = _ed_point_decode(sig[:32])
+    A = _ed_point_decode(pub)
+    if R is None or A is None:
+        return False
+    s = int.from_bytes(sig[32:64], "little")
+    if s >= _ED_L:
+        return False
+    k = int.from_bytes(_ed_h(sig[:32] + pub + msg), "little") % _ED_L
+    sB = _ed_scalar_mult(_ED_B, s)
+    kA = _ed_scalar_mult(A, k)
+    rhs = _ed_point_add(R, kA)
+    return _ed_point_encode(sB) == _ed_point_encode(rhs)
+
+
 # ----- identity + known-peer (TOFU) store -----
 
 def _nomnom_config_dir() -> Path:
@@ -2483,8 +2644,13 @@ def _nomnom_config_dir() -> Path:
 def _load_identity() -> dict:
     """Return this machine's identity, creating/upgrading it on first use.
 
-    Identity is {device_id, name, ik_priv, ik_pub} where ik_* is a long-term
-    Diffie-Hellman keypair (hex) used to authenticate transfers under TOFU.
+    Identity holds:
+      - device_id, name
+      - sig_priv / sig_pub: Ed25519 seed + public key (hex), used to sign
+        outgoing feed posts so receivers can verify a post under the URL-token
+        crypto came from this machine and not from another URL holder.
+      - ik_priv / ik_pub: long-term DH keypair (hex), kept for backwards
+        compatibility with v1 transfer code; unused by feeds v2.
     """
     path = _nomnom_config_dir() / "identity.json"
     ident: dict = {}
@@ -2505,6 +2671,11 @@ def _load_identity() -> dict:
         priv, pub = _dh_keypair()
         ident["ik_priv"] = format(priv, "x")
         ident["ik_pub"] = format(pub, "x")
+        changed = True
+    if not ident.get("sig_priv") or not ident.get("sig_pub"):
+        seed, pub = ed25519_keypair()
+        ident["sig_priv"] = seed.hex()
+        ident["sig_pub"] = pub.hex()
         changed = True
     if changed:
         try:
@@ -2874,6 +3045,563 @@ def _tofu_check_join(peer: dict) -> bool:
     return True
 
 
+# ----- feed TOFU (global identity pinning, keyed by Ed25519 sig_pub) -----
+#
+# Feed posts are signed by the sender's Ed25519 identity key. We pin those
+# identities globally (across all feeds) so the same person stays trusted no
+# matter how many feeds they join. The synthetic peer id is `feed-<sig_pub16>`
+# so v2-pinned identities don't collide with any legacy DH pins still on disk.
+
+
+def _feed_peer_id(sig_pub_hex: str) -> str:
+    return f"feed-{sig_pub_hex[:16]}"
+
+
+def _find_pinned_sig(sig_pub_hex: str) -> tuple[str, dict] | None:
+    """Return (peer_id, record) for an existing global pin on this sig_pub."""
+    if not sig_pub_hex:
+        return None
+    for pid, rec in _load_known_peers().items():
+        if isinstance(rec, dict) and rec.get("sig_pub") == sig_pub_hex:
+            return pid, rec
+    return None
+
+
+def _save_feed_pin(sig_pub_hex: str, name: str) -> None:
+    """Pin (or refresh) a feed member's Ed25519 identity globally."""
+    peers = _load_known_peers()
+    existing = _find_pinned_sig(sig_pub_hex)
+    if existing is not None:
+        pid, rec = existing
+        rec["name"] = name
+        peers[pid] = rec
+    else:
+        pid = _feed_peer_id(sig_pub_hex)
+        peers[pid] = {
+            "name": name,
+            "sig_pub": sig_pub_hex,
+            "first_seen": int(time.time()),
+        }
+    _save_known_peers(peers)
+
+
+def _tofu_check_feed_member(
+    card: dict, *, trust_new: bool = False,
+) -> bool:
+    """Run TOFU on a feed member card. Returns True if trusted, False if declined.
+
+    The card looks like {member_id, identity_pubkey, name}. We pin globally by
+    identity_pubkey (sig_pub_hex). On first-ever sighting we either auto-pin
+    (trust_new) or prompt; subsequent feeds where the same identity appears
+    are silent. A mismatch (same person's sig_pub seen with a DIFFERENT
+    fingerprint we already pinned) can't happen since the pin IS keyed by
+    sig_pub — a different sig_pub is a different identity from our POV.
+    """
+    sig_pub = card.get("identity_pubkey")
+    name = card.get("name") or "(no name)"
+    if not isinstance(sig_pub, str) or not sig_pub:
+        return False
+    if _find_pinned_sig(sig_pub) is not None:
+        return True
+    if trust_new:
+        _save_feed_pin(sig_pub, name)
+        if not _in_tui():
+            sys.stderr.write(
+                f"audit: TOFU pinned {name!r} (fingerprint "
+                f"{_ik_fingerprint(sig_pub)})\n",
+            )
+        return True
+    _tofu_assert_main_thread()
+    sys.stderr.write("\n")
+    sys.stderr.write(f"  first contact with {name!r}.\n")
+    sys.stderr.write(f"    fingerprint: {_ik_fingerprint(sig_pub)}\n")
+    sys.stderr.write(
+        "  verify out-of-band if it matters.\n",
+    )
+    sys.stderr.write("  trust and pin this device? [y/N]: ")
+    sys.stderr.flush()
+    try:
+        ans = input().strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return False
+    if ans in ("y", "yes"):
+        _save_feed_pin(sig_pub, name)
+        return True
+    return False
+
+
+# ---------- feed crypto ----------
+#
+# Feeds v2 transport.
+#
+# The user-facing URL is host/f/<token>. The token is the credential, and
+# every member of the feed derives the same symmetric AEAD key from it. The
+# Worker authenticates per-request signatures the same way (HMAC keyed by the
+# feed_key), so anyone holding the URL can talk to the Worker for that feed
+# but nothing else on the relay.
+#
+# Sender authenticity comes from a separate Ed25519 signature over each post's
+# transcript: posts unsigned (or signed by a key that doesn't match the
+# claimed member's pinned identity) are dropped.
+
+_FEED_MAGIC = b"NMNF\x01"  # 4-byte tag + 1-byte format version
+_FEED_NONCE_LEN = 12
+_FEED_MAC_LEN = 32
+_FEED_HEADER_LEN = len(_FEED_MAGIC) + _FEED_NONCE_LEN + _FEED_MAC_LEN
+_FEED_KEY_SALT = b"nomnom-feed-v1"
+_FEED_ENC_INFO = b"nomnom-feed-enc"
+_FEED_MAC_INFO = b"nomnom-feed-mac"
+_FEED_SIG_DOMAIN = b"nomnom-feed-sig-v1"
+
+
+def _urlsafe_b64decode_loose(s: str) -> bytes:
+    """Decode URL-safe base64, tolerating missing padding."""
+    s = s.strip()
+    pad = (-len(s)) % 4
+    return base64.urlsafe_b64decode(s + "=" * pad)
+
+
+_FEED_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{8,32}$")
+
+
+def _feed_key_from_token(token: str) -> bytes:
+    """Derive the 32-byte feed key from the URL token.
+
+    Mirrors the Worker's HKDF-SHA256 derivation: salt=`nomnom-feed-v1`,
+    ikm=raw bytes of the URL token, info=the token's string form. Both ends
+    must agree byte-for-byte; the Worker derives the same key on every
+    /feeds/:id/* request to verify signatures.
+    """
+    if not token:
+        raise ValueError("feed token must not be empty")
+    if not _FEED_TOKEN_RE.match(token):
+        raise ValueError(
+            "feed token must be 8-32 url-safe base64 chars",
+        )
+    try:
+        ikm = _urlsafe_b64decode_loose(token)
+    except (binascii.Error, ValueError) as e:
+        raise ValueError(f"feed token is not valid url-safe base64: {e}") from e
+    return _hkdf(salt=_FEED_KEY_SALT, ikm=ikm, info=token.encode("ascii"), length=32)
+
+
+def _feed_subkeys(feed_key: bytes) -> tuple[bytes, bytes]:
+    """Derive (enc_key, mac_key) from the feed key via HKDF-Expand."""
+    enc = _hkdf(salt=b"", ikm=feed_key, info=_FEED_ENC_INFO, length=32)
+    mac = _hkdf(salt=b"", ikm=feed_key, info=_FEED_MAC_INFO, length=32)
+    return enc, mac
+
+
+def _feed_request_mac(feed_key: bytes, method: str, path: str, ts: int) -> str:
+    """Compute the per-request signature for /feeds/:id/* endpoints."""
+    msg = f"{method}\n{path}\n{ts}".encode("ascii")
+    return hmac.new(feed_key, msg, hashlib.sha256).hexdigest()
+
+
+def _feed_sig_transcript(
+    *,
+    feed_id: str,
+    sender_member_id: str,
+    sender_sig_pub_hex: str,
+    filename: str,
+    file_size: int,
+    content_hash: bytes,
+    posted_at: int,
+    nonce: bytes,
+) -> bytes:
+    """Hash the bound-together fields a sender signs over.
+
+    Includes the AEAD nonce so a captured signature can't be replayed against
+    a different ciphertext for the same logical message.
+    """
+    parts = [
+        _FEED_SIG_DOMAIN,
+        feed_id.encode("ascii"),
+        sender_member_id.encode("ascii"),
+        bytes.fromhex(sender_sig_pub_hex),
+        filename.encode("utf-8"),
+        file_size.to_bytes(8, "big"),
+        content_hash,
+        posted_at.to_bytes(8, "big"),
+        nonce,
+    ]
+    h = hashlib.sha256()
+    for p in parts:
+        h.update(len(p).to_bytes(2, "big"))
+        h.update(p)
+    return h.digest()
+
+
+def _feed_pack_header(header: dict) -> bytes:
+    """Pack a JSON header with a 2-byte length prefix (max 64 KB)."""
+    raw = json.dumps(header, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    if len(raw) > 0xFFFF:
+        raise ValueError("feed header too large")
+    return len(raw).to_bytes(2, "big") + raw
+
+
+def _feed_unpack_header(plaintext: bytes) -> tuple[dict, bytes]:
+    """Inverse of _feed_pack_header. Returns (header_dict, body_bytes)."""
+    if len(plaintext) < 2:
+        raise ValueError("feed plaintext truncated")
+    n = int.from_bytes(plaintext[:2], "big")
+    if len(plaintext) < 2 + n:
+        raise ValueError("feed plaintext truncated")
+    try:
+        header = json.loads(plaintext[2:2 + n].decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as e:
+        raise ValueError(f"feed header is not valid JSON: {e}") from e
+    if not isinstance(header, dict):
+        raise ValueError("feed header is not a JSON object")
+    return header, plaintext[2 + n:]
+
+
+def feed_seal(
+    *,
+    feed_key: bytes,
+    feed_id: str,
+    sender_member_id: str,
+    sender_sig_priv_hex: str,
+    sender_sig_pub_hex: str,
+    filename: str,
+    body: bytes,
+    posted_at: int | None = None,
+    _nonce: bytes | None = None,
+) -> bytes:
+    """Encrypt and authenticate a single feed post.
+
+    Wire format:
+        magic(5) || nonce(12) || mac(32) || ciphertext
+
+    The ciphertext encrypts a length-prefixed JSON header followed by the raw
+    file body. The header carries the sender's identity, the file metadata,
+    and an Ed25519 signature over a transcript that includes the nonce.
+
+    `_nonce` is a test hook; production callers leave it None.
+    """
+    nonce = _nonce if _nonce is not None else secrets.token_bytes(_FEED_NONCE_LEN)
+    content_hash = hashlib.sha256(body).digest()
+    when = posted_at if posted_at is not None else int(time.time())
+    transcript = _feed_sig_transcript(
+        feed_id=feed_id,
+        sender_member_id=sender_member_id,
+        sender_sig_pub_hex=sender_sig_pub_hex,
+        filename=filename,
+        file_size=len(body),
+        content_hash=content_hash,
+        posted_at=when,
+        nonce=nonce,
+    )
+    sig = ed25519_sign(transcript, bytes.fromhex(sender_sig_priv_hex))
+    header = {
+        "v": 1,
+        "fid": feed_id,
+        "smid": sender_member_id,
+        "sik": sender_sig_pub_hex,
+        "fn": filename,
+        "fs": len(body),
+        "ch": content_hash.hex(),
+        "pa": when,
+        "sig": sig.hex(),
+    }
+    plaintext = _feed_pack_header(header) + body
+    enc_key, mac_key = _feed_subkeys(feed_key)
+    ciphertext = _stream_xor(enc_key, nonce, plaintext)
+    mac = hmac.new(
+        mac_key, _FEED_MAGIC + nonce + ciphertext, hashlib.sha256,
+    ).digest()
+    return _FEED_MAGIC + nonce + mac + ciphertext
+
+
+def feed_open(
+    *,
+    feed_key: bytes,
+    feed_id: str,
+    blob: bytes,
+    expect_member_id: str | None = None,
+    expect_sig_pub_hex: str | None = None,
+) -> tuple[dict, bytes]:
+    """Verify and decrypt a single feed post.
+
+    Returns (header_dict, body_bytes). Raises ValueError on tamper, signature
+    mismatch, or content-hash mismatch. `expect_member_id` /
+    `expect_sig_pub_hex` are optional callsite assertions: if set, the
+    decoded post must match them or verification fails.
+    """
+    if len(blob) < _FEED_HEADER_LEN:
+        raise ValueError("feed blob too short")
+    if blob[:len(_FEED_MAGIC)] != _FEED_MAGIC:
+        raise ValueError("not a feed post (bad magic)")
+    off = len(_FEED_MAGIC)
+    nonce = blob[off:off + _FEED_NONCE_LEN]; off += _FEED_NONCE_LEN
+    mac = blob[off:off + _FEED_MAC_LEN]; off += _FEED_MAC_LEN
+    ciphertext = blob[off:]
+    enc_key, mac_key = _feed_subkeys(feed_key)
+    expected = hmac.new(
+        mac_key, _FEED_MAGIC + nonce + ciphertext, hashlib.sha256,
+    ).digest()
+    if not hmac.compare_digest(expected, mac):
+        raise ValueError("feed authentication failed")
+    plaintext = _stream_xor(enc_key, nonce, ciphertext)
+    header, body = _feed_unpack_header(plaintext)
+    try:
+        sender_member_id = header["smid"]
+        sender_sig_pub_hex = header["sik"]
+        filename = header["fn"]
+        file_size = header["fs"]
+        content_hash_hex = header["ch"]
+        posted_at = header["pa"]
+        sig_hex = header["sig"]
+    except KeyError as e:
+        raise ValueError(f"feed header missing field: {e}") from e
+    if (not isinstance(sender_member_id, str)
+            or not isinstance(sender_sig_pub_hex, str)
+            or not isinstance(filename, str)
+            or not isinstance(file_size, int)
+            or not isinstance(content_hash_hex, str)
+            or not isinstance(posted_at, int)
+            or not isinstance(sig_hex, str)):
+        raise ValueError("feed header has wrong field types")
+    if "/" in filename or "\\" in filename or filename in (".", ".."):
+        raise ValueError(f"refusing unsafe filename in feed post: {filename!r}")
+    if file_size != len(body):
+        raise ValueError(
+            f"feed file_size mismatch: header says {file_size}, body has {len(body)}",
+        )
+    actual_hash = hashlib.sha256(body).digest()
+    try:
+        claimed_hash = bytes.fromhex(content_hash_hex)
+    except ValueError as e:
+        raise ValueError("feed content_hash is not hex") from e
+    if not hmac.compare_digest(actual_hash, claimed_hash):
+        raise ValueError("feed content_hash mismatch (body corrupted)")
+    if expect_member_id is not None and sender_member_id != expect_member_id:
+        raise ValueError("feed sender_member_id mismatch")
+    if expect_sig_pub_hex is not None and sender_sig_pub_hex != expect_sig_pub_hex:
+        raise ValueError("feed sender_sig_pub mismatch")
+    try:
+        sig = bytes.fromhex(sig_hex)
+        pub = bytes.fromhex(sender_sig_pub_hex)
+    except ValueError as e:
+        raise ValueError(f"feed signature/pubkey not hex: {e}") from e
+    transcript = _feed_sig_transcript(
+        feed_id=feed_id,
+        sender_member_id=sender_member_id,
+        sender_sig_pub_hex=sender_sig_pub_hex,
+        filename=filename,
+        file_size=file_size,
+        content_hash=actual_hash,
+        posted_at=posted_at,
+        nonce=nonce,
+    )
+    if not ed25519_verify(transcript, sig, pub):
+        raise ValueError("feed sender signature failed")
+    return header, body
+
+
+# ---------- feeds.json local store ----------
+#
+# Local persistence of joined feeds. One small file at ~/.config/nomnom/feeds.json
+# tracks every feed this device has opened or joined: nickname, URL token,
+# expiry, the member id this device uses inside the feed, a roster cache (for
+# UI / TOFU prompts), and the last-seen post timestamp (for resume).
+#
+# Schema:
+#   {
+#     "version": 1,
+#     "default": "<nickname>" | null,
+#     "feeds": [Feed.to_dict(), ...]
+#   }
+
+_FEEDS_CONFIG_SCHEMA = 1
+_FEED_NICKNAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
+
+
+@dataclass
+class Feed:
+    """A feed this device has joined.
+
+    `feed_id` and `feed_token` are currently the same string — they're kept
+    distinct for forward compatibility if the URL anatomy ever splits the
+    identifier from the credential (e.g. fragment-style URLs).
+    """
+
+    name: str
+    feed_id: str
+    feed_token: str
+    url: str
+    expires_at: int
+    joined_at: int
+    member_id: str
+    members_cache: list = field(default_factory=list)
+    last_post_ts: int = 0
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "feed_id": self.feed_id,
+            "feed_token": self.feed_token,
+            "url": self.url,
+            "expires_at": self.expires_at,
+            "joined_at": self.joined_at,
+            "member_id": self.member_id,
+            "members_cache": list(self.members_cache),
+            "last_post_ts": self.last_post_ts,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> Feed:
+        if not isinstance(d, dict):
+            raise ValueError("feed entry is not a JSON object")
+        try:
+            return cls(
+                name=str(d["name"]),
+                feed_id=str(d["feed_id"]),
+                feed_token=str(d.get("feed_token", d["feed_id"])),
+                url=str(d["url"]),
+                expires_at=int(d["expires_at"]),
+                joined_at=int(d["joined_at"]),
+                member_id=str(d["member_id"]),
+                members_cache=list(d.get("members_cache", [])),
+                last_post_ts=int(d.get("last_post_ts", 0)),
+            )
+        except (KeyError, TypeError, ValueError) as e:
+            raise ValueError(f"feed entry missing/invalid field: {e}") from e
+
+
+def _feeds_config_path() -> Path:
+    return _nomnom_config_dir() / "feeds.json"
+
+
+def _empty_feeds_config() -> dict:
+    return {"version": _FEEDS_CONFIG_SCHEMA, "default": None, "feeds": []}
+
+
+def _load_feeds_config() -> dict:
+    """Return the current feeds config; empty config on missing/malformed file."""
+    path = _feeds_config_path()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return _empty_feeds_config()
+    if not isinstance(data, dict):
+        return _empty_feeds_config()
+    if data.get("version") != _FEEDS_CONFIG_SCHEMA:
+        return _empty_feeds_config()
+    raw_feeds = data.get("feeds") if isinstance(data.get("feeds"), list) else []
+    feeds: list[Feed] = []
+    for entry in raw_feeds:
+        try:
+            feeds.append(Feed.from_dict(entry))
+        except ValueError:
+            continue
+    default = data.get("default")
+    if not isinstance(default, str):
+        default = None
+    # Default must point at an existing feed; otherwise drop it.
+    if default is not None and not any(f.name == default for f in feeds):
+        default = None
+    return {
+        "version": _FEEDS_CONFIG_SCHEMA,
+        "default": default,
+        "feeds": feeds,
+    }
+
+
+def _save_feeds_config(config: dict) -> None:
+    """Write the feeds config atomically. Accepts the shape returned by _load."""
+    feeds = config.get("feeds") or []
+    body = {
+        "version": _FEEDS_CONFIG_SCHEMA,
+        "default": config.get("default"),
+        "feeds": [
+            f.to_dict() if isinstance(f, Feed) else f
+            for f in feeds
+        ],
+    }
+    _atomic_write_text(_feeds_config_path(), json.dumps(body, indent=2))
+
+
+def _find_feed(config: dict, nickname: str) -> Feed | None:
+    """Return the Feed with the given nickname, or None."""
+    for f in config.get("feeds") or []:
+        if isinstance(f, Feed) and f.name == nickname:
+            return f
+    return None
+
+
+def _default_feed(config: dict) -> Feed | None:
+    """Return the configured default feed, or None."""
+    name = config.get("default")
+    if not isinstance(name, str):
+        return None
+    return _find_feed(config, name)
+
+
+def _validate_feed_nickname(name: str) -> None:
+    """Raise NomnomError if `name` doesn't match the nickname format."""
+    if not _FEED_NICKNAME_RE.match(name):
+        raise NomnomError(
+            "feed nickname must be 1-32 chars of lowercase letters, "
+            "digits, or '-', and start with a letter or digit",
+        )
+
+
+def _autogen_feed_nickname(existing: list[Feed]) -> str:
+    """Return a fresh `feed-N` that doesn't collide with any existing feed."""
+    taken = {f.name for f in existing if isinstance(f, Feed)}
+    for i in range(1, 10_000):
+        candidate = f"feed-{i}"
+        if candidate not in taken:
+            return candidate
+    raise NomnomError("too many feeds; pick an explicit --name")
+
+
+def _format_feed_url(host: str, feed_id: str) -> str:
+    """Build the shareable feed URL. Always https://."""
+    if "://" not in host:
+        host = f"https://{host}"
+    return f"{host.rstrip('/')}/f/{feed_id}"
+
+
+def _parse_feed_url(url: str) -> tuple[str, str]:
+    """Split a feed URL into (host, feed_id). Strict: requires /f/<token>."""
+    raw = url.strip()
+    if not raw:
+        raise NomnomError("feed url must not be empty")
+    if raw.startswith("https://"):
+        rest = raw[len("https://"):]
+    elif raw.startswith("http://"):
+        rest = raw[len("http://"):]
+    else:
+        rest = raw
+    if "/f/" not in rest:
+        raise NomnomError("feed url must contain '/f/<token>'")
+    host, _, token = rest.partition("/f/")
+    if not host or "/" in token or not token:
+        raise NomnomError("malformed feed url")
+    if not _FEED_TOKEN_RE.match(token):
+        raise NomnomError(
+            "feed token in url must be 8-32 url-safe base64 chars",
+        )
+    return host, token
+
+
+def _add_or_replace_feed(config: dict, feed: Feed) -> dict:
+    """Insert `feed` into config (replacing any existing entry with the same name).
+
+    If this is the first feed, mark it as the default. Returns the updated
+    config dict (mutated in place for convenience).
+    """
+    feeds = config.get("feeds") or []
+    feeds = [f for f in feeds if not (isinstance(f, Feed) and f.name == feed.name)]
+    feeds.append(feed)
+    config["feeds"] = feeds
+    if not config.get("default") and len(feeds) == 1:
+        config["default"] = feed.name
+    return config
+
+
 # ---------- Relay transport ----------
 # nomnom moves files through a Cloudflare Worker the user deploys to their
 # own account. The Worker is intentionally dumb: it stores HMAC-authenticated
@@ -3088,11 +3816,11 @@ def _relay_request(
     headers: dict[str, str] = {}
     if signed:
         headers.update(_relay_hmac_headers(relay["secret"], method, full_path))
-    if extra_headers:
-        headers.update(extra_headers)
     if body is not None:
         headers["Content-Length"] = str(len(body))
         headers["Content-Type"] = "application/octet-stream"
+    if extra_headers:
+        headers.update(extra_headers)
     conn = _relay_open(relay)
     try:
         try:
@@ -3156,6 +3884,263 @@ def _relay_delete_slot(relay: dict, slot_id: str) -> None:
         _relay_request(relay, "DELETE", f"/slots/{slot_id}")
     except NomnomError:
         pass
+
+
+# --- feed-key-signed HTTP (parallel to the relay HMAC scheme above) ---
+
+
+_FEED_AUTH_PREFIX = "NMNM-FEEDKEY-SHA256 "
+
+
+def _feed_relay_dict(host: str) -> dict:
+    """Build a relay-shaped dict for feed-key-signed requests.
+
+    Reuses the connection helpers (_relay_open, _relay_full_path) but skips
+    the HMAC scheme — the URL token IS the credential for /feeds/:id/*.
+    """
+    if "://" not in host:
+        host = f"https://{host}"
+    return {"url": host.rstrip("/")}
+
+
+def _feed_auth_headers(feed_key: bytes, method: str, path: str) -> dict[str, str]:
+    """Authorization header for one /feeds/:id/* request.
+
+    Same shape as `_relay_hmac_headers` (method + path + unix_ts), keyed by
+    the per-feed key. The Worker re-derives the same key from the URL token
+    and verifies on receipt. Query strings are stripped so the signed path
+    matches the Worker's `url.pathname`.
+    """
+    bare_path = path.split("?", 1)[0]
+    ts = str(int(time.time()))
+    msg = f"{method}\n{bare_path}\n{ts}".encode("utf-8")
+    mac = hmac.new(feed_key, msg, hashlib.sha256).hexdigest()
+    return {
+        "Authorization": f"{_FEED_AUTH_PREFIX}{ts}:{mac}",
+        "User-Agent": _RELAY_USER_AGENT,
+    }
+
+
+def _feed_request(
+    host: str,
+    feed_key: bytes,
+    method: str,
+    path: str,
+    *,
+    body: bytes | None = None,
+    content_type: str = "application/octet-stream",
+) -> tuple[int, bytes]:
+    """One-shot feed-key-signed request. Returns (status, body)."""
+    relay = _feed_relay_dict(host)
+    full_path = _relay_full_path(relay, path)
+    headers = _feed_auth_headers(feed_key, method, full_path)
+    if body is not None:
+        headers["Content-Length"] = str(len(body))
+        headers["Content-Type"] = content_type
+    conn = _relay_open(relay)
+    try:
+        try:
+            conn.request(method, full_path, body=body, headers=headers)
+            resp = conn.getresponse()
+            data = resp.read(_RELAY_MAX_BODY + 1)
+            if len(data) > _RELAY_MAX_BODY:
+                raise NomnomError(
+                    f"relay returned oversized body (> {_RELAY_MAX_BODY} bytes)",
+                )
+            return resp.status, data
+        except (OSError, http.client.HTTPException) as e:
+            raise NomnomError(f"relay request failed: {e}") from e
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _raise_feed_error(status: int, body: bytes) -> None:
+    reason = body.decode("utf-8", errors="replace").strip()
+    if status == 401:
+        if reason == "clock-skew":
+            raise NomnomError(
+                "relay rejected feed request (clock skew). sync the system clock.",
+            )
+        raise NomnomError(
+            "relay rejected feed-key signature. the feed URL may be wrong or stale.",
+        )
+    if status == 403:
+        raise NomnomError(f"relay refused feed request: {reason or '(no detail)'}")
+    if status == 404:
+        raise NomnomError("feed not found on relay")
+    if status == 409:
+        raise NomnomError(f"relay returned 409: {reason or '(no detail)'}")
+    if status == 410:
+        raise NomnomError("feed has expired on the relay")
+    if status == 413:
+        raise NomnomError("payload too large for relay")
+    raise NomnomError(f"relay returned HTTP {status}: {reason or '(no body)'}")
+
+
+def _relay_mint_feed(
+    relay: dict, *, ttl_seconds: int, member_card: dict,
+) -> dict:
+    """POST /feeds — HMAC-gated. Returns {feed_id, expires_at, created_at}."""
+    body = json.dumps(
+        {"ttl_seconds": int(ttl_seconds), "member_card": member_card},
+        separators=(",", ":"),
+    ).encode("utf-8")
+    status, data = _relay_request(
+        relay, "POST", "/feeds", body=body,
+        extra_headers={"Content-Type": "application/json"},
+    )
+    if status == 201:
+        try:
+            return json.loads(data)
+        except json.JSONDecodeError as e:
+            raise NomnomError(f"relay returned bad JSON: {e}") from e
+    _raise_relay_error(status, data)
+    return {}  # unreachable
+
+
+def _relay_get_feed_meta(host: str, feed_id: str, feed_key: bytes) -> dict:
+    status, data = _feed_request(
+        host, feed_key, "GET", f"/feeds/{feed_id}/meta",
+    )
+    if status == 200:
+        try:
+            return json.loads(data)
+        except json.JSONDecodeError as e:
+            raise NomnomError(f"relay returned bad JSON: {e}") from e
+    _raise_feed_error(status, data)
+    return {}
+
+
+def _relay_put_member(
+    host: str, feed_id: str, feed_key: bytes, member_id: str, card: dict,
+) -> None:
+    body = json.dumps(card, separators=(",", ":")).encode("utf-8")
+    status, data = _feed_request(
+        host, feed_key, "PUT", f"/feeds/{feed_id}/members/{member_id}",
+        body=body, content_type="application/json",
+    )
+    if status == 204:
+        return
+    _raise_feed_error(status, data)
+
+
+def _relay_delete_member(
+    host: str, feed_id: str, feed_key: bytes, member_id: str,
+) -> None:
+    try:
+        status, data = _feed_request(
+            host, feed_key, "DELETE", f"/feeds/{feed_id}/members/{member_id}",
+        )
+    except NomnomError:
+        return  # leave is best-effort
+    if status not in (204, 404):
+        _raise_feed_error(status, data)
+
+
+def _relay_list_members(
+    host: str, feed_id: str, feed_key: bytes,
+    *, since_ts: int = 0, wait_ms: int = 0,
+) -> dict:
+    q = []
+    if wait_ms > 0:
+        q.append(f"wait={int(wait_ms)}")
+    if since_ts > 0:
+        q.append(f"since={int(since_ts)}")
+    qs = ("?" + "&".join(q)) if q else ""
+    status, data = _feed_request(
+        host, feed_key, "GET", f"/feeds/{feed_id}/members{qs}",
+    )
+    if status == 200:
+        try:
+            return json.loads(data)
+        except json.JSONDecodeError as e:
+            raise NomnomError(f"relay returned bad JSON: {e}") from e
+    _raise_feed_error(status, data)
+    return {}
+
+
+def _relay_extend_feed(
+    host: str, feed_id: str, feed_key: bytes, new_ttl_seconds: int,
+) -> dict:
+    body = json.dumps({"new_ttl_seconds": int(new_ttl_seconds)}).encode("utf-8")
+    status, data = _feed_request(
+        host, feed_key, "POST", f"/feeds/{feed_id}/extend",
+        body=body, content_type="application/json",
+    )
+    if status == 200:
+        try:
+            return json.loads(data)
+        except json.JSONDecodeError as e:
+            raise NomnomError(f"relay returned bad JSON: {e}") from e
+    _raise_feed_error(status, data)
+    return {}
+
+
+def _relay_close_feed(host: str, feed_id: str, feed_key: bytes) -> None:
+    status, data = _feed_request(
+        host, feed_key, "DELETE", f"/feeds/{feed_id}",
+    )
+    if status in (204, 404):
+        return
+    _raise_feed_error(status, data)
+
+
+def _relay_put_feed_slot(
+    host: str, feed_id: str, feed_key: bytes, slot_id: str, body: bytes,
+) -> None:
+    if len(body) > _RELAY_MAX_BODY:
+        raise NomnomError(
+            f"payload too large for relay: {len(body)} > {_RELAY_MAX_BODY} bytes",
+        )
+    status, data = _feed_request(
+        host, feed_key, "PUT", f"/feeds/{feed_id}/slots/{slot_id}",
+        body=body,
+    )
+    if status == 204:
+        return
+    _raise_feed_error(status, data)
+
+
+def _relay_get_feed_slot(
+    host: str, feed_id: str, feed_key: bytes, slot_id: str,
+    *, wait_ms: int = 0,
+) -> bytes | None:
+    qs = f"?wait={int(wait_ms)}" if wait_ms > 0 else ""
+    status, data = _feed_request(
+        host, feed_key, "GET", f"/feeds/{feed_id}/slots/{slot_id}{qs}",
+    )
+    if status == 200:
+        return data
+    if status == 404:
+        return None
+    _raise_feed_error(status, data)
+    return None
+
+
+def _relay_list_feed_slots(
+    host: str, feed_id: str, feed_key: bytes,
+    *, since_ts: int = 0, wait_ms: int = 0,
+) -> list:
+    q = []
+    if wait_ms > 0:
+        q.append(f"wait={int(wait_ms)}")
+    if since_ts > 0:
+        q.append(f"since={int(since_ts)}")
+    qs = ("?" + "&".join(q)) if q else ""
+    status, data = _feed_request(
+        host, feed_key, "GET", f"/feeds/{feed_id}/slots{qs}",
+    )
+    if status == 200:
+        try:
+            parsed = json.loads(data)
+        except json.JSONDecodeError as e:
+            raise NomnomError(f"relay returned bad JSON: {e}") from e
+        return parsed.get("slots") or []
+    _raise_feed_error(status, data)
+    return []
 
 
 def _relay_health(relay: dict) -> bool:
@@ -4140,15 +5125,61 @@ def _read_payload_or_error(p: Path) -> bytes | None:
         return None
 
 
-def cmd_send(path: str, *, to: str | None = None, trust_new: bool = False) -> int:
-    """Send a file through the relay to a pinned peer.
+def _resolve_target_feed(feed_name: str | None) -> Feed | None:
+    """Look up the feed for send/receive, printing a friendly error on miss."""
+    cfg = _load_feeds_config()
+    if feed_name is not None:
+        feed = _find_feed(cfg, feed_name)
+        if feed is None:
+            sys.stderr.write(f"error: no feed named {feed_name!r}.\n")
+            return None
+        return feed
+    feed = _default_feed(cfg)
+    if feed is None:
+        sys.stderr.write(
+            "error: no default feed. open one with `nomnom open` or join "
+            "one with `nomnom join <url>`.\n",
+        )
+        return None
+    return feed
 
-    Routing:
-      - --to PEER         recurring transfer to the named pinned peer.
-      - 1 peer pinned     auto-target that peer.
-      - 0 or N peers      error (run `nomnom pair` for first-contact, or
-                          pass --to for ambiguity).
+
+def _refresh_roster_with_tofu(
+    feed: Feed, host: str, feed_key: bytes, *, trust_new: bool,
+) -> list[dict] | None:
+    """Fetch the live roster and prompt TOFU on any newly-seen identities.
+
+    Returns the fresh roster on success, None if the relay errored. Updates
+    `feed.members_cache` in place but does NOT persist — the caller decides
+    when to write feeds.json.
     """
+    try:
+        resp = _relay_list_members(host, feed.feed_id, feed_key)
+    except NomnomError as e:
+        sys.stderr.write(f"error: {e}\n")
+        return None
+    roster = resp.get("members") or []
+    known_in_cache = {
+        m.get("identity_pubkey")
+        for m in (feed.members_cache or [])
+        if isinstance(m, dict)
+    }
+    for m in roster:
+        if not isinstance(m, dict):
+            continue
+        if m.get("member_id") == feed.member_id:
+            continue
+        sig_pub = m.get("identity_pubkey")
+        if sig_pub in known_in_cache:
+            # Seen locally before; either already pinned or previously declined.
+            continue
+        _tofu_check_feed_member(m, trust_new=trust_new)
+    feed.members_cache = roster
+    return roster
+
+
+def cmd_send(path: str, *, feed: str | None = None, trust_new: bool = False) -> int:
+    """Broadcast a file into the default feed (or --feed)."""
     p = Path(path).expanduser()
     if not p.is_file():
         sys.stderr.write(f"error: not a file: {p}\n")
@@ -4157,140 +5188,228 @@ def cmd_send(path: str, *, to: str | None = None, trust_new: bool = False) -> in
     if data is None:
         return 1
 
-    relay = _ensure_relay_configured()
-    if relay is None:
-        return 2
-    identity = _load_identity()
+    target = _resolve_target_feed(feed)
+    if target is None:
+        return 1
+    feed_key = _feed_key_from_token(target.feed_token)
+    host, _ = _parse_feed_url(target.url)
 
-    target_ik = None
-    if to is not None:
-        matches = _resolve_peer(to)
-        if not matches:
-            sys.stderr.write(
-                f"error: no pinned peer matches {to!r}. "
-                "see `nomnom peers list`.\n",
-            )
-            return 1
-        if len(matches) > 1:
-            sys.stderr.write(
-                f"error: peer {to!r} is ambiguous "
-                f"({len(matches)} matches). use the device id.\n",
-            )
-            return 1
-        _pid, rec = matches[0]
-        target_ik = rec.get("ik_pub")
-        if not isinstance(target_ik, str):
-            sys.stderr.write(f"error: peer {to!r} has no pinned ik_pub.\n")
-            return 1
-    else:
-        peers = [
-            (pid, rec) for pid, rec in _load_known_peers().items()
-            if isinstance(rec, dict) and isinstance(rec.get("ik_pub"), str)
-        ]
-        if not peers:
-            sys.stderr.write(
-                "error: no pinned peers. run `nomnom pair FILE` to add "
-                "a new device.\n",
-            )
-            return 1
-        if len(peers) > 1:
-            sys.stderr.write(
-                "error: multiple pinned peers; pass --to PEER.\n",
-            )
-            return 1
-        target_ik = peers[0][1]["ik_pub"]
+    # Always-fresh roster on send: accurate member counts + TOFU on new identities.
+    roster = _refresh_roster_with_tofu(target, host, feed_key, trust_new=trust_new)
+    if roster is None:
+        return 1
+    others = [m for m in roster if m.get("member_id") != target.member_id]
+    if not others:
         sys.stderr.write(
-            f"sending to {peers[0][1].get('name', peers[0][0])!r}.\n",
+            f"warning: feed {target.name!r} has no other members; the post "
+            "will sit until someone joins or the feed expires.\n",
         )
 
-    on_tofu = _trust_new_callback() if trust_new else None
+    ident = _load_identity()
+    blob = feed_seal(
+        feed_key=feed_key,
+        feed_id=target.feed_id,
+        sender_member_id=target.member_id,
+        sender_sig_priv_hex=ident["sig_priv"],
+        sender_sig_pub_hex=ident["sig_pub"],
+        filename=p.name,
+        body=data,
+    )
+    slot_id = secrets.token_urlsafe(12)
     try:
-        rc = _relay_send(
-            p.name, data,
-            target_ik_hex=target_ik,
-            identity=identity, relay=relay,
-            on_tofu=on_tofu,
-        )
+        _relay_put_feed_slot(host, target.feed_id, feed_key, slot_id, blob)
     except NomnomError as e:
         sys.stderr.write(f"error: {e}\n")
         return 1
-    if rc == 0:
-        sys.stderr.write(
-            f"sent {p.name!r} ({len(data)} bytes).\n",
-        )
-    return rc
+    # Persist the cache refresh.
+    cfg = _load_feeds_config()
+    existing = _find_feed(cfg, target.name)
+    if existing is not None:
+        existing.members_cache = roster
+        _save_feeds_config(cfg)
+    sys.stderr.write(
+        f"sent {p.name!r} ({len(data)} bytes) to feed {target.name!r} "
+        f"({len(others)} recipient(s)).\n",
+    )
+    return 0
 
 
-def cmd_receive(*, once: bool = False, trust_new: bool = False) -> int:
-    """Receive files through the relay from pinned peers.
+def _safe_filename(name: str) -> str:
+    """Strip directory components from a filename; refuse path-escape attempts."""
+    base = os.path.basename(name)
+    if not base or base in (".", "..") or "/" in base or "\\" in base:
+        raise NomnomError(f"refusing unsafe filename: {name!r}")
+    return base
 
-    Default: keep long-polling every pinned peer's deterministic rendezvous
-    slot, printing one line per received file. Ctrl-C exits cleanly. Pass
-    `once=True` to exit after the first received file (scripting). With
-    zero pinned peers, errors: first contact goes through `nomnom pair`.
+
+def _receive_one_post(
+    *, feed: Feed, host: str, feed_key: bytes, slot_id: str,
+) -> tuple[str, int, str, str] | None:
+    """Fetch and verify a single post. Returns (filename, bytes, sender_name, out_path).
+
+    Returns None when the slot disappeared (already cleaned up). Raises
+    NomnomError on tamper / signature failure / unknown sender.
     """
-    relay = _ensure_relay_configured()
-    if relay is None:
-        return 2
-    identity = _load_identity()
-
-    if not _load_known_peers():
-        sys.stderr.write(
-            "error: no pinned peers. run `nomnom pair` to add a new device.\n",
+    raw = _relay_get_feed_slot(host, feed.feed_id, feed_key, slot_id)
+    if raw is None:
+        return None
+    # Resolve sender from cached roster first; refresh if missing.
+    try:
+        header, body = feed_open(
+            feed_key=feed_key, feed_id=feed.feed_id, blob=raw,
         )
-        return 1
+    except ValueError as e:
+        raise NomnomError(f"feed post rejected: {e}") from e
+    sender_id = header.get("smid")
+    sender_pub = header.get("sik")
+    sender_name = "(unknown)"
+    for m in feed.members_cache or []:
+        if m.get("member_id") == sender_id:
+            sender_name = m.get("name", sender_name)
+            # Cross-check that the cached identity matches.
+            if m.get("identity_pubkey") and m.get("identity_pubkey") != sender_pub:
+                raise NomnomError(
+                    f"feed post sender {sender_id!r} identity key changed "
+                    "from roster cache (possible spoof or rotation); "
+                    "re-fetch roster",
+                )
+            break
+    filename = _safe_filename(header.get("fn") or "post")
+    out = _pick_decrypted_path(Path.cwd(), filename)
+    out.write_bytes(body)
+    return (filename, len(body), sender_name, str(out))
 
-    on_tofu = _trust_new_callback() if trust_new else None
+
+def cmd_receive(
+    *, feed: str | None = None, once: bool = False, trust_new: bool = False,
+) -> int:
+    """Watch a feed for new posts; write each to cwd.
+
+    Long-polls /feeds/:id/slots?since=<last_post_ts> in a loop. Each new
+    post is decrypted, signature-verified, and written to disk (collisions
+    auto-rename). Ctrl-C exits cleanly.
+    """
+    target = _resolve_target_feed(feed)
+    if target is None:
+        return 1
+    feed_key = _feed_key_from_token(target.feed_token)
+    host, _ = _parse_feed_url(target.url)
+
     received_any = False
     if not once:
         sys.stderr.write(
-            "waiting for transfers (Ctrl-C to exit)...\n",
+            f"watching feed {target.name!r} (Ctrl-C to exit)...\n",
         )
         sys.stderr.flush()
+
+    last_ts = target.last_post_ts
     while True:
-        result_holder: list[dict] = []
-
-        def _on_result(r: dict) -> None:
-            result_holder.append(r)
-
+        # Roster refresh + TOFU prompts before each slot long-poll. Up to a
+        # 30s lag between a new member joining and the prompt firing, but
+        # interleaving keeps the I/O on a single thread.
+        roster = _refresh_roster_with_tofu(
+            target, host, feed_key, trust_new=trust_new,
+        )
+        if roster is not None:
+            cfg_now = _load_feeds_config()
+            existing = _find_feed(cfg_now, target.name)
+            if existing is not None:
+                existing.members_cache = roster
+                _save_feeds_config(cfg_now)
         try:
-            rc = _relay_recv_pinned(
-                identity=identity, relay=relay,
-                on_result=_on_result, on_tofu=on_tofu,
+            slots = _relay_list_feed_slots(
+                host, target.feed_id, feed_key,
+                since_ts=last_ts, wait_ms=30_000,
             )
         except KeyboardInterrupt:
             sys.stderr.write("\n")
             return 0 if received_any else 130
         except NomnomError as e:
-            # `_relay_recv_pinned` raises "no transfer (waited 30s)" on a
-            # benign long-poll timeout — for the single-shot mode that's an
-            # error ("expected a transfer, got none"), but for the watch
-            # loop it's the steady-state idle case. Re-arm in watch mode.
-            # The error-loaded variant ("no transfer: 401 Unauthorized")
-            # carries a real reason and should always exit.
-            msg = str(e)
-            if not once and msg.startswith("no transfer (waited"):
-                continue
             sys.stderr.write(f"error: {e}\n")
             return 1
-        if rc == 0 and result_holder:
-            r = result_holder[0]
+        if not slots:
+            if once:
+                sys.stderr.write("no transfer (waited 30s)\n")
+                return 0 if received_any else 1
+            continue
+        # Iterate in chronological order; the Worker already sorts by created_at.
+        for entry in slots:
+            slot_id = entry.get("slot_id")
+            created_at = int(entry.get("created_at") or 0)
+            if not slot_id:
+                continue
+            # Skip posts authored by this device (our own broadcast comes back).
+            try:
+                raw = _relay_get_feed_slot(host, target.feed_id, feed_key, slot_id)
+            except NomnomError as e:
+                sys.stderr.write(f"warning: {e}\n")
+                if created_at > last_ts:
+                    last_ts = created_at
+                continue
+            if raw is None:
+                if created_at > last_ts:
+                    last_ts = created_at
+                continue
+            try:
+                header, body = feed_open(
+                    feed_key=feed_key, feed_id=target.feed_id, blob=raw,
+                )
+            except ValueError as e:
+                sys.stderr.write(f"warning: dropping bad post: {e}\n")
+                if created_at > last_ts:
+                    last_ts = created_at
+                continue
+            sender_id = header.get("smid")
+            if sender_id == target.member_id:
+                # our own broadcast — don't write our own file back to disk
+                if created_at > last_ts:
+                    last_ts = created_at
+                continue
+            sender_name = "(unknown)"
+            sender_pub = header.get("sik")
+            for m in target.members_cache or []:
+                if m.get("member_id") == sender_id:
+                    sender_name = m.get("name", sender_name)
+                    if m.get("identity_pubkey") and m.get("identity_pubkey") != sender_pub:
+                        sys.stderr.write(
+                            f"warning: dropping post; sender {sender_id!r} "
+                            "identity key changed from roster cache.\n",
+                        )
+                        sender_id = None
+                    break
+            if sender_id is None:
+                if created_at > last_ts:
+                    last_ts = created_at
+                continue
+            try:
+                filename = _safe_filename(header.get("fn") or "post")
+            except NomnomError as e:
+                sys.stderr.write(f"warning: dropping bad post: {e}\n")
+                if created_at > last_ts:
+                    last_ts = created_at
+                continue
+            out = _pick_decrypted_path(Path.cwd(), filename)
+            try:
+                out.write_bytes(body)
+            except OSError as e:
+                sys.stderr.write(f"error writing {out}: {e}\n")
+                return 1
             sys.stderr.write(
-                f"received {r['name']!r} ({r['bytes']} bytes) "
-                f"from {r['peer_name']} -> {r['out_path']}\n",
+                f"received {filename!r} ({len(body)} bytes) "
+                f"from {sender_name} -> {out}\n",
             )
             sys.stderr.flush()
             received_any = True
+            if created_at > last_ts:
+                last_ts = created_at
+            # Persist last_post_ts so a restart doesn't re-fetch.
+            cfg_now = _load_feeds_config()
+            existing = _find_feed(cfg_now, target.name)
+            if existing is not None:
+                existing.last_post_ts = last_ts
+                _save_feeds_config(cfg_now)
             if once:
                 return 0
-            continue
-        if rc == 130:
-            return 0 if received_any else 130
-        if once:
-            return rc
-        # Non-zero return without a Ctrl-C signal: surface and exit so the
-        # user isn't stuck in a tight loop against a broken relay.
-        return rc
 
 
 def cmd_pair(*, trust_new: bool = False) -> int:
@@ -4445,29 +5564,309 @@ def _cmd_relay_init(args) -> int:
     return 0 if cfg is not None else 1
 
 
+def cmd_open(args) -> int:
+    """Mint a new feed on the configured relay and save it locally.
+
+    Requires relay.json (the relay HMAC gates feed minting). Generates a
+    random member_id, publishes a member card for this device, and prints
+    the shareable URL.
+    """
+    relay = _ensure_relay_configured(
+        interactive=getattr(args, "interactive", True),
+    )
+    if relay is None:
+        return 1
+
+    cfg = _load_feeds_config()
+    name = getattr(args, "name", None)
+    if name:
+        try:
+            _validate_feed_nickname(name)
+        except NomnomError as e:
+            sys.stderr.write(f"error: {e}\n")
+            return 1
+        if _find_feed(cfg, name) is not None:
+            sys.stderr.write(f"error: feed nickname {name!r} already exists.\n")
+            return 1
+    else:
+        try:
+            name = _autogen_feed_nickname(cfg["feeds"])
+        except NomnomError as e:
+            sys.stderr.write(f"error: {e}\n")
+            return 1
+
+    ttl = int(getattr(args, "ttl", 0) or 86_400)
+    ident = _load_identity()
+    member_id = secrets.token_hex(16)
+    card = {
+        "member_id": member_id,
+        "identity_pubkey": ident["sig_pub"],
+        "name": ident["name"],
+    }
+    try:
+        result = _relay_mint_feed(relay, ttl_seconds=ttl, member_card=card)
+    except NomnomError as e:
+        sys.stderr.write(f"error: {e}\n")
+        return 1
+
+    feed_id = str(result.get("feed_id") or "")
+    if not feed_id:
+        sys.stderr.write("error: relay did not return a feed_id.\n")
+        return 1
+    expires_at = int(result.get("expires_at") or (int(time.time()) + ttl))
+    created_at = int(result.get("created_at") or time.time())
+    host = _relay_split_url(relay["url"])[0]
+    feed = Feed(
+        name=name,
+        feed_id=feed_id,
+        feed_token=feed_id,
+        url=_format_feed_url(host, feed_id),
+        expires_at=expires_at,
+        joined_at=created_at,
+        member_id=member_id,
+        members_cache=[
+            {
+                "member_id": member_id,
+                "identity_pubkey": ident["sig_pub"],
+                "name": ident["name"],
+                "joined_at": created_at,
+            },
+        ],
+    )
+    _add_or_replace_feed(cfg, feed)
+    if getattr(args, "default", False):
+        cfg["default"] = name
+    _save_feeds_config(cfg)
+
+    sys.stderr.write(
+        f"opened feed '{name}' (TTL {ttl}s, expires at {expires_at}).\n"
+        f"share this URL with the other device:\n",
+    )
+    print(feed.url)
+    return 0
+
+
 def cmd_join(args) -> int:
-    """Second-device flow: parse `host#secret`, self-test, save."""
+    """Join an existing feed by URL.
+
+    Doesn't require relay.json — feed-key signatures are the credential for
+    /feeds/:id/* endpoints. The local `relay.json` is only needed for
+    minting new feeds via `nomnom open`.
+    """
     try:
-        host, secret = _parse_join_token(args.token)
+        host, feed_id = _parse_feed_url(args.url)
     except NomnomError as e:
         sys.stderr.write(f"error: {e}\n")
         return 1
-    url = f"https://{host}"
-    candidate = {"url": url, "secret": secret}
-    rc, msg = _relay_self_test(candidate)
-    if rc != 0:
-        sys.stderr.write(f"error: {msg}\nconfig NOT saved.\n")
-        return 1
+
+    cfg = _load_feeds_config()
+    name = getattr(args, "name", None)
+    if name:
+        try:
+            _validate_feed_nickname(name)
+        except NomnomError as e:
+            sys.stderr.write(f"error: {e}\n")
+            return 1
+        if _find_feed(cfg, name) is not None:
+            sys.stderr.write(f"error: feed nickname {name!r} already exists.\n")
+            return 1
+    else:
+        try:
+            name = _autogen_feed_nickname(cfg["feeds"])
+        except NomnomError as e:
+            sys.stderr.write(f"error: {e}\n")
+            return 1
+
+    feed_key = _feed_key_from_token(feed_id)
+    # Probe the feed exists + the URL is correct before publishing anything.
     try:
-        _save_relay_config(
-            url, secret,
-            allow_private=getattr(args, "allow_private", False),
-        )
+        meta = _relay_get_feed_meta(host, feed_id, feed_key)
+    except NomnomError as e:
+        sys.stderr.write(f"error: {e}\nfeed NOT joined.\n")
+        return 1
+
+    ident = _load_identity()
+    member_id = secrets.token_hex(16)
+    card = {
+        "member_id": member_id,
+        "identity_pubkey": ident["sig_pub"],
+        "name": ident["name"],
+    }
+    try:
+        _relay_put_member(host, feed_id, feed_key, member_id, card)
+        roster = _relay_list_members(host, feed_id, feed_key)
     except NomnomError as e:
         sys.stderr.write(f"error: {e}\n")
         return 1
-    sys.stderr.write(f"saved to {_relay_config_path()} ({msg})\n")
-    sys.stderr.write("run `nomnom pair` on both devices to add this peer.\n")
+
+    feed = Feed(
+        name=name,
+        feed_id=feed_id,
+        feed_token=feed_id,
+        url=_format_feed_url(host, feed_id),
+        expires_at=int(meta.get("expires_at") or 0),
+        joined_at=int(time.time()),
+        member_id=member_id,
+        members_cache=list(roster.get("members") or []),
+    )
+    _add_or_replace_feed(cfg, feed)
+    if getattr(args, "default", False):
+        cfg["default"] = name
+    _save_feeds_config(cfg)
+    sys.stderr.write(
+        f"joined feed '{name}' with {len(feed.members_cache)} member(s).\n",
+    )
+    return 0
+
+
+def cmd_feeds(args) -> int:
+    action = getattr(args, "action", None)
+    if action is None:
+        sys.stderr.write("error: feeds requires an action (try `feeds list`).\n")
+        return 2
+    handler = {
+        "list": _cmd_feeds_list,
+        "members": _cmd_feeds_members,
+        "url": _cmd_feeds_url,
+        "default": _cmd_feeds_default,
+        "rename": _cmd_feeds_rename,
+        "leave": _cmd_feeds_leave,
+        "extend": _cmd_feeds_extend,
+    }.get(action)
+    if handler is None:
+        sys.stderr.write(f"error: unknown feeds action {action!r}.\n")
+        return 2
+    return handler(args)
+
+
+def _cmd_feeds_list(_args) -> int:
+    cfg = _load_feeds_config()
+    feeds = cfg["feeds"]
+    if not feeds:
+        sys.stderr.write("no feeds joined. mint one with `nomnom open`.\n")
+        return 0
+    default = cfg.get("default")
+    now = int(time.time())
+    for f in feeds:
+        marker = " *" if f.name == default else "  "
+        ttl_remaining = max(0, f.expires_at - now)
+        members = len(f.members_cache)
+        status = "expired" if ttl_remaining == 0 else f"expires in {ttl_remaining}s"
+        print(f"{marker} {f.name:<24} {members} member(s)  {status}")
+    return 0
+
+
+def _cmd_feeds_members(args) -> int:
+    cfg = _load_feeds_config()
+    feed = _find_feed(cfg, args.name)
+    if feed is None:
+        sys.stderr.write(f"error: no feed named {args.name!r}.\n")
+        return 1
+    feed_key = _feed_key_from_token(feed.feed_token)
+    host, _ = _parse_feed_url(feed.url)
+    try:
+        roster = _relay_list_members(host, feed.feed_id, feed_key)
+    except NomnomError as e:
+        sys.stderr.write(f"error: {e}\n")
+        return 1
+    members = roster.get("members") or []
+    if not members:
+        sys.stderr.write("(no members)\n")
+        return 0
+    for m in members:
+        marker = " *" if m.get("member_id") == feed.member_id else "  "
+        fp = _ik_fingerprint(m.get("identity_pubkey", "")) if m.get("identity_pubkey") else "(no key)"
+        print(f"{marker} {m.get('name', '?'):<28} {fp}  ({m.get('member_id', '?')[:12]}...)")
+    # Refresh the local cache opportunistically.
+    feed.members_cache = members
+    _save_feeds_config(cfg)
+    return 0
+
+
+def _cmd_feeds_url(args) -> int:
+    cfg = _load_feeds_config()
+    feed = _find_feed(cfg, args.name)
+    if feed is None:
+        sys.stderr.write(f"error: no feed named {args.name!r}.\n")
+        return 1
+    print(feed.url)
+    return 0
+
+
+def _cmd_feeds_default(args) -> int:
+    cfg = _load_feeds_config()
+    feed = _find_feed(cfg, args.name)
+    if feed is None:
+        sys.stderr.write(f"error: no feed named {args.name!r}.\n")
+        return 1
+    cfg["default"] = feed.name
+    _save_feeds_config(cfg)
+    sys.stderr.write(f"default feed is now '{feed.name}'.\n")
+    return 0
+
+
+def _cmd_feeds_rename(args) -> int:
+    cfg = _load_feeds_config()
+    feed = _find_feed(cfg, args.name)
+    if feed is None:
+        sys.stderr.write(f"error: no feed named {args.name!r}.\n")
+        return 1
+    try:
+        _validate_feed_nickname(args.new_name)
+    except NomnomError as e:
+        sys.stderr.write(f"error: {e}\n")
+        return 1
+    if _find_feed(cfg, args.new_name) is not None:
+        sys.stderr.write(f"error: feed nickname {args.new_name!r} already exists.\n")
+        return 1
+    old = feed.name
+    feed.name = args.new_name
+    if cfg.get("default") == old:
+        cfg["default"] = args.new_name
+    _save_feeds_config(cfg)
+    sys.stderr.write(f"renamed '{old}' to '{args.new_name}'.\n")
+    return 0
+
+
+def _cmd_feeds_leave(args) -> int:
+    cfg = _load_feeds_config()
+    feed = _find_feed(cfg, args.name)
+    if feed is None:
+        sys.stderr.write(f"error: no feed named {args.name!r}.\n")
+        return 1
+    feed_key = _feed_key_from_token(feed.feed_token)
+    host, _ = _parse_feed_url(feed.url)
+    _relay_delete_member(host, feed.feed_id, feed_key, feed.member_id)
+    cfg["feeds"] = [f for f in cfg["feeds"] if f.name != feed.name]
+    if cfg.get("default") == feed.name:
+        cfg["default"] = cfg["feeds"][0].name if cfg["feeds"] else None
+    _save_feeds_config(cfg)
+    sys.stderr.write(f"left feed '{feed.name}' (member card deleted).\n")
+    return 0
+
+
+def _cmd_feeds_extend(args) -> int:
+    cfg = _load_feeds_config()
+    feed = _find_feed(cfg, args.name)
+    if feed is None:
+        sys.stderr.write(f"error: no feed named {args.name!r}.\n")
+        return 1
+    new_ttl = int(args.ttl)
+    if new_ttl < 60:
+        sys.stderr.write("error: --ttl must be at least 60 seconds.\n")
+        return 1
+    feed_key = _feed_key_from_token(feed.feed_token)
+    host, _ = _parse_feed_url(feed.url)
+    try:
+        result = _relay_extend_feed(host, feed.feed_id, feed_key, new_ttl)
+    except NomnomError as e:
+        sys.stderr.write(f"error: {e}\n")
+        return 1
+    feed.expires_at = int(result.get("expires_at") or (int(time.time()) + new_ttl))
+    _save_feeds_config(cfg)
+    sys.stderr.write(
+        f"extended '{feed.name}'; new expiry: {feed.expires_at}.\n",
+    )
     return 0
 
 
@@ -4557,7 +5956,9 @@ def cmd_reset(_args) -> int:
     sys.stderr.write(
         f"about to delete {target} and {len(entries)} entries "
         f"({', '.join(entries)}).\n"
-        f"identity rotation will invalidate every pin on every paired device.\n",
+        f"this wipes identity, pinned identities, joined feeds, and relay "
+        f"config. identity rotation invalidates every remote pin; rejoining "
+        f"feeds requires a fresh URL from another member.\n",
     )
     try:
         ans = input("proceed? [y/N]: ").strip().lower()
@@ -4772,14 +6173,13 @@ class LauncherScreen(Screen):
         self.cursor = 0
         self.tiles: list[tuple[str, str]] = [
             ("Bundle",     "Pick files and write a bundle .txt"),
-            ("Send",       "Encrypt a file and send it to a pinned peer"),
-            ("Receive",    "Listen for transfers (auto-resumes after each)"),
-            ("Pair",       "Pair with a new device over the relay"),
+            ("Send",       "Broadcast a file to your default feed (CLI)"),
+            ("Receive",    "Watch a feed for incoming posts (CLI)"),
+            ("Feeds",      "List, leave, and inspect joined feeds"),
             ("Commit",     "Bundle staged/unstaged diffs + recent commits"),
             ("PR",         "Bundle commits since base + diff for an LLM"),
             ("Review",     "Bundle a PR's meta, diff, and comments"),
             ("Rebuild",    "Reconstruct a file tree from a bundle .txt"),
-            ("Pins",       "Manage TOFU-pinned peers"),
             ("Extensions", "Edit the text/binary/name/secret lists"),
         ]
 
@@ -4825,13 +6225,11 @@ class LauncherScreen(Screen):
 
 
 def _launcher_open(verb: str):
-    """Map a launcher tile label to either a Screen to push, or a TODO note.
-
-    Slices 5-8 replace the placeholder rows with real screens."""
+    """Map a launcher tile label to a Screen to push."""
     if verb == "Extensions":
         return ExtensionsScreen()
-    if verb == "Pins":
-        return PinsScreen()
+    if verb == "Feeds":
+        return FeedsScreen()
     if verb == "Rebuild":
         return RebuildScreen()
     if verb == "Bundle":
@@ -4843,15 +6241,21 @@ def _launcher_open(verb: str):
     if verb == "Review":
         return ReviewScreen()
     if verb == "Send":
-        return SendScreen()
+        return PlaceholderScreen(
+            "Send",
+            "Run `nomnom send <file>` from the shell to broadcast to your "
+            "default feed. The CLI is the source of truth in feeds v2; the "
+            "in-curses sender is being rebuilt around the new transport.",
+        )
     if verb == "Receive":
-        return ReceiveScreen()
-    if verb == "Pair":
-        return PairScreen()
+        return PlaceholderScreen(
+            "Receive",
+            "Run `nomnom receive` from the shell to watch your default "
+            "feed. The in-curses receiver is being rebuilt around feeds.",
+        )
     return PlaceholderScreen(
         verb,
-        f"`nomnom {verb.lower()}` works from the shell. A dedicated TUI "
-        "screen for this verb arrives in a follow-up slice.",
+        f"`nomnom {verb.lower()}` works from the shell.",
     )
 
 
@@ -5364,6 +6768,176 @@ class PinsScreen(Screen):
             if self.cursor >= len(self.peers) and self.peers:
                 self.cursor = len(self.peers) - 1
             self.message = f"dropped {', '.join(dropped) or name}."
+        return ScreenAction.CONTINUE
+
+
+class FeedsScreen(Screen):
+    """List joined feeds, mark default, drop the cursored entry."""
+
+    title = "feeds"
+    help_lines = [
+        "j/k or ↑/↓   move",
+        "Enter / m    show members of the cursored feed",
+        "d            set cursored feed as default",
+        "l            leave cursored feed (confirms)",
+        "esc / q      back to launcher",
+    ]
+
+    def __init__(self) -> None:
+        self.cursor = 0
+        self.message = ""
+        self.error = ""
+        self.viewing_members: list[dict] | None = None
+        self.viewing_feed_name: str | None = None
+        self.feeds = self._load_feeds()
+
+    @staticmethod
+    def _load_feeds() -> list[tuple["Feed", bool]]:
+        cfg = _load_feeds_config()
+        default = cfg.get("default")
+        out: list[tuple[Feed, bool]] = []
+        for f in cfg["feeds"]:
+            out.append((f, f.name == default))
+        out.sort(key=lambda r: r[0].name)
+        return out
+
+    def render(self, stdscr) -> None:  # pragma: no cover - curses I/O
+        theme = _setup_theme()
+        h, w = stdscr.getmaxyx()
+        try:
+            stdscr.addstr(
+                0, 0, f" {self.title} ".ljust(max(1, w - 1)), theme["filter"],
+            )
+        except curses.error:
+            pass
+        if self.viewing_members is not None:
+            self._render_members(stdscr, theme, h, w)
+        else:
+            self._render_list(stdscr, theme, h, w)
+        if self.error:
+            try:
+                stdscr.addstr(
+                    h - 3, 0, ("error: " + self.error)[: max(1, w - 1)],
+                    theme["filter"],
+                )
+            except curses.error:
+                pass
+        if self.message:
+            try:
+                stdscr.addstr(
+                    h - 2, 0, self.message[: max(1, w - 1)], theme["dim"],
+                )
+            except curses.error:
+                pass
+        footer = (
+            "esc/q:back"
+            if self.viewing_members is not None
+            else "j/k:move  enter:members  d:default  l:leave  esc/q:back"
+        )
+        try:
+            stdscr.addstr(h - 1, 0, footer[: max(1, w - 1)], theme["dim"])
+        except curses.error:
+            pass
+
+    def _render_list(self, stdscr, theme, h, w):  # pragma: no cover
+        if not self.feeds:
+            try:
+                stdscr.addstr(
+                    2, 2,
+                    "(no feeds yet — run `nomnom open` or `nomnom join <url>`)",
+                    theme["dim"],
+                )
+            except curses.error:
+                pass
+            return
+        now = int(time.time())
+        for i, (feed, is_default) in enumerate(self.feeds):
+            row = 2 + i
+            if row >= h - 3:
+                break
+            attr = theme["cursor"] if i == self.cursor else 0
+            marker = "*" if is_default else " "
+            ttl = max(0, feed.expires_at - now)
+            members = len(feed.members_cache)
+            status = "expired" if ttl == 0 else f"{ttl}s"
+            line = f" {marker} {feed.name:<24}  {members:>2} members  {status}"
+            try:
+                stdscr.addstr(row, 0, line[: max(1, w - 1)], attr)
+            except curses.error:
+                pass
+
+    def _render_members(self, stdscr, theme, h, w):  # pragma: no cover
+        try:
+            stdscr.addstr(
+                2, 2,
+                f"members of '{self.viewing_feed_name}':"[: max(1, w - 4)], 0,
+            )
+        except curses.error:
+            pass
+        for i, m in enumerate(self.viewing_members or []):
+            row = 4 + i
+            if row >= h - 3:
+                break
+            name = m.get("name", "?")
+            sig_pub = m.get("identity_pubkey", "")
+            fp = _ik_fingerprint(sig_pub) if sig_pub else "?"
+            mid = (m.get("member_id") or "")[:12]
+            line = f"  {name:<24}  {fp}  ({mid}...)"
+            try:
+                stdscr.addstr(row, 0, line[: max(1, w - 1)], 0)
+            except curses.error:
+                pass
+
+    def handle_key(self, ch: int, stdscr=None):
+        if self.viewing_members is not None:
+            if ch in (ord("q"), 3, 27):
+                self.viewing_members = None
+                self.viewing_feed_name = None
+            return ScreenAction.CONTINUE
+        if ch in (ord("q"), 3, 27):
+            return ScreenAction.BACK
+        if not self.feeds:
+            return ScreenAction.CONTINUE
+        if ch in (curses.KEY_DOWN, ord("j")):
+            self.cursor = (self.cursor + 1) % len(self.feeds)
+        elif ch in (curses.KEY_UP, ord("k")):
+            self.cursor = (self.cursor - 1) % len(self.feeds)
+        elif ch in (10, 13, ord("m")):
+            feed, _ = self.feeds[self.cursor]
+            try:
+                feed_key = _feed_key_from_token(feed.feed_token)
+                host, _ = _parse_feed_url(feed.url)
+                roster = _relay_list_members(host, feed.feed_id, feed_key)
+                self.viewing_members = roster.get("members") or []
+                self.viewing_feed_name = feed.name
+                self.error = ""
+            except NomnomError as e:
+                self.error = str(e)
+        elif ch == ord("d"):
+            feed, _ = self.feeds[self.cursor]
+            cfg = _load_feeds_config()
+            cfg["default"] = feed.name
+            _save_feeds_config(cfg)
+            self.feeds = self._load_feeds()
+            self.message = f"default → {feed.name}"
+        elif ch == ord("l"):
+            feed, _ = self.feeds[self.cursor]
+            try:
+                feed_key = _feed_key_from_token(feed.feed_token)
+                host, _ = _parse_feed_url(feed.url)
+                _relay_delete_member(host, feed.feed_id, feed_key, feed.member_id)
+            except NomnomError as e:
+                self.error = str(e)
+                return ScreenAction.CONTINUE
+            cfg = _load_feeds_config()
+            cfg["feeds"] = [f for f in cfg["feeds"] if f.name != feed.name]
+            if cfg.get("default") == feed.name:
+                cfg["default"] = cfg["feeds"][0].name if cfg["feeds"] else None
+            _save_feeds_config(cfg)
+            self.feeds = self._load_feeds()
+            if self.cursor >= len(self.feeds) and self.feeds:
+                self.cursor = len(self.feeds) - 1
+            self.message = f"left {feed.name}"
         return ScreenAction.CONTINUE
 
 
@@ -6842,24 +8416,21 @@ def _build_send_parser() -> argparse.ArgumentParser:
     sub = argparse.ArgumentParser(
         prog="nomnom send",
         description=(
-            "Send a file to a pinned peer through the Cloudflare relay. "
-            "Nothing is written to disk on this side. With exactly one peer "
-            "pinned, auto-targets it. With multiple peers, pass --to PEER. "
-            "With zero peers, run `nomnom pair` instead. The relay sees "
-            "only ciphertext."
+            "Broadcast a file into the default feed (or --feed NAME). "
+            "Every other member of the feed will see it. The relay sees only "
+            "ciphertext; the sender's identity is signed per post."
         ),
     )
     sub.add_argument("file", help="Path to the file to send.")
     sub.add_argument(
-        "--to", default=None, metavar="PEER",
-        help="Send to this pinned peer (device id, name, or nickname).",
+        "--feed", default=None, metavar="NAME",
+        help="Target feed nickname (default: the default feed).",
     )
     sub.add_argument(
         "--trust-new", action="store_true",
         help=(
-            "Auto-accept TOFU prompts (new pins, key rotations). Scriptable "
-            "but loses the explicit gate; an audit line is still written "
-            "to stderr."
+            "Auto-accept TOFU prompts on first sight of a member's identity. "
+            "Scriptable but loses the explicit gate."
         ),
     )
     return sub
@@ -6869,11 +8440,15 @@ def _build_receive_parser() -> argparse.ArgumentParser:
     sub = argparse.ArgumentParser(
         prog="nomnom receive",
         description=(
-            "Long-poll every pinned peer's rendezvous slot and write each "
-            "received file into the current directory. Default: keep "
-            "listening (Ctrl-C exits). With zero pinned peers, errors: "
-            "run `nomnom pair` to add a new device."
+            "Watch a feed for new posts and write each received file into the "
+            "current directory. Default: keep listening on the default feed "
+            "until Ctrl-C. Pass --feed NAME to watch a different feed, or "
+            "--once to exit after the first received file."
         ),
+    )
+    sub.add_argument(
+        "--feed", default=None, metavar="NAME",
+        help="Feed nickname to watch (default: the default feed).",
     )
     sub.add_argument(
         "--once", action="store_true",
@@ -6885,8 +8460,8 @@ def _build_receive_parser() -> argparse.ArgumentParser:
     sub.add_argument(
         "--trust-new", action="store_true",
         help=(
-            "Auto-accept TOFU prompts on key rotation. Scriptable but loses "
-            "the explicit gate; an audit line is still written to stderr."
+            "Auto-accept TOFU prompts on first sight of a member's identity. "
+            "Scriptable but loses the explicit gate."
         ),
     )
     return sub
@@ -6965,18 +8540,71 @@ def _build_join_parser() -> argparse.ArgumentParser:
     sub = argparse.ArgumentParser(
         prog="nomnom join",
         description=(
-            "Join an existing nomnom relay using a `host#secret` token "
-            "produced by `nomnom relay show --token` on the first device. "
-            "Self-tests the relay before saving."
+            "Join an existing feed by URL (host/f/<token>). The URL alone "
+            "is the credential; no relay HMAC is needed on the joiner's side."
         ),
     )
-    sub.add_argument("token", help="Join token of the form `host#secret`.")
+    sub.add_argument("url", help="Feed URL (host/f/<token>).")
     sub.add_argument(
-        "--allow-private", action="store_true",
-        help=(
-            "Allow tokens whose host resolves to a private / loopback / "
-            "link-local address. Default refuses to block SSRF."
+        "--name", default=None,
+        help="Local nickname for this feed (default: auto-generated `feed-N`).",
+    )
+    sub.add_argument(
+        "--default", action="store_true",
+        help="Set this feed as the default for `send`/`receive`.",
+    )
+    return sub
+
+
+def _build_open_parser() -> argparse.ArgumentParser:
+    sub = argparse.ArgumentParser(
+        prog="nomnom open",
+        description=(
+            "Mint a new feed on the configured relay and save it locally. "
+            "Prints a shareable join URL for other devices."
         ),
+    )
+    sub.add_argument(
+        "--name", default=None,
+        help="Local nickname for this feed (default: auto-generated `feed-N`).",
+    )
+    sub.add_argument(
+        "--ttl", type=int, default=86_400,
+        help="Time-to-live in seconds (default: 86400 = 1 day).",
+    )
+    sub.add_argument(
+        "--default", action="store_true",
+        help="Set this feed as the default for `send`/`receive`.",
+    )
+    return sub
+
+
+def _build_feeds_parser() -> argparse.ArgumentParser:
+    sub = argparse.ArgumentParser(
+        prog="nomnom feeds",
+        description="Inspect and manage joined feeds.",
+    )
+    sp = sub.add_subparsers(dest="action", metavar="ACTION")
+    sp.add_parser("list", help="Show joined feeds, default marker, TTL.")
+    p_members = sp.add_parser("members", help="Fetch and show feed roster.")
+    p_members.add_argument("name", help="Local feed nickname.")
+    p_url = sp.add_parser("url", help="Print the shareable join URL.")
+    p_url.add_argument("name", help="Local feed nickname.")
+    p_default = sp.add_parser("default", help="Set the default feed.")
+    p_default.add_argument("name", help="Local feed nickname.")
+    p_rename = sp.add_parser("rename", help="Rename a feed locally.")
+    p_rename.add_argument("name", help="Current local nickname.")
+    p_rename.add_argument("new_name", help="New local nickname.")
+    p_leave = sp.add_parser(
+        "leave",
+        help="Leave a feed (deletes your member card, removes locally).",
+    )
+    p_leave.add_argument("name", help="Local feed nickname.")
+    p_extend = sp.add_parser("extend", help="Extend a feed's TTL.")
+    p_extend.add_argument("name", help="Local feed nickname.")
+    p_extend.add_argument(
+        "--ttl", type=int, required=True,
+        help="New TTL in seconds (relative to now).",
     )
     return sub
 
@@ -7049,15 +8677,13 @@ _DISPATCH = {
     ),
     "send": (
         _build_send_parser,
-        lambda a: cmd_send(a.file, to=a.to, trust_new=a.trust_new),
+        lambda a: cmd_send(a.file, feed=a.feed, trust_new=a.trust_new),
     ),
     "receive": (
         _build_receive_parser,
-        lambda a: cmd_receive(once=a.once, trust_new=a.trust_new),
-    ),
-    "pair": (
-        _build_pair_parser,
-        lambda a: cmd_pair(trust_new=a.trust_new),
+        lambda a: cmd_receive(
+            feed=a.feed, once=a.once, trust_new=a.trust_new,
+        ),
     ),
     "relay": (
         _build_relay_parser,
@@ -7066,6 +8692,14 @@ _DISPATCH = {
     "join": (
         _build_join_parser,
         cmd_join,
+    ),
+    "open": (
+        _build_open_parser,
+        cmd_open,
+    ),
+    "feeds": (
+        _build_feeds_parser,
+        cmd_feeds,
     ),
     "peers": (
         _build_peers_parser,
@@ -7142,10 +8776,59 @@ def _emit_bundle(
     return 0, messages
 
 
+_RETIRED_VERBS = {
+    "pair": (
+        "`nomnom pair` was retired in feeds v2. To onboard another device, "
+        "run `nomnom open` on this device to mint a feed and share the "
+        "printed URL; then run `nomnom join <url>` on the other device."
+    ),
+    "encrypt": (
+        "`nomnom encrypt` was renamed in v1.5 and removed in feeds v2. "
+        "Use `nomnom send` (broadcast to your default feed)."
+    ),
+    "decrypt": (
+        "`nomnom decrypt` was renamed in v1.5 and removed in feeds v2. "
+        "Use `nomnom receive` (watch your default feed)."
+    ),
+}
+
+
+def _maybe_print_v2_migration_notice() -> None:
+    """Print a one-shot heads-up when legacy pins exist but no feeds do.
+
+    Detects v1/v2 pin records (no `sig_pub` field) and points the user at
+    the new `open`/`join` flow. Best-effort — failure to print never blocks
+    startup.
+    """
+    try:
+        peers = _load_known_peers()
+    except Exception:
+        return
+    legacy = [
+        rec for rec in peers.values()
+        if isinstance(rec, dict) and not rec.get("sig_pub")
+    ]
+    if not legacy:
+        return
+    cfg = _load_feeds_config()
+    if cfg["feeds"]:
+        return
+    sys.stderr.write(
+        f"nomnom: v2 introduces feeds; pair is retired. "
+        f"{len(legacy)} legacy pin(s) preserved as identity records but no "
+        "longer transport. open or join a feed to send/receive.\n",
+    )
+
+
 def main() -> int:
     # Trip any pin-store migration up front so the notice lands on stderr
     # before either entry point claims the terminal (curses or CLI).
     _load_known_peers()
+    _maybe_print_v2_migration_notice()
+
+    if len(sys.argv) >= 2 and sys.argv[1] in _RETIRED_VERBS:
+        print(f"error: {_RETIRED_VERBS[sys.argv[1]]}", file=sys.stderr)
+        return 2
 
     if len(sys.argv) >= 2 and sys.argv[1] in SUBCOMMANDS:
         return _dispatch_subcommand(sys.argv[1:])
