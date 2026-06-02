@@ -6171,14 +6171,13 @@ class LauncherScreen(Screen):
         self.cursor = 0
         self.tiles: list[tuple[str, str]] = [
             ("Bundle",     "Pick files and write a bundle .txt"),
-            ("Send",       "Encrypt a file and send it to a pinned peer"),
-            ("Receive",    "Listen for transfers (auto-resumes after each)"),
-            ("Pair",       "Pair with a new device over the relay"),
+            ("Send",       "Broadcast a file to your default feed (CLI)"),
+            ("Receive",    "Watch a feed for incoming posts (CLI)"),
+            ("Feeds",      "List, leave, and inspect joined feeds"),
             ("Commit",     "Bundle staged/unstaged diffs + recent commits"),
             ("PR",         "Bundle commits since base + diff for an LLM"),
             ("Review",     "Bundle a PR's meta, diff, and comments"),
             ("Rebuild",    "Reconstruct a file tree from a bundle .txt"),
-            ("Pins",       "Manage TOFU-pinned peers"),
             ("Extensions", "Edit the text/binary/name/secret lists"),
         ]
 
@@ -6224,13 +6223,11 @@ class LauncherScreen(Screen):
 
 
 def _launcher_open(verb: str):
-    """Map a launcher tile label to either a Screen to push, or a TODO note.
-
-    Slices 5-8 replace the placeholder rows with real screens."""
+    """Map a launcher tile label to a Screen to push."""
     if verb == "Extensions":
         return ExtensionsScreen()
-    if verb == "Pins":
-        return PinsScreen()
+    if verb == "Feeds":
+        return FeedsScreen()
     if verb == "Rebuild":
         return RebuildScreen()
     if verb == "Bundle":
@@ -6242,15 +6239,21 @@ def _launcher_open(verb: str):
     if verb == "Review":
         return ReviewScreen()
     if verb == "Send":
-        return SendScreen()
+        return PlaceholderScreen(
+            "Send",
+            "Run `nomnom send <file>` from the shell to broadcast to your "
+            "default feed. The CLI is the source of truth in feeds v2; the "
+            "in-curses sender is being rebuilt around the new transport.",
+        )
     if verb == "Receive":
-        return ReceiveScreen()
-    if verb == "Pair":
-        return PairScreen()
+        return PlaceholderScreen(
+            "Receive",
+            "Run `nomnom receive` from the shell to watch your default "
+            "feed. The in-curses receiver is being rebuilt around feeds.",
+        )
     return PlaceholderScreen(
         verb,
-        f"`nomnom {verb.lower()}` works from the shell. A dedicated TUI "
-        "screen for this verb arrives in a follow-up slice.",
+        f"`nomnom {verb.lower()}` works from the shell.",
     )
 
 
@@ -6763,6 +6766,176 @@ class PinsScreen(Screen):
             if self.cursor >= len(self.peers) and self.peers:
                 self.cursor = len(self.peers) - 1
             self.message = f"dropped {', '.join(dropped) or name}."
+        return ScreenAction.CONTINUE
+
+
+class FeedsScreen(Screen):
+    """List joined feeds, mark default, drop the cursored entry."""
+
+    title = "feeds"
+    help_lines = [
+        "j/k or ↑/↓   move",
+        "Enter / m    show members of the cursored feed",
+        "d            set cursored feed as default",
+        "l            leave cursored feed (confirms)",
+        "esc / q      back to launcher",
+    ]
+
+    def __init__(self) -> None:
+        self.cursor = 0
+        self.message = ""
+        self.error = ""
+        self.viewing_members: list[dict] | None = None
+        self.viewing_feed_name: str | None = None
+        self.feeds = self._load_feeds()
+
+    @staticmethod
+    def _load_feeds() -> list[tuple["Feed", bool]]:
+        cfg = _load_feeds_config()
+        default = cfg.get("default")
+        out: list[tuple[Feed, bool]] = []
+        for f in cfg["feeds"]:
+            out.append((f, f.name == default))
+        out.sort(key=lambda r: r[0].name)
+        return out
+
+    def render(self, stdscr) -> None:  # pragma: no cover - curses I/O
+        theme = _setup_theme()
+        h, w = stdscr.getmaxyx()
+        try:
+            stdscr.addstr(
+                0, 0, f" {self.title} ".ljust(max(1, w - 1)), theme["filter"],
+            )
+        except curses.error:
+            pass
+        if self.viewing_members is not None:
+            self._render_members(stdscr, theme, h, w)
+        else:
+            self._render_list(stdscr, theme, h, w)
+        if self.error:
+            try:
+                stdscr.addstr(
+                    h - 3, 0, ("error: " + self.error)[: max(1, w - 1)],
+                    theme["filter"],
+                )
+            except curses.error:
+                pass
+        if self.message:
+            try:
+                stdscr.addstr(
+                    h - 2, 0, self.message[: max(1, w - 1)], theme["dim"],
+                )
+            except curses.error:
+                pass
+        footer = (
+            "esc/q:back"
+            if self.viewing_members is not None
+            else "j/k:move  enter:members  d:default  l:leave  esc/q:back"
+        )
+        try:
+            stdscr.addstr(h - 1, 0, footer[: max(1, w - 1)], theme["dim"])
+        except curses.error:
+            pass
+
+    def _render_list(self, stdscr, theme, h, w):  # pragma: no cover
+        if not self.feeds:
+            try:
+                stdscr.addstr(
+                    2, 2,
+                    "(no feeds yet — run `nomnom open` or `nomnom join <url>`)",
+                    theme["dim"],
+                )
+            except curses.error:
+                pass
+            return
+        now = int(time.time())
+        for i, (feed, is_default) in enumerate(self.feeds):
+            row = 2 + i
+            if row >= h - 3:
+                break
+            attr = theme["cursor"] if i == self.cursor else 0
+            marker = "*" if is_default else " "
+            ttl = max(0, feed.expires_at - now)
+            members = len(feed.members_cache)
+            status = "expired" if ttl == 0 else f"{ttl}s"
+            line = f" {marker} {feed.name:<24}  {members:>2} members  {status}"
+            try:
+                stdscr.addstr(row, 0, line[: max(1, w - 1)], attr)
+            except curses.error:
+                pass
+
+    def _render_members(self, stdscr, theme, h, w):  # pragma: no cover
+        try:
+            stdscr.addstr(
+                2, 2,
+                f"members of '{self.viewing_feed_name}':"[: max(1, w - 4)], 0,
+            )
+        except curses.error:
+            pass
+        for i, m in enumerate(self.viewing_members or []):
+            row = 4 + i
+            if row >= h - 3:
+                break
+            name = m.get("name", "?")
+            sig_pub = m.get("identity_pubkey", "")
+            fp = _ik_fingerprint(sig_pub) if sig_pub else "?"
+            mid = (m.get("member_id") or "")[:12]
+            line = f"  {name:<24}  {fp}  ({mid}...)"
+            try:
+                stdscr.addstr(row, 0, line[: max(1, w - 1)], 0)
+            except curses.error:
+                pass
+
+    def handle_key(self, ch: int, stdscr=None):
+        if self.viewing_members is not None:
+            if ch in (ord("q"), 3, 27):
+                self.viewing_members = None
+                self.viewing_feed_name = None
+            return ScreenAction.CONTINUE
+        if ch in (ord("q"), 3, 27):
+            return ScreenAction.BACK
+        if not self.feeds:
+            return ScreenAction.CONTINUE
+        if ch in (curses.KEY_DOWN, ord("j")):
+            self.cursor = (self.cursor + 1) % len(self.feeds)
+        elif ch in (curses.KEY_UP, ord("k")):
+            self.cursor = (self.cursor - 1) % len(self.feeds)
+        elif ch in (10, 13, ord("m")):
+            feed, _ = self.feeds[self.cursor]
+            try:
+                feed_key = _feed_key_from_token(feed.feed_token)
+                host, _ = _parse_feed_url(feed.url)
+                roster = _relay_list_members(host, feed.feed_id, feed_key)
+                self.viewing_members = roster.get("members") or []
+                self.viewing_feed_name = feed.name
+                self.error = ""
+            except NomnomError as e:
+                self.error = str(e)
+        elif ch == ord("d"):
+            feed, _ = self.feeds[self.cursor]
+            cfg = _load_feeds_config()
+            cfg["default"] = feed.name
+            _save_feeds_config(cfg)
+            self.feeds = self._load_feeds()
+            self.message = f"default → {feed.name}"
+        elif ch == ord("l"):
+            feed, _ = self.feeds[self.cursor]
+            try:
+                feed_key = _feed_key_from_token(feed.feed_token)
+                host, _ = _parse_feed_url(feed.url)
+                _relay_delete_member(host, feed.feed_id, feed_key, feed.member_id)
+            except NomnomError as e:
+                self.error = str(e)
+                return ScreenAction.CONTINUE
+            cfg = _load_feeds_config()
+            cfg["feeds"] = [f for f in cfg["feeds"] if f.name != feed.name]
+            if cfg.get("default") == feed.name:
+                cfg["default"] = cfg["feeds"][0].name if cfg["feeds"] else None
+            _save_feeds_config(cfg)
+            self.feeds = self._load_feeds()
+            if self.cursor >= len(self.feeds) and self.feeds:
+                self.cursor = len(self.feeds) - 1
+            self.message = f"left {feed.name}"
         return ScreenAction.CONTINUE
 
 

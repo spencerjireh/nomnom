@@ -720,8 +720,14 @@ class TestLauncherScreen:
         s = nomnom.LauncherScreen()
         labels = [t[0] for t in s.tiles]
         for v in ("Bundle", "Commit", "PR", "Review", "Rebuild",
-                  "Send", "Receive", "Extensions", "Pins"):
+                  "Send", "Receive", "Extensions", "Feeds"):
             assert v in labels
+
+    def test_pair_tile_removed_in_v2(self):
+        s = nomnom.LauncherScreen()
+        labels = [t[0] for t in s.tiles]
+        assert "Pair" not in labels
+        assert "Pins" not in labels
 
     def test_cursor_wraps_down(self):
         s = nomnom.LauncherScreen()
@@ -3643,6 +3649,48 @@ class TestCmdReceiveNoFeed:
         rc = nomnom.cmd_receive(feed="ghost")
         assert rc == 1
         assert "no feed named 'ghost'" in capsys.readouterr().err
+
+
+class TestFeedsScreen:
+    def test_empty_when_no_feeds(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        screen = nomnom.FeedsScreen()
+        assert screen.feeds == []
+
+    def test_loads_feeds_sorted_by_name(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        cfg = nomnom._empty_feeds_config()
+        nomnom._add_or_replace_feed(cfg, _make_feed(name="zebra"))
+        nomnom._add_or_replace_feed(cfg, _make_feed(name="alpha", feed_id="abcDEF99_-zy"))
+        nomnom._save_feeds_config(cfg)
+        screen = nomnom.FeedsScreen()
+        assert [f.name for f, _ in screen.feeds] == ["alpha", "zebra"]
+
+    def test_marks_default(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        cfg = nomnom._empty_feeds_config()
+        nomnom._add_or_replace_feed(cfg, _make_feed(name="home"))
+        nomnom._save_feeds_config(cfg)
+        screen = nomnom.FeedsScreen()
+        assert any(is_default for _, is_default in screen.feeds)
+
+    def test_esc_returns_back(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        screen = nomnom.FeedsScreen()
+        assert screen.handle_key(27) == nomnom.ScreenAction.BACK
+        assert screen.handle_key(ord("q")) == nomnom.ScreenAction.BACK
+
+    def test_d_sets_default(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        cfg = nomnom._empty_feeds_config()
+        nomnom._add_or_replace_feed(cfg, _make_feed(name="home"))
+        nomnom._add_or_replace_feed(cfg, _make_feed(name="work", feed_id="abcDEF99_-zy"))
+        nomnom._save_feeds_config(cfg)
+        screen = nomnom.FeedsScreen()
+        # cursor starts at 0 ("home" — alphabetical); 'd' makes it default.
+        screen.cursor = 1
+        screen.handle_key(ord("d"))
+        assert nomnom._load_feeds_config()["default"] == "work"
 
 
 class TestFeedTofu:
