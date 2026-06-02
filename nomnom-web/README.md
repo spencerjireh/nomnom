@@ -59,18 +59,12 @@ Three layers, each proving a different thing:
 
 ## Crypto interop fixtures
 
-`test/fixtures/crypto-vectors.json` is generated from `nomnom.py` (the source of
-truth) and asserts the TS port reproduces the exact bytes + can decrypt a
-Python-sealed blob. Regenerate after any change to the CLI crypto:
-
-```sh
-npm run gen:fixtures      # uv run python ../tools/gen_crypto_fixtures.py ...
-# or, from the repo root:
-make fixtures
-```
-
-CI runs `fixtures-no-drift`: it regenerates and fails on any diff, so the Python
-crypto and the TS port can't silently diverge.
+`test/fixtures/crypto-vectors.json` is a frozen snapshot of the pre-feeds-v2
+crypto: pair / recurring-DH / first-contact rendezvous. The CLI removed those
+primitives when it shifted to feeds; the web client still ships the legacy
+crypto for now, and these vectors freeze its expected outputs. When the web
+client migrates to feeds v2 (Ed25519 + HKDF + feed_seal), regenerate the
+vectors against the v2 primitives and re-introduce the CI drift check.
 
 ## Deploy (Cloudflare Worker — static assets)
 

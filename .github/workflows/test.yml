@@ -59,19 +59,3 @@ jobs:
           name: playwright-report
           path: nomnom-web/playwright-report/
           retention-days: 7
-
-  fixtures-no-drift:
-    # Regenerate the cross-language crypto fixtures from nomnom.py and fail if they
-    # differ from what's committed — keeps the Python source of truth and the TS
-    # port in lockstep.
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-python@v6
-        with:
-          python-version: "3.12"
-      - uses: astral-sh/setup-uv@v5
-      - name: Regenerate fixtures
-        run: uv run python tools/gen_crypto_fixtures.py --out nomnom-web/test/fixtures/crypto-vectors.json
-      - name: Assert no drift
-        run: git diff --exit-code -- nomnom-web/test/fixtures/crypto-vectors.json
