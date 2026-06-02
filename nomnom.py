@@ -5040,15 +5040,27 @@ def _read_payload_or_error(p: Path) -> bytes | None:
         return None
 
 
-def cmd_send(path: str, *, to: str | None = None, trust_new: bool = False) -> int:
-    """Send a file through the relay to a pinned peer.
+def _resolve_target_feed(feed_name: str | None) -> Feed | None:
+    """Look up the feed for send/receive, printing a friendly error on miss."""
+    cfg = _load_feeds_config()
+    if feed_name is not None:
+        feed = _find_feed(cfg, feed_name)
+        if feed is None:
+            sys.stderr.write(f"error: no feed named {feed_name!r}.\n")
+            return None
+        return feed
+    feed = _default_feed(cfg)
+    if feed is None:
+        sys.stderr.write(
+            "error: no default feed. open one with `nomnom open` or join "
+            "one with `nomnom join <url>`.\n",
+        )
+        return None
+    return feed
 
-    Routing:
-      - --to PEER         recurring transfer to the named pinned peer.
-      - 1 peer pinned     auto-target that peer.
-      - 0 or N peers      error (run `nomnom pair` for first-contact, or
-                          pass --to for ambiguity).
-    """
+
+def cmd_send(path: str, *, feed: str | None = None, trust_new: bool = False) -> int:
+    """Broadcast a file into the default feed (or --feed)."""
     p = Path(path).expanduser()
     if not p.is_file():
         sys.stderr.write(f"error: not a file: {p}\n")
@@ -5057,140 +5069,222 @@ def cmd_send(path: str, *, to: str | None = None, trust_new: bool = False) -> in
     if data is None:
         return 1
 
-    relay = _ensure_relay_configured()
-    if relay is None:
-        return 2
-    identity = _load_identity()
+    target = _resolve_target_feed(feed)
+    if target is None:
+        return 1
+    feed_key = _feed_key_from_token(target.feed_token)
+    host, _ = _parse_feed_url(target.url)
 
-    target_ik = None
-    if to is not None:
-        matches = _resolve_peer(to)
-        if not matches:
-            sys.stderr.write(
-                f"error: no pinned peer matches {to!r}. "
-                "see `nomnom peers list`.\n",
-            )
-            return 1
-        if len(matches) > 1:
-            sys.stderr.write(
-                f"error: peer {to!r} is ambiguous "
-                f"({len(matches)} matches). use the device id.\n",
-            )
-            return 1
-        _pid, rec = matches[0]
-        target_ik = rec.get("ik_pub")
-        if not isinstance(target_ik, str):
-            sys.stderr.write(f"error: peer {to!r} has no pinned ik_pub.\n")
-            return 1
-    else:
-        peers = [
-            (pid, rec) for pid, rec in _load_known_peers().items()
-            if isinstance(rec, dict) and isinstance(rec.get("ik_pub"), str)
-        ]
-        if not peers:
-            sys.stderr.write(
-                "error: no pinned peers. run `nomnom pair FILE` to add "
-                "a new device.\n",
-            )
-            return 1
-        if len(peers) > 1:
-            sys.stderr.write(
-                "error: multiple pinned peers; pass --to PEER.\n",
-            )
-            return 1
-        target_ik = peers[0][1]["ik_pub"]
-        sys.stderr.write(
-            f"sending to {peers[0][1].get('name', peers[0][0])!r}.\n",
-        )
-
-    on_tofu = _trust_new_callback() if trust_new else None
+    # Always-fresh roster on send: lets us print accurate member counts and
+    # ensures we'd notice a new joiner with an unpinned identity (TOFU prompt
+    # comes in slice 6).
     try:
-        rc = _relay_send(
-            p.name, data,
-            target_ik_hex=target_ik,
-            identity=identity, relay=relay,
-            on_tofu=on_tofu,
-        )
+        roster_resp = _relay_list_members(host, target.feed_id, feed_key)
     except NomnomError as e:
         sys.stderr.write(f"error: {e}\n")
         return 1
-    if rc == 0:
+    roster = roster_resp.get("members") or []
+    target.members_cache = roster
+    others = [m for m in roster if m.get("member_id") != target.member_id]
+    if not others:
         sys.stderr.write(
-            f"sent {p.name!r} ({len(data)} bytes).\n",
+            f"warning: feed {target.name!r} has no other members; the post "
+            "will sit until someone joins or the feed expires.\n",
         )
-    return rc
 
-
-def cmd_receive(*, once: bool = False, trust_new: bool = False) -> int:
-    """Receive files through the relay from pinned peers.
-
-    Default: keep long-polling every pinned peer's deterministic rendezvous
-    slot, printing one line per received file. Ctrl-C exits cleanly. Pass
-    `once=True` to exit after the first received file (scripting). With
-    zero pinned peers, errors: first contact goes through `nomnom pair`.
-    """
-    relay = _ensure_relay_configured()
-    if relay is None:
-        return 2
-    identity = _load_identity()
-
-    if not _load_known_peers():
-        sys.stderr.write(
-            "error: no pinned peers. run `nomnom pair` to add a new device.\n",
-        )
+    ident = _load_identity()
+    blob = feed_seal(
+        feed_key=feed_key,
+        feed_id=target.feed_id,
+        sender_member_id=target.member_id,
+        sender_sig_priv_hex=ident["sig_priv"],
+        sender_sig_pub_hex=ident["sig_pub"],
+        filename=p.name,
+        body=data,
+    )
+    slot_id = secrets.token_urlsafe(12)
+    try:
+        _relay_put_feed_slot(host, target.feed_id, feed_key, slot_id, blob)
+    except NomnomError as e:
+        sys.stderr.write(f"error: {e}\n")
         return 1
+    # Persist the cache refresh.
+    cfg = _load_feeds_config()
+    existing = _find_feed(cfg, target.name)
+    if existing is not None:
+        existing.members_cache = roster
+        _save_feeds_config(cfg)
+    sys.stderr.write(
+        f"sent {p.name!r} ({len(data)} bytes) to feed {target.name!r} "
+        f"({len(others)} recipient(s)).\n",
+    )
+    return 0
 
-    on_tofu = _trust_new_callback() if trust_new else None
+
+def _safe_filename(name: str) -> str:
+    """Strip directory components from a filename; refuse path-escape attempts."""
+    base = os.path.basename(name)
+    if not base or base in (".", "..") or "/" in base or "\\" in base:
+        raise NomnomError(f"refusing unsafe filename: {name!r}")
+    return base
+
+
+def _receive_one_post(
+    *, feed: Feed, host: str, feed_key: bytes, slot_id: str,
+) -> tuple[str, int, str, str] | None:
+    """Fetch and verify a single post. Returns (filename, bytes, sender_name, out_path).
+
+    Returns None when the slot disappeared (already cleaned up). Raises
+    NomnomError on tamper / signature failure / unknown sender.
+    """
+    raw = _relay_get_feed_slot(host, feed.feed_id, feed_key, slot_id)
+    if raw is None:
+        return None
+    # Resolve sender from cached roster first; refresh if missing.
+    try:
+        header, body = feed_open(
+            feed_key=feed_key, feed_id=feed.feed_id, blob=raw,
+        )
+    except ValueError as e:
+        raise NomnomError(f"feed post rejected: {e}") from e
+    sender_id = header.get("smid")
+    sender_pub = header.get("sik")
+    sender_name = "(unknown)"
+    for m in feed.members_cache or []:
+        if m.get("member_id") == sender_id:
+            sender_name = m.get("name", sender_name)
+            # Cross-check that the cached identity matches.
+            if m.get("identity_pubkey") and m.get("identity_pubkey") != sender_pub:
+                raise NomnomError(
+                    f"feed post sender {sender_id!r} identity key changed "
+                    "from roster cache (possible spoof or rotation); "
+                    "re-fetch roster",
+                )
+            break
+    filename = _safe_filename(header.get("fn") or "post")
+    out = _pick_decrypted_path(Path.cwd(), filename)
+    out.write_bytes(body)
+    return (filename, len(body), sender_name, str(out))
+
+
+def cmd_receive(
+    *, feed: str | None = None, once: bool = False, trust_new: bool = False,
+) -> int:
+    """Watch a feed for new posts; write each to cwd.
+
+    Long-polls /feeds/:id/slots?since=<last_post_ts> in a loop. Each new
+    post is decrypted, signature-verified, and written to disk (collisions
+    auto-rename). Ctrl-C exits cleanly.
+    """
+    target = _resolve_target_feed(feed)
+    if target is None:
+        return 1
+    feed_key = _feed_key_from_token(target.feed_token)
+    host, _ = _parse_feed_url(target.url)
+
     received_any = False
     if not once:
         sys.stderr.write(
-            "waiting for transfers (Ctrl-C to exit)...\n",
+            f"watching feed {target.name!r} (Ctrl-C to exit)...\n",
         )
         sys.stderr.flush()
+
+    last_ts = target.last_post_ts
     while True:
-        result_holder: list[dict] = []
-
-        def _on_result(r: dict) -> None:
-            result_holder.append(r)
-
         try:
-            rc = _relay_recv_pinned(
-                identity=identity, relay=relay,
-                on_result=_on_result, on_tofu=on_tofu,
+            slots = _relay_list_feed_slots(
+                host, target.feed_id, feed_key,
+                since_ts=last_ts, wait_ms=30_000,
             )
         except KeyboardInterrupt:
             sys.stderr.write("\n")
             return 0 if received_any else 130
         except NomnomError as e:
-            # `_relay_recv_pinned` raises "no transfer (waited 30s)" on a
-            # benign long-poll timeout — for the single-shot mode that's an
-            # error ("expected a transfer, got none"), but for the watch
-            # loop it's the steady-state idle case. Re-arm in watch mode.
-            # The error-loaded variant ("no transfer: 401 Unauthorized")
-            # carries a real reason and should always exit.
-            msg = str(e)
-            if not once and msg.startswith("no transfer (waited"):
-                continue
             sys.stderr.write(f"error: {e}\n")
             return 1
-        if rc == 0 and result_holder:
-            r = result_holder[0]
+        if not slots:
+            if once:
+                sys.stderr.write("no transfer (waited 30s)\n")
+                return 0 if received_any else 1
+            continue
+        # Iterate in chronological order; the Worker already sorts by created_at.
+        for entry in slots:
+            slot_id = entry.get("slot_id")
+            created_at = int(entry.get("created_at") or 0)
+            if not slot_id:
+                continue
+            # Skip posts authored by this device (our own broadcast comes back).
+            try:
+                raw = _relay_get_feed_slot(host, target.feed_id, feed_key, slot_id)
+            except NomnomError as e:
+                sys.stderr.write(f"warning: {e}\n")
+                if created_at > last_ts:
+                    last_ts = created_at
+                continue
+            if raw is None:
+                if created_at > last_ts:
+                    last_ts = created_at
+                continue
+            try:
+                header, body = feed_open(
+                    feed_key=feed_key, feed_id=target.feed_id, blob=raw,
+                )
+            except ValueError as e:
+                sys.stderr.write(f"warning: dropping bad post: {e}\n")
+                if created_at > last_ts:
+                    last_ts = created_at
+                continue
+            sender_id = header.get("smid")
+            if sender_id == target.member_id:
+                # our own broadcast — don't write our own file back to disk
+                if created_at > last_ts:
+                    last_ts = created_at
+                continue
+            sender_name = "(unknown)"
+            sender_pub = header.get("sik")
+            for m in target.members_cache or []:
+                if m.get("member_id") == sender_id:
+                    sender_name = m.get("name", sender_name)
+                    if m.get("identity_pubkey") and m.get("identity_pubkey") != sender_pub:
+                        sys.stderr.write(
+                            f"warning: dropping post; sender {sender_id!r} "
+                            "identity key changed from roster cache.\n",
+                        )
+                        sender_id = None
+                    break
+            if sender_id is None:
+                if created_at > last_ts:
+                    last_ts = created_at
+                continue
+            try:
+                filename = _safe_filename(header.get("fn") or "post")
+            except NomnomError as e:
+                sys.stderr.write(f"warning: dropping bad post: {e}\n")
+                if created_at > last_ts:
+                    last_ts = created_at
+                continue
+            out = _pick_decrypted_path(Path.cwd(), filename)
+            try:
+                out.write_bytes(body)
+            except OSError as e:
+                sys.stderr.write(f"error writing {out}: {e}\n")
+                return 1
             sys.stderr.write(
-                f"received {r['name']!r} ({r['bytes']} bytes) "
-                f"from {r['peer_name']} -> {r['out_path']}\n",
+                f"received {filename!r} ({len(body)} bytes) "
+                f"from {sender_name} -> {out}\n",
             )
             sys.stderr.flush()
             received_any = True
+            if created_at > last_ts:
+                last_ts = created_at
+            # Persist last_post_ts so a restart doesn't re-fetch.
+            cfg_now = _load_feeds_config()
+            existing = _find_feed(cfg_now, target.name)
+            if existing is not None:
+                existing.last_post_ts = last_ts
+                _save_feeds_config(cfg_now)
             if once:
                 return 0
-            continue
-        if rc == 130:
-            return 0 if received_any else 130
-        if once:
-            return rc
-        # Non-zero return without a Ctrl-C signal: surface and exit so the
-        # user isn't stuck in a tight loop against a broken relay.
-        return rc
 
 
 def cmd_pair(*, trust_new: bool = False) -> int:
@@ -8022,24 +8116,21 @@ def _build_send_parser() -> argparse.ArgumentParser:
     sub = argparse.ArgumentParser(
         prog="nomnom send",
         description=(
-            "Send a file to a pinned peer through the Cloudflare relay. "
-            "Nothing is written to disk on this side. With exactly one peer "
-            "pinned, auto-targets it. With multiple peers, pass --to PEER. "
-            "With zero peers, run `nomnom pair` instead. The relay sees "
-            "only ciphertext."
+            "Broadcast a file into the default feed (or --feed NAME). "
+            "Every other member of the feed will see it. The relay sees only "
+            "ciphertext; the sender's identity is signed per post."
         ),
     )
     sub.add_argument("file", help="Path to the file to send.")
     sub.add_argument(
-        "--to", default=None, metavar="PEER",
-        help="Send to this pinned peer (device id, name, or nickname).",
+        "--feed", default=None, metavar="NAME",
+        help="Target feed nickname (default: the default feed).",
     )
     sub.add_argument(
         "--trust-new", action="store_true",
         help=(
-            "Auto-accept TOFU prompts (new pins, key rotations). Scriptable "
-            "but loses the explicit gate; an audit line is still written "
-            "to stderr."
+            "Auto-accept TOFU prompts on first sight of a member's identity. "
+            "Scriptable but loses the explicit gate."
         ),
     )
     return sub
@@ -8049,11 +8140,15 @@ def _build_receive_parser() -> argparse.ArgumentParser:
     sub = argparse.ArgumentParser(
         prog="nomnom receive",
         description=(
-            "Long-poll every pinned peer's rendezvous slot and write each "
-            "received file into the current directory. Default: keep "
-            "listening (Ctrl-C exits). With zero pinned peers, errors: "
-            "run `nomnom pair` to add a new device."
+            "Watch a feed for new posts and write each received file into the "
+            "current directory. Default: keep listening on the default feed "
+            "until Ctrl-C. Pass --feed NAME to watch a different feed, or "
+            "--once to exit after the first received file."
         ),
+    )
+    sub.add_argument(
+        "--feed", default=None, metavar="NAME",
+        help="Feed nickname to watch (default: the default feed).",
     )
     sub.add_argument(
         "--once", action="store_true",
@@ -8065,8 +8160,8 @@ def _build_receive_parser() -> argparse.ArgumentParser:
     sub.add_argument(
         "--trust-new", action="store_true",
         help=(
-            "Auto-accept TOFU prompts on key rotation. Scriptable but loses "
-            "the explicit gate; an audit line is still written to stderr."
+            "Auto-accept TOFU prompts on first sight of a member's identity. "
+            "Scriptable but loses the explicit gate."
         ),
     )
     return sub
@@ -8282,11 +8377,13 @@ _DISPATCH = {
     ),
     "send": (
         _build_send_parser,
-        lambda a: cmd_send(a.file, to=a.to, trust_new=a.trust_new),
+        lambda a: cmd_send(a.file, feed=a.feed, trust_new=a.trust_new),
     ),
     "receive": (
         _build_receive_parser,
-        lambda a: cmd_receive(once=a.once, trust_new=a.trust_new),
+        lambda a: cmd_receive(
+            feed=a.feed, once=a.once, trust_new=a.trust_new,
+        ),
     ),
     "pair": (
         _build_pair_parser,

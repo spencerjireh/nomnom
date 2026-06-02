@@ -3627,83 +3627,216 @@ class TestAtomicWrite:
         assert "new" in target.read_text()
 
 
-class TestCmdReceiveNoPeers:
-    """cmd_receive errors when no peers are pinned; no silent rendezvous."""
+class TestCmdReceiveNoFeed:
+    """cmd_receive errors when no feeds are joined and no --feed specified."""
 
-    def test_no_peers_errors(self, tmp_path, monkeypatch, capsys):
+    def test_no_default_feed_errors(self, tmp_path, monkeypatch, capsys):
         monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
-        nomnom._save_relay_config("https://example.invalid", "secret",
-                                  allow_private=True)
         rc = nomnom.cmd_receive()
         assert rc == 1
-        assert "no pinned peers" in capsys.readouterr().err.lower()
+        err = capsys.readouterr().err.lower()
+        assert "no default feed" in err
+        assert "nomnom open" in err
 
-
-class TestCmdReceiveWatch:
-    """cmd_receive default watch loop accumulates results until interrupted;
-    --once exits after the first received file."""
-
-    def _setup_env(self, tmp_path, monkeypatch):
+    def test_named_feed_missing_errors(self, tmp_path, monkeypatch, capsys):
         monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
-        nomnom._save_relay_config("https://example.invalid", "secret",
-                                  allow_private=True)
-        nomnom._save_known_peer("alice", "alice-mac", "aa" * 32)
+        rc = nomnom.cmd_receive(feed="ghost")
+        assert rc == 1
+        assert "no feed named 'ghost'" in capsys.readouterr().err
 
-    def test_loops_on_multiple_results(self, tmp_path, monkeypatch, capsys):
-        self._setup_env(tmp_path, monkeypatch)
-        results = [
-            {"name": "foo.txt", "bytes": 12, "peer_name": "alice",
-             "out_path": str(tmp_path / "foo.txt")},
-            {"name": "bar.txt", "bytes": 34, "peer_name": "alice",
-             "out_path": str(tmp_path / "bar.txt")},
-        ]
-        call_count = {"n": 0}
 
-        def fake_recv(*, identity, relay, on_result, on_tofu):
-            i = call_count["n"]
-            call_count["n"] += 1
-            if i < len(results):
-                on_result(results[i])
-                return 0
-            # third iteration: simulate Ctrl-C inside the long-poll
-            raise KeyboardInterrupt
+class TestCmdSendFeed:
+    @pytest.fixture
+    def env(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        ident = nomnom._load_identity()
+        member_id = "a" * 32
+        token = nomnom.secrets.token_urlsafe(9)
+        feed = nomnom.Feed(
+            name="home",
+            feed_id=token,
+            feed_token=token,
+            url=f"https://relay.example.com/f/{token}",
+            expires_at=2_000_000_000,
+            joined_at=1_700_000_000,
+            member_id=member_id,
+            members_cache=[
+                {"member_id": member_id, "identity_pubkey": ident["sig_pub"], "name": ident["name"]},
+            ],
+        )
+        cfg = nomnom._empty_feeds_config()
+        nomnom._add_or_replace_feed(cfg, feed)
+        nomnom._save_feeds_config(cfg)
+        # Track what gets PUT to the Worker.
+        posts: list = []
 
-        monkeypatch.setattr(nomnom, "_relay_recv_pinned", fake_recv)
-        rc = nomnom.cmd_receive()
-        # received_any was True before the KeyboardInterrupt → clean exit
+        def fake_list_members(host, fid, fkey, *, since_ts=0, wait_ms=0):
+            return {"members": feed.members_cache}
+
+        def fake_put_slot(host, fid, fkey, slot_id, body):
+            posts.append({"slot_id": slot_id, "body": body, "feed_id": fid})
+
+        monkeypatch.setattr(nomnom, "_relay_list_members", fake_list_members)
+        monkeypatch.setattr(nomnom, "_relay_put_feed_slot", fake_put_slot)
+        return tmp_path, feed, posts
+
+    def test_send_posts_to_default_feed(self, env, capsys):
+        tmp_path, feed, posts = env
+        f = tmp_path / "hello.txt"
+        f.write_text("hi from cmd_send")
+        rc = nomnom.cmd_send(str(f))
+        assert rc == 0
+        assert len(posts) == 1
+        assert posts[0]["feed_id"] == feed.feed_id
+        # Verify the post decrypts to our payload.
+        feed_key = nomnom._feed_key_from_token(feed.feed_token)
+        header, body = nomnom.feed_open(
+            feed_key=feed_key, feed_id=feed.feed_id, blob=posts[0]["body"],
+        )
+        assert body == b"hi from cmd_send"
+        assert header["fn"] == "hello.txt"
+        assert header["smid"] == feed.member_id
+
+    def test_send_warns_on_lonely_feed(self, env, capsys):
+        tmp_path, feed, _ = env
+        f = tmp_path / "ghost.txt"
+        f.write_bytes(b"x")
+        rc = nomnom.cmd_send(str(f))
         assert rc == 0
         err = capsys.readouterr().err
-        assert "foo.txt" in err
-        assert "bar.txt" in err
-        assert call_count["n"] == 3  # two results + one interrupted iteration
+        assert "no other members" in err
 
-    def test_once_exits_after_one(self, tmp_path, monkeypatch, capsys):
-        self._setup_env(tmp_path, monkeypatch)
-        call_count = {"n": 0}
+    def test_send_explicit_feed(self, env, capsys):
+        tmp_path, feed, posts = env
+        f = tmp_path / "hi.txt"
+        f.write_bytes(b"x")
+        rc = nomnom.cmd_send(str(f), feed="home")
+        assert rc == 0
+        assert len(posts) == 1
 
-        def fake_recv(*, identity, relay, on_result, on_tofu):
-            call_count["n"] += 1
-            on_result({"name": "foo.txt", "bytes": 1, "peer_name": "alice",
-                       "out_path": str(tmp_path / "foo.txt")})
-            return 0
+    def test_send_unknown_feed_errors(self, env, capsys):
+        tmp_path, _, _ = env
+        f = tmp_path / "a.txt"
+        f.write_bytes(b"x")
+        rc = nomnom.cmd_send(str(f), feed="missing")
+        assert rc == 1
+        assert "no feed named 'missing'" in capsys.readouterr().err
 
-        monkeypatch.setattr(nomnom, "_relay_recv_pinned", fake_recv)
+    def test_send_nonexistent_file_errors(self, env, capsys):
+        rc = nomnom.cmd_send("/nope/does/not/exist.txt")
+        assert rc == 1
+
+
+class TestCmdReceiveFeed:
+    @pytest.fixture
+    def env(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        # Set up "alice" as the receiver and "bob" as the sender.
+        alice_ident = nomnom._load_identity()
+        bob_seed, bob_pub = nomnom.ed25519_keypair()
+        bob_member = "b" * 32
+        alice_member = "a" * 32
+        token = nomnom.secrets.token_urlsafe(9)
+        feed = nomnom.Feed(
+            name="home",
+            feed_id=token,
+            feed_token=token,
+            url=f"https://relay.example.com/f/{token}",
+            expires_at=2_000_000_000,
+            joined_at=1_700_000_000,
+            member_id=alice_member,
+            members_cache=[
+                {"member_id": alice_member, "identity_pubkey": alice_ident["sig_pub"], "name": "alice"},
+                {"member_id": bob_member, "identity_pubkey": bob_pub.hex(), "name": "bob"},
+            ],
+        )
+        cfg = nomnom._empty_feeds_config()
+        nomnom._add_or_replace_feed(cfg, feed)
+        nomnom._save_feeds_config(cfg)
+
+        feed_key = nomnom._feed_key_from_token(token)
+        bob_post = nomnom.feed_seal(
+            feed_key=feed_key,
+            feed_id=token,
+            sender_member_id=bob_member,
+            sender_sig_priv_hex=bob_seed.hex(),
+            sender_sig_pub_hex=bob_pub.hex(),
+            filename="from-bob.txt",
+            body=b"hello alice",
+        )
+
+        slots: list = [{"slot_id": "slot-1", "created_at": 1, "body": bob_post}]
+
+        def fake_list_slots(host, fid, fkey, *, since_ts=0, wait_ms=0):
+            fresh = [s for s in slots if s["created_at"] > since_ts]
+            if not fresh and wait_ms > 0:
+                # Simulate a 30s timeout returning empty (avoid actually sleeping).
+                return []
+            return [{"slot_id": s["slot_id"], "created_at": s["created_at"]} for s in fresh]
+
+        def fake_get_slot(host, fid, fkey, slot_id, *, wait_ms=0):
+            for s in slots:
+                if s["slot_id"] == slot_id:
+                    return s["body"]
+            return None
+
+        monkeypatch.setattr(nomnom, "_relay_list_feed_slots", fake_list_slots)
+        monkeypatch.setattr(nomnom, "_relay_get_feed_slot", fake_get_slot)
+        return tmp_path, feed, slots
+
+    def test_receive_once_decodes_post(self, env, capsys, monkeypatch):
+        tmp_path, feed, slots = env
+        monkeypatch.chdir(tmp_path)
         rc = nomnom.cmd_receive(once=True)
         assert rc == 0
-        assert call_count["n"] == 1
-        assert "foo.txt" in capsys.readouterr().err
+        err = capsys.readouterr().err
+        assert "from-bob.txt" in err
+        assert "from bob" in err
+        assert (tmp_path / "from-bob.txt").read_bytes() == b"hello alice"
 
-    def test_relay_error_exits_loop(self, tmp_path, monkeypatch, capsys):
-        # A NomnomError from the relay should NOT cause a tight retry loop.
-        self._setup_env(tmp_path, monkeypatch)
+    def test_receive_skips_own_post(self, env, capsys, monkeypatch):
+        tmp_path, feed, slots = env
+        monkeypatch.chdir(tmp_path)
+        # Add a post authored by alice (this device); should be skipped.
+        alice_ident = nomnom._load_identity()
+        feed_key = nomnom._feed_key_from_token(feed.feed_token)
+        alice_post = nomnom.feed_seal(
+            feed_key=feed_key,
+            feed_id=feed.feed_id,
+            sender_member_id=feed.member_id,
+            sender_sig_priv_hex=alice_ident["sig_priv"],
+            sender_sig_pub_hex=alice_ident["sig_pub"],
+            filename="echo.txt",
+            body=b"my own",
+        )
+        slots.insert(0, {"slot_id": "slot-0", "created_at": 0.5, "body": alice_post})
+        rc = nomnom.cmd_receive(once=True)
+        assert rc == 0
+        # Only bob's file was written; alice's echo was skipped.
+        assert not (tmp_path / "echo.txt").exists()
+        assert (tmp_path / "from-bob.txt").exists()
 
-        def fake_recv(*, identity, relay, on_result, on_tofu):
-            raise nomnom.NomnomError("relay is on fire")
-
-        monkeypatch.setattr(nomnom, "_relay_recv_pinned", fake_recv)
-        rc = nomnom.cmd_receive()
+    def test_receive_once_no_post_returns_failure(
+        self, tmp_path, monkeypatch, capsys,
+    ):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        token = nomnom.secrets.token_urlsafe(9)
+        feed = nomnom.Feed(
+            name="home", feed_id=token, feed_token=token,
+            url=f"https://relay.example.com/f/{token}",
+            expires_at=2_000_000_000, joined_at=1_700_000_000,
+            member_id="a" * 32, members_cache=[],
+        )
+        cfg = nomnom._empty_feeds_config()
+        nomnom._add_or_replace_feed(cfg, feed)
+        nomnom._save_feeds_config(cfg)
+        monkeypatch.setattr(
+            nomnom, "_relay_list_feed_slots",
+            lambda *a, **k: [],
+        )
+        rc = nomnom.cmd_receive(once=True)
         assert rc == 1
-        assert "on fire" in capsys.readouterr().err
+        assert "no transfer" in capsys.readouterr().err
 
 
 class TestFirstContactPromptDefaultsNo:
