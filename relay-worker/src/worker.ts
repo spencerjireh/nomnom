@@ -24,6 +24,7 @@ import { verifyFeedKey } from "./feed-auth";
 import {
   closeFeed,
   deleteMember,
+  errorResponse,
   extendFeed,
   getFeedMeta,
   getFeedSlot,
@@ -88,28 +89,19 @@ async function routeFeed(
   // /feeds/:id (no subpath) — DELETE = close
   if (subpath === "" || subpath === "/") {
     if (req.method === "DELETE") return await closeFeed(bucket, feedId);
-    return new Response("method-not-allowed", {
-      status: 405,
-      headers: { Allow: "DELETE, OPTIONS" },
-    });
+    return methodNotAllowed("DELETE, OPTIONS");
   }
 
   // /feeds/:id/meta
   if (subpath === "/meta") {
     if (req.method === "GET") return await getFeedMeta(bucket, feedId);
-    return new Response("method-not-allowed", {
-      status: 405,
-      headers: { Allow: "GET, OPTIONS" },
-    });
+    return methodNotAllowed("GET, OPTIONS");
   }
 
   // /feeds/:id/extend
   if (subpath === "/extend") {
     if (req.method === "POST") return await extendFeed(bucket, feedId, req);
-    return new Response("method-not-allowed", {
-      status: 405,
-      headers: { Allow: "POST, OPTIONS" },
-    });
+    return methodNotAllowed("POST, OPTIONS");
   }
 
   // /feeds/:id/members (list / long-poll)
@@ -122,10 +114,7 @@ async function routeFeed(
         parseSinceTs(url),
       );
     }
-    return new Response("method-not-allowed", {
-      status: 405,
-      headers: { Allow: "GET, OPTIONS" },
-    });
+    return methodNotAllowed("GET, OPTIONS");
   }
 
   // /feeds/:id/members/:mid
@@ -133,7 +122,7 @@ async function routeFeed(
   if (memberMatch) {
     const memberId = memberMatch[1];
     if (!validateMemberId(memberId)) {
-      return new Response("bad-member-id", { status: 403 });
+      return errorResponse("bad-member-id", 403);
     }
     if (req.method === "PUT") {
       return await putMember(bucket, feedId, memberId, req);
@@ -141,10 +130,7 @@ async function routeFeed(
     if (req.method === "DELETE") {
       return await deleteMember(bucket, feedId, memberId);
     }
-    return new Response("method-not-allowed", {
-      status: 405,
-      headers: { Allow: "PUT, DELETE, OPTIONS" },
-    });
+    return methodNotAllowed("PUT, DELETE, OPTIONS");
   }
 
   // /feeds/:id/slots (list / long-poll)
@@ -157,10 +143,7 @@ async function routeFeed(
         parseSinceTs(url),
       );
     }
-    return new Response("method-not-allowed", {
-      status: 405,
-      headers: { Allow: "GET, OPTIONS" },
-    });
+    return methodNotAllowed("GET, OPTIONS");
   }
 
   // /feeds/:id/slots/:slot_id
@@ -168,7 +151,7 @@ async function routeFeed(
   if (slotMatch) {
     const slotId = slotMatch[1];
     if (!validateFeedSlotId(slotId)) {
-      return new Response("bad-slot-id", { status: 403 });
+      return errorResponse("bad-slot-id", 403);
     }
     if (req.method === "PUT") {
       return await putFeedSlot(bucket, feedId, slotId, req);
@@ -176,13 +159,16 @@ async function routeFeed(
     if (req.method === "GET") {
       return await getFeedSlot(bucket, feedId, slotId, parseWaitMs(url));
     }
-    return new Response("method-not-allowed", {
-      status: 405,
-      headers: { Allow: "PUT, GET, OPTIONS" },
-    });
+    return methodNotAllowed("PUT, GET, OPTIONS");
   }
 
-  return new Response("not-found", { status: 404 });
+  return errorResponse("not-found", 404);
+}
+
+function methodNotAllowed(allow: string): Response {
+  const res = errorResponse("method-not-allowed", 405);
+  res.headers.set("Allow", allow);
+  return res;
 }
 
 async function route(
@@ -199,14 +185,14 @@ async function route(
   }
 
   if (!env.NOMNOM_HMAC_SECRET) {
-    return new Response("relay-misconfigured", { status: 500 });
+    return errorResponse("relay-misconfigured", 500);
   }
 
   // POST /feeds — HMAC required (gates feed minting to your relay's users)
   if (req.method === "POST" && path === "/feeds") {
     const auth = await verifyHmac(req, env.NOMNOM_HMAC_SECRET);
     if (!auth.ok) {
-      return new Response(auth.reason, { status: auth.status });
+      return errorResponse(auth.reason, auth.status);
     }
     return await mintFeed(env.BUCKET, req);
   }
@@ -217,11 +203,11 @@ async function route(
     const feedId = feedMatch[1];
     const subpath = feedMatch[2] ?? "";
     if (!validateFeedId(feedId)) {
-      return new Response("bad-feed-id", { status: 403 });
+      return errorResponse("bad-feed-id", 403);
     }
     const auth = await verifyFeedKey(req, feedId);
     if (!auth.ok) {
-      return new Response(auth.reason, { status: auth.status });
+      return errorResponse(auth.reason, auth.status);
     }
     return await routeFeed(env.BUCKET, feedId, subpath, req, url);
   }
@@ -231,24 +217,21 @@ async function route(
   if (slotMatch !== null) {
     const auth = await verifyHmac(req, env.NOMNOM_HMAC_SECRET);
     if (!auth.ok) {
-      return new Response(auth.reason, { status: auth.status });
+      return errorResponse(auth.reason, auth.status);
     }
     const slotId = slotMatch[1];
     if (!validateSlotId(slotId)) {
-      return new Response("bad-slot-id", { status: 403 });
+      return errorResponse("bad-slot-id", 403);
     }
     if (req.method === "PUT") return await putSlot(env.BUCKET, slotId, req);
     if (req.method === "GET") {
       return await getSlot(env.BUCKET, slotId, parseWaitMs(url));
     }
     if (req.method === "DELETE") return await deleteSlot(env.BUCKET, slotId);
-    return new Response("method-not-allowed", {
-      status: 405,
-      headers: { Allow: "GET, PUT, DELETE, OPTIONS" },
-    });
+    return methodNotAllowed("GET, PUT, DELETE, OPTIONS");
   }
 
-  return new Response("not-found", { status: 404 });
+  return errorResponse("not-found", 404);
 }
 
 export default {

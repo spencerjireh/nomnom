@@ -33,7 +33,7 @@ export class RelayClient {
       signal,
     });
     if (res.status === 204) return;
-    throw new RelayError(res.status, (await safeText(res)) || "put-failed");
+    throw new RelayError(res.status, (await safeReason(res)) || "put-failed");
   }
 
   /**
@@ -54,7 +54,7 @@ export class RelayClient {
     });
     if (res.status === 200) return await res.arrayBuffer();
     if (res.status === 404) return null; // nothing in the slot yet
-    throw new RelayError(res.status, (await safeText(res)) || "get-failed");
+    throw new RelayError(res.status, (await safeReason(res)) || "get-failed");
   }
 
   /** Best-effort slot deletion (cleanup of authored slots). Never throws. */
@@ -82,10 +82,20 @@ export class RelayClient {
   }
 }
 
-async function safeText(res: Response): Promise<string> {
+async function safeReason(res: Response): Promise<string> {
+  let text: string;
   try {
-    return (await res.text()).trim();
+    text = (await res.text()).trim();
   } catch {
     return "";
   }
+  if (text.startsWith("{")) {
+    try {
+      const obj = JSON.parse(text);
+      if (obj && typeof obj.error === "string") return obj.error;
+    } catch {
+      // fall through to raw text
+    }
+  }
+  return text;
 }

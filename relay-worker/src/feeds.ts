@@ -28,6 +28,7 @@ const MAX_MEMBER_COUNT = 64; // bound roster size per feed
 const MEMBER_POLL_INTERVAL_MS = 1000;
 const SLOT_LIST_POLL_INTERVAL_MS = 1000;
 const MAX_BUDGET_MS = 30_000;
+const LIST_BATCH_SIZE = 1000;
 
 export function validateFeedId(id: string): boolean {
   return FEED_ID_RE.test(id);
@@ -61,7 +62,7 @@ export async function mintFeed(
     const text = await req.text();
     body = JSON.parse(text);
   } catch {
-    return new Response("bad-json", { status: 400 });
+    return errorResponse("bad-json", 400);
   }
 
   const ttl = clampTtl(body.ttl_seconds);
@@ -73,11 +74,11 @@ export async function mintFeed(
     typeof card.identity_pubkey !== "string" ||
     typeof card.name !== "string"
   ) {
-    return new Response("bad-member-card", { status: 400 });
+    return errorResponse("bad-member-card", 400);
   }
   const cardJson = JSON.stringify(card);
   if (cardJson.length > MAX_MEMBER_CARD_BYTES) {
-    return new Response("member-card-too-large", { status: 413 });
+    return errorResponse("member-card-too-large", 413);
   }
 
   const feedId = generateFeedId();
@@ -116,11 +117,11 @@ export async function getFeedMeta(
 ): Promise<Response> {
   const obj = await bucket.get(`feeds/${feedId}/meta`);
   if (obj === null) {
-    return new Response("feed-not-found", { status: 404 });
+    return errorResponse("feed-not-found", 404);
   }
   if (isExpired(obj.customMetadata)) {
     await purgeFeed(bucket, feedId);
-    return new Response("feed-expired", { status: 410 });
+    return errorResponse("feed-expired", 410);
   }
   return new Response(obj.body, {
     status: 200,
@@ -139,17 +140,17 @@ export async function extendFeed(
   try {
     body = JSON.parse(await req.text());
   } catch {
-    return new Response("bad-json", { status: 400 });
+    return errorResponse("bad-json", 400);
   }
   const ttl = clampTtl(body.new_ttl_seconds);
 
   const metaObj = await bucket.get(`feeds/${feedId}/meta`);
   if (metaObj === null) {
-    return new Response("feed-not-found", { status: 404 });
+    return errorResponse("feed-not-found", 404);
   }
   if (isExpired(metaObj.customMetadata)) {
     await purgeFeed(bucket, feedId);
-    return new Response("feed-expired", { status: 410 });
+    return errorResponse("feed-expired", 410);
   }
   const meta = JSON.parse(await metaObj.text()) as {
     created_at: number;
@@ -164,8 +165,9 @@ export async function extendFeed(
     customMetadata: { expires_at: String(newExpiresAt) },
     httpMetadata: { contentType: "application/json" },
   });
-  // Note: per-object expires_at on members/slots stays at old value. R2 lifecycle
-  // cleans by age, not metadata; we honour the new feed TTL via meta-level checks.
+  // Per-object expires_at on members/slots stays at the old value — slot reads
+  // intentionally only consult feed meta (via ensureFeedLive), so extending the
+  // feed keeps already-posted slots reachable. R2 lifecycle cleans by age.
   return jsonResponse({ expires_at: newExpiresAt }, 200);
 }
 
@@ -192,13 +194,13 @@ export async function putMember(
 
   const text = await req.text();
   if (text.length > MAX_MEMBER_CARD_BYTES) {
-    return new Response("member-card-too-large", { status: 413 });
+    return errorResponse("member-card-too-large", 413);
   }
   let card: { member_id?: string; identity_pubkey?: string; name?: string };
   try {
     card = JSON.parse(text);
   } catch {
-    return new Response("bad-json", { status: 400 });
+    return errorResponse("bad-json", 400);
   }
   if (
     typeof card.member_id !== "string" ||
@@ -206,7 +208,7 @@ export async function putMember(
     typeof card.identity_pubkey !== "string" ||
     typeof card.name !== "string"
   ) {
-    return new Response("bad-member-card", { status: 400 });
+    return errorResponse("bad-member-card", 400);
   }
 
   // Bound roster growth.
@@ -218,7 +220,7 @@ export async function putMember(
     (o) => o.key === `feeds/${feedId}/members/${memberId}`,
   );
   if (!isUpdate && existing.objects.length >= MAX_MEMBER_COUNT) {
-    return new Response("feed-full", { status: 409 });
+    return errorResponse("feed-full", 409);
   }
 
   const expiresAt = await readExpiresAt(bucket, feedId);
@@ -288,10 +290,9 @@ async function readMembersSince(
   const cards: MemberCard[] = [];
   const fresh: MemberCard[] = [];
   for (const obj of list.objects) {
-    const head = await bucket.head(obj.key);
-    const joinedAt = parseTs(head?.customMetadata?.created_at) ?? 0;
     const body = await bucket.get(obj.key);
     if (body === null) continue;
+    const joinedAt = parseTs(body.customMetadata?.created_at) ?? 0;
     let parsed: { member_id: string; identity_pubkey: string; name: string };
     try {
       parsed = JSON.parse(await body.text());
@@ -325,16 +326,16 @@ export async function putFeedSlot(
   if (lenHdr !== null) {
     const len = Number.parseInt(lenHdr, 10);
     if (Number.isFinite(len) && len > MAX_BODY_BYTES) {
-      return new Response("payload-too-large", { status: 413 });
+      return errorResponse("payload-too-large", 413);
     }
   }
   const key = `feeds/${feedId}/slots/${slotId}`;
   const existing = await bucket.head(key);
   if (existing !== null) {
-    return new Response("slot-occupied", { status: 409 });
+    return errorResponse("slot-occupied", 409);
   }
   if (req.body === null) {
-    return new Response("empty-body", { status: 400 });
+    return errorResponse("empty-body", 400);
   }
   const expiresAt =
     (await readExpiresAt(bucket, feedId)) ??
@@ -364,12 +365,11 @@ export async function getFeedSlot(
   const key = `feeds/${feedId}/slots/${slotId}`;
   const obj = await pollSlot(bucket, key, waitMs);
   if (obj === null) {
-    return new Response("not-found", { status: 404 });
+    return errorResponse("not-found", 404);
   }
-  if (isExpired(obj.customMetadata)) {
-    await bucket.delete(key);
-    return new Response("expired", { status: 410 });
-  }
+  // The feed-level meta (checked by ensureFeedLive above) is the authoritative
+  // TTL gate. Per-slot customMetadata.expires_at is only what the feed TTL was
+  // at slot-write time; it goes stale after extendFeed, so we don't consult it.
   return new Response(obj.body, {
     status: 200,
     headers: { "Content-Type": "application/octet-stream" },
@@ -414,7 +414,7 @@ async function readSlotsSince(
   sinceTs: number,
 ): Promise<SlotIndex[]> {
   const prefix = `feeds/${feedId}/slots/`;
-  const list = await bucket.list({ prefix, limit: 1000 });
+  const list = await bucket.list({ prefix, limit: LIST_BATCH_SIZE });
   const out: SlotIndex[] = [];
   for (const obj of list.objects) {
     const head = await bucket.head(obj.key);
@@ -478,11 +478,11 @@ async function ensureFeedLive(
 ): Promise<Response> {
   const head = await bucket.head(`feeds/${feedId}/meta`);
   if (head === null) {
-    return new Response("feed-not-found", { status: 404 });
+    return errorResponse("feed-not-found", 404);
   }
   if (isExpired(head.customMetadata)) {
     await purgeFeed(bucket, feedId);
-    return new Response("feed-expired", { status: 410 });
+    return errorResponse("feed-expired", 410);
   }
   return new Response(null, { status: 200 });
 }
@@ -491,7 +491,7 @@ async function purgeFeed(bucket: R2Bucket, feedId: string): Promise<void> {
   const prefix = `feeds/${feedId}/`;
   let cursor: string | undefined;
   do {
-    const list = await bucket.list({ prefix, limit: 1000, cursor });
+    const list = await bucket.list({ prefix, limit: LIST_BATCH_SIZE, cursor });
     if (list.objects.length === 0) break;
     await Promise.all(list.objects.map((o) => bucket.delete(o.key)));
     cursor = list.truncated ? list.cursor : undefined;
@@ -503,6 +503,10 @@ function jsonResponse(body: unknown, status: number): Response {
     status,
     headers: { "Content-Type": "application/json" },
   });
+}
+
+export function errorResponse(reason: string, status: number): Response {
+  return jsonResponse({ error: reason }, status);
 }
 
 function sleep(ms: number): Promise<void> {

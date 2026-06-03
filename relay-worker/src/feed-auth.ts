@@ -13,6 +13,12 @@
 // from the URL token. Possession of the feed URL grants access to that feed only;
 // leaks don't compromise the rest of the relay.
 
+import {
+  bytesToHex,
+  constantTimeEqualHex,
+  urlsafeBase64Decode,
+} from "./crypto-util";
+
 const TIMESTAMP_WINDOW_SEC = 300;
 const AUTH_PREFIX = "NMNM-FEEDKEY-SHA256 ";
 const HKDF_SALT = new TextEncoder().encode("nomnom-feed-v1");
@@ -21,7 +27,7 @@ export type AuthResult =
   | { ok: true }
   | { ok: false; status: number; reason: string };
 
-export async function deriveFeedKey(feedId: string): Promise<CryptoKey> {
+export async function deriveFeedKey(feedId: string): Promise<Uint8Array> {
   const ikm = urlsafeBase64Decode(feedId);
   const info = new TextEncoder().encode(feedId);
   const baseKey = await crypto.subtle.importKey(
@@ -29,15 +35,14 @@ export async function deriveFeedKey(feedId: string): Promise<CryptoKey> {
     ikm,
     "HKDF",
     false,
-    ["deriveKey"],
+    ["deriveBits"],
   );
-  return await crypto.subtle.deriveKey(
+  const bits = await crypto.subtle.deriveBits(
     { name: "HKDF", hash: "SHA-256", salt: HKDF_SALT, info },
     baseKey,
-    { name: "HMAC", hash: "SHA-256", length: 256 },
-    false,
-    ["sign"],
+    256,
   );
+  return new Uint8Array(bits);
 }
 
 export async function verifyFeedKey(
@@ -64,7 +69,7 @@ export async function verifyFeedKey(
     return { ok: false, status: 401, reason: "clock-skew" };
   }
 
-  let feedKey: CryptoKey;
+  let feedKey: Uint8Array;
   try {
     feedKey = await deriveFeedKey(feedId);
   } catch {
@@ -80,34 +85,18 @@ export async function verifyFeedKey(
   return { ok: true };
 }
 
-async function hmacSha256Hex(key: CryptoKey, msg: string): Promise<string> {
-  const enc = new TextEncoder();
-  const sig = await crypto.subtle.sign("HMAC", key, enc.encode(msg));
+async function hmacSha256Hex(key: Uint8Array, msg: string): Promise<string> {
+  const cryptoKey = await crypto.subtle.importKey(
+    "raw",
+    key,
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const sig = await crypto.subtle.sign(
+    "HMAC",
+    cryptoKey,
+    new TextEncoder().encode(msg),
+  );
   return bytesToHex(new Uint8Array(sig));
-}
-
-function bytesToHex(bytes: Uint8Array): string {
-  let out = "";
-  for (let i = 0; i < bytes.length; i++) {
-    out += bytes[i].toString(16).padStart(2, "0");
-  }
-  return out;
-}
-
-function constantTimeEqualHex(a: string, b: string): boolean {
-  if (a.length !== b.length) return false;
-  let diff = 0;
-  for (let i = 0; i < a.length; i++) {
-    diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  }
-  return diff === 0;
-}
-
-function urlsafeBase64Decode(s: string): Uint8Array {
-  let padded = s.replace(/-/g, "+").replace(/_/g, "/");
-  while (padded.length % 4 !== 0) padded += "=";
-  const bin = atob(padded);
-  const bytes = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-  return bytes;
 }
