@@ -165,8 +165,9 @@ export async function extendFeed(
     customMetadata: { expires_at: String(newExpiresAt) },
     httpMetadata: { contentType: "application/json" },
   });
-  // Note: per-object expires_at on members/slots stays at old value. R2 lifecycle
-  // cleans by age, not metadata; we honour the new feed TTL via meta-level checks.
+  // Per-object expires_at on members/slots stays at the old value — slot reads
+  // intentionally only consult feed meta (via ensureFeedLive), so extending the
+  // feed keeps already-posted slots reachable. R2 lifecycle cleans by age.
   return jsonResponse({ expires_at: newExpiresAt }, 200);
 }
 
@@ -366,10 +367,9 @@ export async function getFeedSlot(
   if (obj === null) {
     return errorResponse("not-found", 404);
   }
-  if (isExpired(obj.customMetadata)) {
-    await bucket.delete(key);
-    return errorResponse("expired", 410);
-  }
+  // The feed-level meta (checked by ensureFeedLive above) is the authoritative
+  // TTL gate. Per-slot customMetadata.expires_at is only what the feed TTL was
+  // at slot-write time; it goes stale after extendFeed, so we don't consult it.
   return new Response(obj.body, {
     status: 200,
     headers: { "Content-Type": "application/octet-stream" },
