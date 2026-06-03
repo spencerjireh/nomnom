@@ -1,6 +1,6 @@
 import { ikFingerprint } from "../crypto/fingerprint";
 
-/** Renders an identity-key fingerprint in the mustard accent, monospace. */
-export function Fingerprint({ ikHex }: { ikHex: string }) {
-  return <span className="fingerprint">{ikFingerprint(ikHex)}</span>;
+/** Renders an identity-key fingerprint (Ed25519 sig_pub) in the mustard accent. */
+export function Fingerprint({ hex }: { hex: string }) {
+  return <span className="fingerprint">{ikFingerprint(hex)}</span>;
 }

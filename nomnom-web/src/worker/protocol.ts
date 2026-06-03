@@ -1,56 +1,42 @@
 // Message protocol between the main thread and the crypto Web Worker.
 //
-// Heavy or memory-bound crypto (scrypt, the 100 MB stream-cipher pass, 2048-bit
-// modexp) runs in the worker; the main thread sends hex keys + transferable
-// ArrayBuffers and gets results back the same way. Each request carries an `id`;
-// the worker replies with one `progress`* then exactly one `result` or `error`.
+// The 100 MB stream-cipher pass runs in the worker so it never blocks the main
+// thread; the main thread sends the already-derived feed key (hex) + a
+// transferable ArrayBuffer and gets the result back the same way. Each request
+// carries an `id`; the worker replies with zero or more `progress` then exactly
+// one `result` or `error`.
 
-import type { Identity } from "../crypto/dh";
-import type { Pubs } from "../crypto/session";
+import type { Identity } from "../crypto/identity";
+import type { FeedHeader } from "../crypto/feeds";
 
-export type ProgressPhase = "scrypt" | "xor";
+export type ProgressPhase = "xor";
 
-export interface SealRequest {
-  myIkPrivHex: string;
-  myEkPrivHex: string;
-  pubs: Pubs;
-  bindingHex: string;
-  name: string;
+export interface FeedSealReq {
+  feedKeyHex: string;
+  feedId: string;
+  senderMemberId: string;
+  senderSigPrivHex: string;
+  senderSigPubHex: string;
+  filename: string;
   data: ArrayBuffer; // transferred in
 }
 
-export interface OpenRequest {
-  myIkPrivHex: string;
-  myEkPrivHex: string;
-  pubs: Pubs;
-  bindingHex: string;
+export interface FeedOpenReq {
+  feedKeyHex: string;
+  feedId: string;
   blob: ArrayBuffer; // transferred in
 }
 
-// Request payloads keyed by op name.
 export interface WorkerRequests {
-  generateIdentity: Record<string, never>;
-  ephemeralKeypair: Record<string, never>;
-  recurringSlots: { myIkPrivHex: string; theirIkPubHex: string };
-  recurringBinding: { myIkPubHex: string; theirIkPubHex: string };
-  firstContactBinding: { relaySecret: string };
-  firstContactInitSlot: { bindingHex: string };
-  pairRespSlot: { bindingHex: string; ikPubHex: string };
-  sealInitiator: SealRequest;
-  openResponder: OpenRequest;
+  generateIdentity: { name?: string };
+  feedSeal: FeedSealReq;
+  feedOpen: FeedOpenReq;
 }
 
-// Result payloads keyed by op name.
 export interface WorkerResults {
   generateIdentity: Identity;
-  ephemeralKeypair: { privHex: string; pubHex: string };
-  recurringSlots: { base: string; init: string; resp: string; data: string };
-  recurringBinding: { bindingHex: string };
-  firstContactBinding: { bindingHex: string };
-  firstContactInitSlot: { slot: string };
-  pairRespSlot: { slot: string };
-  sealInitiator: { blob: ArrayBuffer };
-  openResponder: { name: string; body: ArrayBuffer };
+  feedSeal: { blob: ArrayBuffer };
+  feedOpen: { header: FeedHeader; body: ArrayBuffer };
 }
 
 export type WorkerOp = keyof WorkerRequests;

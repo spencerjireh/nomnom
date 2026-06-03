@@ -1,54 +1,50 @@
-import { useMemo, useState } from "react";
+import { useState } from "react";
 import { useStore } from "../../state/store";
 import { useTransfer } from "../../hooks/useTransfer";
 import { FileDrop, type StagedPayload } from "../FileDrop";
-import { Fingerprint } from "../Fingerprint";
 
 export function SendTab() {
-  const peers = useStore((s) => s.peers);
+  const feeds = useStore((s) => s.feeds);
+  const defaultFeed = useStore((s) => s.defaultFeed);
   const { send, busy } = useTransfer();
-  const peerList = useMemo(() => Object.entries(peers), [peers]);
-  const [peerId, setPeerId] = useState<string>(peerList[0]?.[0] ?? "");
+  const [feedName, setFeedName] = useState(defaultFeed ?? feeds[0]?.name ?? "");
   const [staged, setStaged] = useState<StagedPayload | null>(null);
 
-  const target = peers[peerId];
-  const canSend = !busy && !!target && !!staged;
+  const feed = feeds.find((f) => f.name === feedName) ?? feeds[0];
 
-  async function onSend() {
-    if (!target || !staged) return;
-    const data = await staged.read();
-    await send(
-      { peerId, peerIk: target.ik_pub, peerName: target.nickname || target.name },
-      { name: staged.name, data },
+  if (!feed) {
+    return (
+      <div className="tab-empty">
+        <p>no feeds yet.</p>
+        <p className="dim">open or join one in the Feeds tab, then broadcast into it.</p>
+      </div>
     );
   }
 
-  if (peerList.length === 0) {
-    return (
-      <div className="tab-empty">
-        <p>no devices on the menu yet.</p>
-        <p className="dim">head to the Pair tab to add one.</p>
-      </div>
-    );
+  const recipients = (feed.members_cache ?? []).filter((m) => m.member_id !== feed.member_id).length;
+  const canSend = !busy && !!staged;
+
+  async function onSend() {
+    if (!feed || !staged) return;
+    const data = await staged.read();
+    await send(feed, { name: staged.name, data });
   }
 
   return (
     <div className="tab">
       <label className="field">
-        <span className="field-label">to</span>
-        <select value={peerId} onChange={(e) => setPeerId(e.target.value)} disabled={busy}>
-          {peerList.map(([id, pin]) => (
-            <option key={id} value={id}>
-              {pin.nickname || pin.name}
+        <span className="field-label">broadcast into</span>
+        <select value={feed.name} onChange={(e) => setFeedName(e.target.value)} disabled={busy}>
+          {feeds.map((f) => (
+            <option key={f.name} value={f.name}>
+              {f.name}
             </option>
           ))}
         </select>
       </label>
-      {target && (
-        <p className="kv small">
-          <span className="dim">fp</span> <Fingerprint ikHex={target.ik_pub} />
-        </p>
-      )}
+      <p className="kv small dim">
+        {recipients} other member{recipients === 1 ? "" : "s"} will receive this.
+      </p>
 
       <FileDrop onChange={setStaged} disabled={busy} />
 

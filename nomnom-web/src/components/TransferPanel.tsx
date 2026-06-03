@@ -12,8 +12,8 @@ export function TransferPanel() {
   if (transfer.phase === "idle") return null;
 
   const pct = Math.round(transfer.progress * 100);
-  const active =
-    transfer.phase !== "done" && transfer.phase !== "error";
+  const active = transfer.phase !== "done" && transfer.phase !== "error";
+  const r = transfer.result;
 
   return (
     <section className="ticket panel">
@@ -25,44 +25,37 @@ export function TransferPanel() {
       {active && (
         <>
           <p className="phase-label">{transfer.label || transfer.phase}…</p>
-          <div className="progress" aria-label={`${pct}%`}>
-            <div className="progress-fill" style={{ width: `${pct}%` }} />
-            <span className="progress-pct">{pct}%</span>
-          </div>
+          {transfer.kind === "send" && (
+            <>
+              <div className="progress" aria-label={`${pct}%`}>
+                <div className="progress-fill" style={{ width: `${pct}%` }} />
+                <span className="progress-pct">{pct}%</span>
+              </div>
+            </>
+          )}
           <button type="button" className="btn ghost" onClick={cancel}>
-            cancel
+            {transfer.kind === "receive" ? "stop watching" : "cancel"}
           </button>
         </>
       )}
 
       {transfer.phase === "done" && (
         <div className="result ok">
-          {transfer.kind === "send" && transfer.result?.name && (
+          {transfer.kind === "send" && r?.name && (
             <p>
-              served <strong>{transfer.result.name}</strong>
-              {transfer.result.bytes != null && (
-                <span className="dim"> · {fmtSize(transfer.result.bytes)}</span>
+              served <strong>{r.name}</strong>
+              {r.bytes != null && <span className="dim"> · {fmtSize(r.bytes)}</span>}
+              {r.recipients != null && (
+                <span> → {r.recipients} member{r.recipients === 1 ? "" : "s"}</span>
               )}
-              {transfer.result.peerName && <span> → {transfer.result.peerName}</span>}
-            </p>
-          )}
-          {transfer.kind === "receive" && transfer.result?.outName && (
-            <p>
-              got <strong>{transfer.result.outName}</strong>
-              {transfer.result.bytes != null && (
-                <span className="dim"> · {fmtSize(transfer.result.bytes)}</span>
-              )}
-              {transfer.result.peerName && <span> from {transfer.result.peerName}</span>} — saved to
-              downloads.
-            </p>
-          )}
-          {transfer.kind === "pair" && (
-            <p>
-              paired with <strong>{transfer.result?.peerName}</strong>. it&apos;s on the menu now.
             </p>
           )}
           <p className="thanks">— thank you, come again —</p>
-          <button type="button" className="btn ghost" onClick={() => useStore.getState().resetTransfer()}>
+          <button
+            type="button"
+            className="btn ghost"
+            onClick={() => useStore.getState().resetTransfer()}
+          >
             clear
           </button>
         </div>
@@ -71,7 +64,11 @@ export function TransferPanel() {
       {transfer.phase === "error" && (
         <div className="result err-result">
           <p className="err">86&apos;d: {transfer.error}</p>
-          <button type="button" className="btn ghost" onClick={() => useStore.getState().resetTransfer()}>
+          <button
+            type="button"
+            className="btn ghost"
+            onClick={() => useStore.getState().resetTransfer()}
+          >
             dismiss
           </button>
         </div>

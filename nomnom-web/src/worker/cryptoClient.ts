@@ -1,7 +1,7 @@
 // Main-thread proxy over the crypto Web Worker. Promise-per-request, keyed by id,
-// with progress callbacks for the seal/open ops. `cancel()` terminates the worker
-// (killing any in-flight scrypt/XOR) and lazily respawns it — fine because only
-// one transfer runs at a time.
+// with progress callbacks for seal/open. `cancel()` terminates the worker
+// (killing any in-flight XOR) and lazily respawns it — fine because only one
+// transfer runs at a time.
 
 import type {
   RequestMessage,
@@ -10,10 +10,10 @@ import type {
   WorkerRequests,
   WorkerResults,
   ProgressPhase,
-  SealRequest,
-  OpenRequest,
+  FeedSealReq,
+  FeedOpenReq,
 } from "./protocol";
-import type { Identity } from "../crypto/dh";
+import type { Identity } from "../crypto/identity";
 
 type ProgressFn = (phase: ProgressPhase, fraction: number) => void;
 
@@ -83,54 +83,20 @@ class CryptoClient {
     this.failAll(new Error("cancelled"));
   }
 
-  // --- typed ops ---
-
-  generateIdentity(): Promise<Identity> {
-    return this.call("generateIdentity", {});
+  generateIdentity(name?: string): Promise<Identity> {
+    return this.call("generateIdentity", { name });
   }
 
-  ephemeralKeypair(): Promise<{ privHex: string; pubHex: string }> {
-    return this.call("ephemeralKeypair", {});
-  }
-
-  recurringSlots(
-    myIkPrivHex: string,
-    theirIkPubHex: string,
-  ): Promise<WorkerResults["recurringSlots"]> {
-    return this.call("recurringSlots", { myIkPrivHex, theirIkPubHex });
-  }
-
-  async recurringBinding(myIkPubHex: string, theirIkPubHex: string): Promise<string> {
-    const r = await this.call("recurringBinding", { myIkPubHex, theirIkPubHex });
-    return r.bindingHex;
-  }
-
-  async firstContactBinding(relaySecret: string): Promise<string> {
-    const r = await this.call("firstContactBinding", { relaySecret });
-    return r.bindingHex;
-  }
-
-  async firstContactInitSlot(bindingHex: string): Promise<string> {
-    const r = await this.call("firstContactInitSlot", { bindingHex });
-    return r.slot;
-  }
-
-  async pairRespSlot(bindingHex: string, ikPubHex: string): Promise<string> {
-    const r = await this.call("pairRespSlot", { bindingHex, ikPubHex });
-    return r.slot;
-  }
-
-  async sealInitiator(req: SealRequest, onProgress?: ProgressFn): Promise<ArrayBuffer> {
-    const r = await this.call("sealInitiator", req, { transfer: [req.data], onProgress });
+  async feedSeal(req: FeedSealReq, onProgress?: ProgressFn): Promise<ArrayBuffer> {
+    const r = await this.call("feedSeal", req, { transfer: [req.data], onProgress });
     return r.blob;
   }
 
-  async openResponder(
-    req: OpenRequest,
+  feedOpen(
+    req: FeedOpenReq,
     onProgress?: ProgressFn,
-  ): Promise<{ name: string; body: ArrayBuffer }> {
-    const r = await this.call("openResponder", req, { transfer: [req.blob], onProgress });
-    return r;
+  ): Promise<WorkerResults["feedOpen"]> {
+    return this.call("feedOpen", req, { transfer: [req.blob], onProgress });
   }
 }
 
