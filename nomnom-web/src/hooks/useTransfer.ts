@@ -1,22 +1,20 @@
-// Bridges the framework-free orchestration state machines to the store. Each
-// action builds an AbortController, wires onProgress/onTofu/onPin to store
-// actions, and translates results/errors into the transfer slice.
+// Bridges the framework-free feed orchestration to the store. Each action builds
+// an AbortController, wires onProgress / TOFU / persistence callbacks to store
+// actions, and translates results and errors into the transfer slice.
 
 import { useStore } from "../state/store";
 import { runSend } from "../orchestration/send";
-import { runReceivePinned } from "../orchestration/receive";
-import { runPair } from "../orchestration/pair";
+import { runReceive } from "../orchestration/receive";
+import { openFeed, joinFeed, leaveFeed, type TofuHooks } from "../orchestration/feed-actions";
 import { cryptoClient } from "../worker/cryptoClient";
 import { friendlyRelayMessage } from "../relay/errors";
+import type { Feed } from "../types";
 
-function wired(abort: AbortController) {
-  const s = useStore.getState();
+function tofuHooks(): TofuHooks {
   return {
-    onProgress: (phase: Parameters<typeof s.updateProgress>[0], label: string, frac: number) =>
-      useStore.getState().updateProgress(phase, label, frac),
-    onTofu: (req: Parameters<typeof s.requestTofu>[0]) => useStore.getState().requestTofu(req),
-    onPin: (u: Parameters<typeof s.applyPin>[0]) => useStore.getState().applyPin(u),
-    signal: abort.signal,
+    isPinned: (sigPub) => useStore.getState().isPinned(sigPub),
+    onTofu: (req) => useStore.getState().requestTofu(req),
+    pinPeer: (sigPub, name) => useStore.getState().pinPeer(sigPub, name),
   };
 }
 
@@ -28,7 +26,6 @@ function downloadBlob(name: string, body: ArrayBuffer): void {
   document.body.appendChild(a);
   a.click();
   a.remove();
-  // Revoke after the click has a chance to start the download.
   setTimeout(() => URL.revokeObjectURL(url), 10_000);
 }
 
@@ -36,77 +33,87 @@ export function useTransfer() {
   const phase = useStore((s) => s.transfer.phase);
   const busy = phase !== "idle" && phase !== "done" && phase !== "error";
 
-  async function send(
-    target: { peerId: string; peerIk: string; peerName: string },
-    payload: { name: string; data: ArrayBuffer },
-  ): Promise<void> {
+  async function send(feed: Feed, payload: { name: string; data: ArrayBuffer }): Promise<void> {
     const s = useStore.getState();
-    if (!s.identity || !s.relay) return;
+    if (!s.identity) return;
     const abort = new AbortController();
     s.beginTransfer("send", abort);
     try {
       const result = await runSend({
+        feed,
         identity: s.identity,
-        relay: s.relay,
-        pins: s.peers,
-        target,
         payload,
-        ...wired(abort),
+        hooks: tofuHooks(),
+        onProgress: (p, l, f) => useStore.getState().updateProgress(p, l, f),
+        onRoster: (roster) => useStore.getState().patchFeed(feed.name, { members_cache: roster }),
+        signal: abort.signal,
       });
       useStore.getState().finishTransfer(result);
     } catch (e) {
-      // A user cancel aborts the in-flight promise; don't flip the idle state
-      // back to an error.
       if (abort.signal.aborted) return;
       useStore.getState().failTransfer(friendlyRelayMessage(e));
     }
   }
 
-  async function receive(): Promise<void> {
+  async function receive(feed: Feed): Promise<void> {
     const s = useStore.getState();
-    if (!s.identity || !s.relay) return;
+    if (!s.identity) return;
     const abort = new AbortController();
     s.beginTransfer("receive", abort);
+    s.clearReceived();
     try {
-      const outcome = await runReceivePinned({
+      await runReceive({
+        feed,
         identity: s.identity,
-        relay: s.relay,
-        pins: s.peers,
-        ...wired(abort),
+        hooks: tofuHooks(),
+        onProgress: (p, l, f) => useStore.getState().updateProgress(p, l, f),
+        onFile: (f) => {
+          downloadBlob(f.name, f.body);
+          useStore.getState().pushReceived({
+            name: f.name,
+            bytes: f.bytes,
+            peerName: f.peerName,
+            at: Date.now(),
+          });
+        },
+        onAdvance: (ts) => useStore.getState().patchFeed(feed.name, { last_post_ts: ts }),
+        onRoster: (roster) => useStore.getState().patchFeed(feed.name, { members_cache: roster }),
+        signal: abort.signal,
       });
-      downloadBlob(outcome.name, outcome.body);
-      useStore.getState().finishTransfer({
-        outName: outcome.name,
-        bytes: outcome.bytes,
-        peerName: outcome.peerName,
-      });
+      // Loop ended (signal aborted) — fall back to idle.
+      useStore.getState().resetTransfer();
     } catch (e) {
-      // A user cancel aborts the in-flight promise; don't flip the idle state
-      // back to an error.
-      if (abort.signal.aborted) return;
+      if (abort.signal.aborted) {
+        useStore.getState().resetTransfer();
+        return;
+      }
       useStore.getState().failTransfer(friendlyRelayMessage(e));
     }
   }
 
-  async function pair(): Promise<void> {
+  /** Mint a new feed (needs a configured relay). Throws on failure. */
+  async function open(name: string, ttlSeconds?: number): Promise<Feed> {
     const s = useStore.getState();
-    if (!s.identity || !s.relay) return;
-    const abort = new AbortController();
-    s.beginTransfer("pair", abort);
-    try {
-      const result = await runPair({
-        identity: s.identity,
-        relay: s.relay,
-        pins: s.peers,
-        ...wired(abort),
-      });
-      useStore.getState().finishTransfer({ peerName: result.peerName });
-    } catch (e) {
-      // A user cancel aborts the in-flight promise; don't flip the idle state
-      // back to an error.
-      if (abort.signal.aborted) return;
-      useStore.getState().failTransfer(friendlyRelayMessage(e));
-    }
+    if (!s.identity) throw new Error("no identity");
+    if (!s.relay) throw new Error("no relay configured — set one in settings to open a feed.");
+    const feed = await openFeed({ identity: s.identity, relay: s.relay, name, ttlSeconds });
+    useStore.getState().upsertFeed(feed);
+    return feed;
+  }
+
+  /** Join a feed by URL (no relay secret required). Throws on failure. */
+  async function join(url: string, name: string): Promise<Feed> {
+    const s = useStore.getState();
+    if (!s.identity) throw new Error("no identity");
+    const feed = await joinFeed({ identity: s.identity, url, name, hooks: tofuHooks() });
+    useStore.getState().upsertFeed(feed);
+    return feed;
+  }
+
+  async function leave(feed: Feed): Promise<void> {
+    const s = useStore.getState();
+    if (s.identity) await leaveFeed(feed, s.identity);
+    useStore.getState().removeFeed(feed.name);
   }
 
   function cancel(): void {
@@ -117,5 +124,5 @@ export function useTransfer() {
     useStore.getState().resetTransfer();
   }
 
-  return { send, receive, pair, cancel, busy };
+  return { send, receive, open, join, leave, cancel, busy };
 }

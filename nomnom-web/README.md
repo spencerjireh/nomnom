@@ -1,32 +1,45 @@
 # nomnom-web
 
-A browser sender / receiver / pair client for [nomnom](../README.md), speaking the
-same relay protocol as the Python CLI with **full crypto interop** — a transfer
-composed in the browser decrypts on a CLI Mac and vice-versa. The browser is just
-another nomnom device with its own identity.
+A browser sender / receiver for [nomnom](../README.md), speaking the same
+**feeds v2** relay protocol as the Python CLI with **full crypto interop** — a
+file broadcast from the browser opens on a CLI Mac and vice-versa. The browser
+is just another nomnom device with its own Ed25519 identity.
 
-Stack: Vite + React + TypeScript. All crypto runs in a Web Worker. Deployed to
-Cloudflare Pages at `nomnom.spencerjireh.com`.
+Stack: Vite + React + TypeScript. The stream cipher runs in a Web Worker.
+Deployed as a static-assets Cloudflare Worker at `nomnom.spencerjireh.com`.
 
 ## How it works
 
-- **Crypto** (`src/crypto/`) is a byte-for-byte TypeScript port of `nomnom.py`:
-  RFC 3526 group-14 triple-DH, the `seal_bytes`/`open_bytes` AEAD (scrypt +
-  HMAC-SHA256 keystream + encrypt-then-MAC), slot derivation, first-contact scrypt
-  binding, and the relay HMAC auth header. `@noble/hashes` provides sha256/hmac/
-  scrypt; BigInt modexp is hand-rolled.
-- **Web Worker** (`src/worker/`) runs scrypt, the stream cipher over big files
-  (up to 100 MB), and modexp off the main thread, reporting progress.
-- **Orchestration** (`src/orchestration/`) implements send / receive / pair as
-  framework-free state machines over a thin relay HTTP client (`src/relay/`).
-- **UI** (`src/components/`, zustand store in `src/state/`) is a tabbed
-  "diner-receipt" interface: Send / Receive / Pair / Peers + Settings.
+- **Crypto** (`src/crypto/`) is a byte-for-byte TypeScript port of `nomnom.py`'s
+  feed primitives: Ed25519 sender signatures (via `@noble/curves`, identical to
+  the CLI's RFC 8032 reference impl), HKDF-SHA256 key derivation from the URL
+  token, the `feed_seal` / `feed_open` AEAD (HMAC-SHA256 keystream +
+  encrypt-then-MAC over a signed, length-prefixed header), and the per-request
+  `NMNM-FEEDKEY-SHA256` auth header. `@noble/hashes` provides sha256/hmac.
+- **Web Worker** (`src/worker/`) runs `feed_seal` / `feed_open` — the stream
+  cipher over big files (up to 100 MB) — off the main thread, reporting progress.
+- **Relay client** (`src/relay/`) implements the `/feeds/*` surface: mint
+  (HMAC-gated), member cards, roster long-poll, and slot put/get/list.
+- **Orchestration** (`src/orchestration/`) implements open / join / send /
+  receive as framework-free state machines over the relay client.
+- **UI** (`src/components/`, zustand store in `src/state/`) is an editorial
+  two-pane "diner-receipt" interface: a brand/status rail beside the receipt,
+  with Send / Receive / Feeds tabs + Settings.
 
-Identity, TOFU pins, and the relay passphrase live in `localStorage`, shapes
-matching the CLI's `identity.json` / `known_peers.json`. **Accepted tradeoff:** the
-identity private key and relay secret are readable by any script on this origin —
-the same trust model as the CLI's `~/.config/nomnom` files. The site ships a strict
-CSP (`public/_headers`) and no third-party scripts to keep the origin clean.
+A feed is one-to-many: every member derives the same symmetric key from the
+shared URL token, posts are encrypted under it, and each post carries an Ed25519
+signature so senders are authenticated even though the key is shared.
+
+Identity, joined feeds, TOFU pins, and the relay passphrase live in
+`localStorage`, shapes matching the CLI's `identity.json` / `feeds.json` /
+`known_peers.json`. **Accepted tradeoff:** the Ed25519 seed (`sig_priv`) and the
+relay secret are readable by any script on this origin — the same trust model as
+the CLI's `~/.config/nomnom` files. The site ships a strict CSP
+(`public/_headers`) and no third-party scripts to keep the origin clean.
+
+A relay passphrase is only needed to **open** (mint) a feed; **joining** a feed
+by URL needs nothing but the URL, so the app is usable on first load — relay
+setup lives in Settings.
 
 ## Develop
 
@@ -34,8 +47,9 @@ CSP (`public/_headers`) and no third-party scripts to keep the origin clean.
 npm install
 npm run dev          # http://localhost:5173 — hits the live relay (allowlisted in the Worker CORS)
 npm run typecheck
-npm test             # crypto interop vectors (vitest)
+npm test             # feeds-v2 crypto interop vectors (vitest)
 npm run test:e2e     # Playwright UI smoke (offline; builds + previews on :4173)
+npm run gen:fixtures # regenerate the crypto vectors from nomnom.py (needs uv)
 npm run build        # tsc --noEmit && vite build -> dist/
 ```
 
@@ -47,24 +61,25 @@ npm run build        # tsc --noEmit && vite build -> dist/
 Three layers, each proving a different thing:
 
 - **`npm test`** — cross-language crypto vectors (vitest). Proves the TS port
-  reproduces `nomnom.py` byte-for-byte and decrypts a Python-sealed blob.
+  reproduces `nomnom.py` byte-for-byte: HKDF, Ed25519 sign/verify, feed-key
+  derivation, `feed_seal` (reseals to identical bytes) and `feed_open` (decrypts
+  a Python-sealed post), and the request MAC.
 - **`npm run test:e2e`** — Playwright UI smoke (`e2e/`). Drives the built app
-  through `vite preview`, fully **offline and secret-free**: onboarding's relay
-  health probe is mocked and every screen is reached from `localStorage`, so it
-  guards the UI + state wiring without touching the relay. First run needs
-  `npx playwright install chromium`.
+  through `vite preview`, fully **offline and secret-free**: feed state is seeded
+  from `localStorage` and no relay is touched, so it guards the UI + state wiring.
+  First run needs `npx playwright install chromium`.
 - **Manual CLI↔browser round-trip** — the real interop proof, run by hand against
-  the live relay: pair the browser with `nomnom pair`, send a file each way, and
-  checksum-compare. Not in CI (it needs the relay passphrase + a running CLI).
+  the live relay: `nomnom open` a feed, join it in the browser (or vice-versa),
+  send a file each way, and checksum-compare. Not in CI (it needs the relay
+  passphrase + a running CLI).
 
 ## Crypto interop fixtures
 
-`test/fixtures/crypto-vectors.json` is a frozen snapshot of the pre-feeds-v2
-crypto: pair / recurring-DH / first-contact rendezvous. The CLI removed those
-primitives when it shifted to feeds; the web client still ships the legacy
-crypto for now, and these vectors freeze its expected outputs. When the web
-client migrates to feeds v2 (Ed25519 + HKDF + feed_seal), regenerate the
-vectors against the v2 primitives and re-introduce the CI drift check.
+`test/fixtures/feeds-vectors.json` is generated by `tools/gen_feeds_fixtures.py`
+(`npm run gen:fixtures`) from `nomnom.py` with fixed seeds/nonce, so the output
+is deterministic and meaningful in a diff. It freezes the expected bytes of the
+feeds-v2 primitives; the vitest suite asserts the TS port reproduces them.
+Re-run it whenever `nomnom.py`'s feed crypto changes, and the tests re-validate.
 
 ## Deploy (Cloudflare Worker — static assets)
 
@@ -72,9 +87,8 @@ Hosted as a static-assets Worker bound to `nomnom.spencerjireh.com` (see
 `wrangler.toml`). We use a Worker rather than Pages because `wrangler deploy`
 auto-provisions the custom domain's DNS + TLS through the Workers API — the same
 path the relay Worker uses for `relay.spencerjireh.com` — so the whole deploy is
-one CLI command with no dashboard step. (A Pages custom domain needs a separate
-DNS record that a `pages:write`/`zone:read` token can't create.) Workers Static
-Assets honors `dist/_headers`, so the strict CSP ships unchanged.
+one CLI command with no dashboard step. Workers Static Assets honors
+`dist/_headers`, so the strict CSP ships unchanged.
 
 ```sh
 npm run build
@@ -82,6 +96,6 @@ npx wrangler deploy
 ```
 
 No build-time env is required — the relay URL is hardcoded in `src/config.ts` and
-the passphrase is entered at runtime. The `spencerjireh.com` zone is already on
-Cloudflare, so the custom domain + cert are provisioned automatically on first
-deploy.
+the passphrase is entered at runtime in Settings. The `spencerjireh.com` zone is
+already on Cloudflare, so the custom domain + cert are provisioned automatically
+on first deploy.
