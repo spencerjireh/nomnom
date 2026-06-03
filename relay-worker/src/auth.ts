@@ -8,6 +8,8 @@
 // over the ciphertext). The relay's HMAC authenticates the client to the
 // Worker; it does not vouch for what the client is sending.
 
+import { bytesToHex, constantTimeEqualHex } from "./crypto-util";
+
 const TIMESTAMP_WINDOW_SEC = 300;
 const AUTH_PREFIX = "NMNM-HMAC-SHA256 ";
 
@@ -58,21 +60,4 @@ async function hmacSha256Hex(secret: string, msg: string): Promise<string> {
   );
   const sig = await crypto.subtle.sign("HMAC", key, enc.encode(msg));
   return bytesToHex(new Uint8Array(sig));
-}
-
-function bytesToHex(bytes: Uint8Array): string {
-  let out = "";
-  for (let i = 0; i < bytes.length; i++) {
-    out += bytes[i].toString(16).padStart(2, "0");
-  }
-  return out;
-}
-
-function constantTimeEqualHex(a: string, b: string): boolean {
-  if (a.length !== b.length) return false;
-  let diff = 0;
-  for (let i = 0; i < a.length; i++) {
-    diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  }
-  return diff === 0;
 }

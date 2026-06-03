@@ -36,7 +36,7 @@ import urllib.parse
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import NamedTuple
+from typing import NamedTuple, NoReturn, Tuple
 
 try:
     locale.setlocale(locale.LC_ALL, "")
@@ -1215,19 +1215,15 @@ def pick(
     """
     if not nodes:
         return PickResult(set(), initial_destination, initial_include_tree)
-    holder: dict = {"result": None}
+    result: list = []
     try:
-        curses.wrapper(
-            lambda stdscr: holder.__setitem__(
-                "result",
-                _picker_ui(stdscr, nodes, root, initial_destination,
-                           initial_include_tree, allow_stdout=True,
-                           allow_git_verbs=allow_git_verbs),
-            )
-        )
+        curses.wrapper(lambda stdscr: result.append(_picker_ui(
+            stdscr, nodes, root, initial_destination, initial_include_tree,
+            allow_stdout=True, allow_git_verbs=allow_git_verbs,
+        )))
     except KeyboardInterrupt:
         return None
-    return holder["result"]
+    return result[0] if result else None
 
 
 # ---------- output ----------
@@ -2489,6 +2485,9 @@ _ED_L = 2 ** 252 + 27742317777372353535851937790883648493
 _ED_D = -121665 * pow(121666, _ED_P - 2, _ED_P) % _ED_P
 _ED_I = pow(2, (_ED_P - 1) // 4, _ED_P)
 
+# Extended Edwards point: (X, Y, Z, T). Affine = (X/Z, Y/Z); T = XY/Z.
+_EdPoint = Tuple[int, int, int, int]
+
 
 def _ed_h(m: bytes) -> bytes:
     return hashlib.sha512(m).digest()
@@ -2518,8 +2517,7 @@ if _ED_BX is None:
 _ED_B = (_ED_BX % _ED_P, _ED_BY % _ED_P, 1, _ED_BX * _ED_BY % _ED_P)
 
 
-def _ed_point_add(P, Q):
-    # Extended Edwards coordinates: (X, Y, Z, T). Affine point is (X/Z, Y/Z).
+def _ed_point_add(P: _EdPoint, Q: _EdPoint) -> _EdPoint:
     x1, y1, z1, t1 = P
     x2, y2, z2, t2 = Q
     a = (y1 - x1) * (y2 - x2) % _ED_P
@@ -2533,8 +2531,8 @@ def _ed_point_add(P, Q):
     return (e * f % _ED_P, g * h % _ED_P, f * g % _ED_P, e * h % _ED_P)
 
 
-def _ed_scalar_mult(P, n: int):
-    Q = (0, 1, 1, 0)  # identity
+def _ed_scalar_mult(P: _EdPoint, n: int) -> _EdPoint:
+    Q: _EdPoint = (0, 1, 1, 0)  # identity
     while n > 0:
         if n & 1:
             Q = _ed_point_add(Q, P)
@@ -2543,7 +2541,7 @@ def _ed_scalar_mult(P, n: int):
     return Q
 
 
-def _ed_point_encode(P) -> bytes:
+def _ed_point_encode(P: _EdPoint) -> bytes:
     x, y, z, _ = P
     zi = pow(z, _ED_P - 2, _ED_P)
     x = x * zi % _ED_P
@@ -2551,7 +2549,7 @@ def _ed_point_encode(P) -> bytes:
     return ((y & ((1 << 255) - 1)) | ((x & 1) << 255)).to_bytes(32, "little")
 
 
-def _ed_point_decode(s: bytes):
+def _ed_point_decode(s: bytes) -> _EdPoint | None:
     if len(s) != 32:
         return None
     raw = int.from_bytes(s, "little")
@@ -3658,6 +3656,12 @@ def _relay_request(
             pass
 
 
+def _qs(**params: int) -> str:
+    """Build `?k=v&...` from positive int kwargs; empty string if none apply."""
+    parts = [f"{k}={int(v)}" for k, v in params.items() if v and v > 0]
+    return ("?" + "&".join(parts)) if parts else ""
+
+
 def _relay_put_slot(relay: dict, slot_id: str, body: bytes) -> None:
     if len(body) > _RELAY_MAX_BODY:
         raise NomnomError(
@@ -3671,14 +3675,12 @@ def _relay_put_slot(relay: dict, slot_id: str, body: bytes) -> None:
 
 def _relay_get_slot(relay: dict, slot_id: str, *, wait_ms: int = 0) -> bytes | None:
     """Returns the slot body on 200, None on 404 (poll timeout / empty)."""
-    suffix = f"?wait={int(wait_ms)}" if wait_ms > 0 else ""
-    status, data = _relay_request(relay, "GET", f"/slots/{slot_id}{suffix}")
+    status, data = _relay_request(relay, "GET", f"/slots/{slot_id}{_qs(wait=wait_ms)}")
     if status == 200:
         return data
     if status == 404:
         return None
     _raise_relay_error(status, data)
-    return None  # unreachable
 
 
 def _relay_delete_slot(relay: dict, slot_id: str) -> None:
@@ -3760,8 +3762,23 @@ def _feed_request(
             pass
 
 
-def _raise_feed_error(status: int, body: bytes) -> None:
-    reason = body.decode("utf-8", errors="replace").strip()
+def _decode_relay_reason(body: bytes) -> str:
+    """Extract `error` from a JSON body, else the raw text (back-compat)."""
+    text = body.decode("utf-8", errors="replace").strip()
+    if text.startswith("{"):
+        try:
+            obj = json.loads(text)
+        except json.JSONDecodeError:
+            return text
+        if isinstance(obj, dict):
+            err = obj.get("error")
+            if isinstance(err, str):
+                return err
+    return text
+
+
+def _raise_feed_error(status: int, body: bytes) -> NoReturn:
+    reason = _decode_relay_reason(body)
     if status == 401:
         if reason == "clock-skew":
             raise NomnomError(
@@ -3801,7 +3818,6 @@ def _relay_mint_feed(
         except json.JSONDecodeError as e:
             raise NomnomError(f"relay returned bad JSON: {e}") from e
     _raise_relay_error(status, data)
-    return {}  # unreachable
 
 
 def _relay_get_feed_meta(host: str, feed_id: str, feed_key: bytes) -> dict:
@@ -3814,7 +3830,6 @@ def _relay_get_feed_meta(host: str, feed_id: str, feed_key: bytes) -> dict:
         except json.JSONDecodeError as e:
             raise NomnomError(f"relay returned bad JSON: {e}") from e
     _raise_feed_error(status, data)
-    return {}
 
 
 def _relay_put_member(
@@ -3847,14 +3862,9 @@ def _relay_list_members(
     host: str, feed_id: str, feed_key: bytes,
     *, since_ts: int = 0, wait_ms: int = 0,
 ) -> dict:
-    q = []
-    if wait_ms > 0:
-        q.append(f"wait={int(wait_ms)}")
-    if since_ts > 0:
-        q.append(f"since={int(since_ts)}")
-    qs = ("?" + "&".join(q)) if q else ""
     status, data = _feed_request(
-        host, feed_key, "GET", f"/feeds/{feed_id}/members{qs}",
+        host, feed_key, "GET",
+        f"/feeds/{feed_id}/members{_qs(wait=wait_ms, since=since_ts)}",
     )
     if status == 200:
         try:
@@ -3862,7 +3872,6 @@ def _relay_list_members(
         except json.JSONDecodeError as e:
             raise NomnomError(f"relay returned bad JSON: {e}") from e
     _raise_feed_error(status, data)
-    return {}
 
 
 def _relay_extend_feed(
@@ -3879,7 +3888,6 @@ def _relay_extend_feed(
         except json.JSONDecodeError as e:
             raise NomnomError(f"relay returned bad JSON: {e}") from e
     _raise_feed_error(status, data)
-    return {}
 
 
 def _relay_close_feed(host: str, feed_id: str, feed_key: bytes) -> None:
@@ -3911,30 +3919,24 @@ def _relay_get_feed_slot(
     host: str, feed_id: str, feed_key: bytes, slot_id: str,
     *, wait_ms: int = 0,
 ) -> bytes | None:
-    qs = f"?wait={int(wait_ms)}" if wait_ms > 0 else ""
     status, data = _feed_request(
-        host, feed_key, "GET", f"/feeds/{feed_id}/slots/{slot_id}{qs}",
+        host, feed_key, "GET",
+        f"/feeds/{feed_id}/slots/{slot_id}{_qs(wait=wait_ms)}",
     )
     if status == 200:
         return data
     if status == 404:
         return None
     _raise_feed_error(status, data)
-    return None
 
 
 def _relay_list_feed_slots(
     host: str, feed_id: str, feed_key: bytes,
     *, since_ts: int = 0, wait_ms: int = 0,
 ) -> list:
-    q = []
-    if wait_ms > 0:
-        q.append(f"wait={int(wait_ms)}")
-    if since_ts > 0:
-        q.append(f"since={int(since_ts)}")
-    qs = ("?" + "&".join(q)) if q else ""
     status, data = _feed_request(
-        host, feed_key, "GET", f"/feeds/{feed_id}/slots{qs}",
+        host, feed_key, "GET",
+        f"/feeds/{feed_id}/slots{_qs(wait=wait_ms, since=since_ts)}",
     )
     if status == 200:
         try:
@@ -3943,7 +3945,6 @@ def _relay_list_feed_slots(
             raise NomnomError(f"relay returned bad JSON: {e}") from e
         return parsed.get("slots") or []
     _raise_feed_error(status, data)
-    return []
 
 
 def _relay_health(relay: dict) -> bool:
@@ -3954,8 +3955,8 @@ def _relay_health(relay: dict) -> bool:
     return status == 200 and data.strip() == b"ok"
 
 
-def _raise_relay_error(status: int, body: bytes) -> None:
-    reason = body.decode("utf-8", errors="replace").strip()
+def _raise_relay_error(status: int, body: bytes) -> NoReturn:
+    reason = _decode_relay_reason(body)
     if status == 401:
         if reason == "clock-skew":
             raise NomnomError(

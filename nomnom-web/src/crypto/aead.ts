@@ -120,21 +120,22 @@ async function deriveKeys(
   return { encKey: dk.subarray(0, 32), macKey: dk.subarray(32) };
 }
 
-export interface SealOpts extends AeadProgress {
-  salt?: Uint8Array; // test hook
-  nonce?: Uint8Array; // test hook
-}
-
-/** Encrypt `data` under `passphrase`, embedding `name`. Returns the wire blob. */
+/**
+ * Encrypt `data` under `passphrase` with caller-supplied salt + nonce.
+ * Production code should use `sealBytesWithRandom`; this overload exists so
+ * tests can pin entropy against the Python CLI's wire vectors.
+ */
 export async function sealBytes(
   data: Uint8Array,
   name: string,
   passphrase: string,
-  opts: SealOpts = {},
+  salt: Uint8Array,
+  nonce: Uint8Array,
+  opts: AeadProgress = {},
 ): Promise<Uint8Array> {
   if (!passphrase) throw new Error("passphrase must not be empty");
-  const salt = opts.salt ?? randomBytes(NMNM_SALT_LEN);
-  const nonce = opts.nonce ?? randomBytes(NMNM_NONCE_LEN);
+  if (salt.length !== NMNM_SALT_LEN) throw new Error("salt length mismatch");
+  if (nonce.length !== NMNM_NONCE_LEN) throw new Error("nonce length mismatch");
   const { encKey, macKey } = await deriveKeys(passphrase, salt, (f) =>
     opts.onProgress?.("scrypt", f),
   );
@@ -147,6 +148,23 @@ export async function sealBytes(
   const mac = hmacSha256(macKey, macInput);
 
   return concat(NMNM_MAGIC, salt, nonce, mac, ciphertext);
+}
+
+/** Encrypt with freshly generated salt + nonce. The normal production entry point. */
+export function sealBytesWithRandom(
+  data: Uint8Array,
+  name: string,
+  passphrase: string,
+  opts: AeadProgress = {},
+): Promise<Uint8Array> {
+  return sealBytes(
+    data,
+    name,
+    passphrase,
+    randomBytes(NMNM_SALT_LEN),
+    randomBytes(NMNM_NONCE_LEN),
+    opts,
+  );
 }
 
 /** Verify and decrypt a blob from sealBytes. Throws on tamper / wrong passphrase. */

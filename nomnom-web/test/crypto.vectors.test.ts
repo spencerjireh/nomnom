@@ -77,10 +77,13 @@ describe("AEAD (seal/open)", () => {
       expect(hex(body)).toBe(v.plaintextHex);
     });
     it(`vector ${i} (${v.name}): reseals to identical bytes`, async () => {
-      const out = await sealBytes(hexToBytes(v.plaintextHex), v.name, v.kdfInput, {
-        salt: hexToBytes(v.saltHex),
-        nonce: hexToBytes(v.nonceHex),
-      });
+      const out = await sealBytes(
+        hexToBytes(v.plaintextHex),
+        v.name,
+        v.kdfInput,
+        hexToBytes(v.saltHex),
+        hexToBytes(v.nonceHex),
+      );
       expect(hex(out)).toBe(v.blobHex);
     });
   }

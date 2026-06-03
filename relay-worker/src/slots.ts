@@ -9,6 +9,7 @@
 // objects older than 1 day so orphans (sender abandons after PUT, etc.)
 // don't accumulate. See relay-worker/README.md for the dashboard step.
 
+import { errorResponse } from "./feeds";
 import { pollSlot } from "./poll";
 
 const SLOT_TTL_SEC = 300; // 5 minutes from PUT to expiry
@@ -28,17 +29,17 @@ export async function putSlot(
   if (lenHdr !== null) {
     const len = Number.parseInt(lenHdr, 10);
     if (Number.isFinite(len) && len > MAX_BODY_BYTES) {
-      return new Response("payload-too-large", { status: 413 });
+      return errorResponse("payload-too-large", 413);
     }
   }
   // 409 if slot is already occupied. R2 has no native "if-not-exists" so
   // we read first. Race window is tiny but acceptable.
   const existing = await bucket.head(key);
   if (existing !== null) {
-    return new Response("slot-occupied", { status: 409 });
+    return errorResponse("slot-occupied", 409);
   }
   if (req.body === null) {
-    return new Response("empty-body", { status: 400 });
+    return errorResponse("empty-body", 400);
   }
   const expiresAt = Math.floor(Date.now() / 1000) + SLOT_TTL_SEC;
   await bucket.put(key, req.body, {
@@ -54,14 +55,14 @@ export async function getSlot(
 ): Promise<Response> {
   const obj = await pollSlot(bucket, key, waitMs);
   if (obj === null) {
-    return new Response("not-found", { status: 404 });
+    return errorResponse("not-found", 404);
   }
   const expStr = obj.customMetadata?.expires_at;
   if (expStr !== undefined) {
     const exp = Number.parseInt(expStr, 10);
     if (Number.isFinite(exp) && exp < Math.floor(Date.now() / 1000)) {
       await bucket.delete(key);
-      return new Response("expired", { status: 410 });
+      return errorResponse("expired", 410);
     }
   }
   // Delete-on-read. We have to fully read the body first before delete

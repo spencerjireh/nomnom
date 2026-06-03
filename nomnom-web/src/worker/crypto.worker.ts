@@ -14,7 +14,7 @@ import {
   pairRespSlot,
   sessionKeyInitiator,
   sessionKeyResponder,
-  sealBytes,
+  sealBytesWithRandom,
   openBytes,
   bytesToHexDigest,
   hexToBytes,
@@ -79,9 +79,12 @@ async function handle(req: RequestMessage): Promise<{ result: unknown; transfer:
     case "sealInitiator": {
       const p = payload as RequestMessage<"sealInitiator">["payload"];
       const key = sessionKeyInitiator(p.myIkPrivHex, p.myEkPrivHex, p.pubs, hexToBytes(p.bindingHex));
-      const blob = await sealBytes(new Uint8Array(p.data), p.name, bytesToHexDigest(key), {
-        onProgress: (phase, fraction) => progress(id, phase, fraction),
-      });
+      const blob = await sealBytesWithRandom(
+        new Uint8Array(p.data),
+        p.name,
+        bytesToHexDigest(key),
+        { onProgress: (phase, fraction) => progress(id, phase, fraction) },
+      );
       // Re-pack into its own ArrayBuffer so the whole (possibly larger) backing
       // store isn't transferred.
       const buf = blob.slice().buffer;

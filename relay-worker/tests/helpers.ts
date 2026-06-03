@@ -19,11 +19,7 @@ export async function signedHmacRequest(
 ): Promise<Request> {
   const ts = Math.floor(Date.now() / 1000);
   const msg = `${method}\n${pathOnly(path)}\n${ts}`;
-  const mac = await hmacSha256Hex(
-    new TextEncoder().encode(TEST_SECRET),
-    msg,
-    "raw",
-  );
+  const mac = await hmacSha256Hex(new TextEncoder().encode(TEST_SECRET), msg);
   const headers: Record<string, string> = {
     Authorization: `${HMAC_PREFIX} ${ts}:${mac}`,
   };
@@ -46,7 +42,7 @@ export async function signedFeedRequest(
   const ts = Math.floor(Date.now() / 1000);
   const msg = `${method}\n${pathOnly(path)}\n${ts}`;
   const feedKey = await deriveFeedKeyBytes(feedId);
-  const mac = await hmacSha256Hex(feedKey, msg, "raw-bytes");
+  const mac = await hmacSha256Hex(feedKey, msg);
   const headers: Record<string, string> = {
     Authorization: `${FEED_KEY_PREFIX} ${ts}:${mac}`,
   };
@@ -81,7 +77,6 @@ export async function deriveFeedKeyBytes(feedId: string): Promise<Uint8Array> {
 async function hmacSha256Hex(
   key: Uint8Array,
   msg: string,
-  _label: string,
 ): Promise<string> {
   const cryptoKey = await crypto.subtle.importKey(
     "raw",
