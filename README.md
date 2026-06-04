@@ -19,7 +19,7 @@ nomnom .
 
 Opens a picker for the current directory. Pick files, hit `Enter`, get `./<repo>-<timestamp>.txt`. `.gitignore`, junk dirs (`.git`, `node_modules`, …), binaries, symlinks, and obvious secrets are skipped before the picker loads.
 
-Bare `nomnom` on a TTY opens a launcher with tiles for Bundle, Send, Receive, Feeds, Commit, PR, Review, Rebuild, and Extensions. Inside the picker, `v` cycles bundle / `commit` / `pr` / `review` when run from inside a git repo.
+Bare `nomnom` on a TTY opens a launcher with tiles for Bundle, Send, Receive, Feeds, Commit, PR, Item, Rebuild, and Extensions. Inside the picker, `v` cycles bundle / `commit` / `pr` / `item` when run from inside a git repo.
 
 Output mirrors [repomix](https://github.com/yamadashy/repomix)'s shape:
 
@@ -83,15 +83,22 @@ Preview pane auto-shows at terminal width ≥ 100 cols.
 
 ## Git context for an LLM
 
-`commit`, `pr`, and `review` bundle git/gh state into the same `<section name="…">` shape.
+`commit`, `pr`, and `item` bundle git/gh state into the same `<section name="…">` shape.
 
 ```sh
 nomnom commit                  # status, diffs, recent commits
 nomnom pr [--base develop]     # commits since base, full diff, existing PR body
-nomnom review 123 [--diff]     # PR meta, body, comments, threads, checks
+nomnom item 123 [--diff]       # auto-detect: PR / issue / workflow run by number
+nomnom item v1.2.3             # release notes + assets
+nomnom item abc1234            # commit meta + diff + comments
+nomnom item pr [123]           # explicit pr (auto-resolves current branch if id omitted)
+nomnom item issue 45           # issue meta + body + comments + timeline + linked PRs
+nomnom item discussion 7       # discussion meta + threaded comments + answer
+nomnom item run 123456 [--all-logs]  # workflow run jobs + failing-step logs
+nomnom item job 67890 [--all-logs]   # single job + steps + logs
 ```
 
-`commit` errors on a clean tree. `pr` and `review` require [`gh`](https://cli.github.com); `pr` auto-detects the base. `review` groups inline threads by file/line, tags `[resolved]`/`[outdated]`, and keeps the full diff opt-in via `--diff` (the threads already carry hunks). Each verb accepts `--clipboard` or `--stdout`.
+`commit` errors on a clean tree. `pr` and `item` require [`gh`](https://cli.github.com); `pr` auto-detects the base. `nomnom item <id>` infers the kind: hex strings → commit, non-numeric tag-like strings → release, pure numbers run a parallel probe of pr / issue / workflow run and either auto-route on a unique hit or refuse with a disambiguation hint. `discussion` and `job` ids live in their own namespaces so they need explicit `nomnom item discussion <n>` / `nomnom item job <n>`. `pr` and `commit` honor `--diff` (off by default); `run` and `job` default to failing-step logs, `--all-logs` includes everything. Each verb accepts `--clipboard` or `--stdout`.
 
 ## Rebuild
 

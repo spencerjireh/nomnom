@@ -753,14 +753,14 @@ class Verb(enum.IntEnum):
     BUNDLE = 0
     COMMIT = 1
     PR = 2
-    REVIEW = 3
+    ITEM = 3
 
 
 _VERB_LABELS = {
     Verb.BUNDLE: "bundle",
     Verb.COMMIT: "commit",
     Verb.PR: "pr",
-    Verb.REVIEW: "review",
+    Verb.ITEM: "item",
 }
 
 
@@ -827,7 +827,8 @@ class PickResult(NamedTuple):
     destination: Destination
     include_tree: bool
     verb: Verb = Verb.BUNDLE
-    review_pr: int | None = None
+    item_kind: str | None = None
+    item_id: str | None = None
 
 
 PREVIEW_MAX_BYTES = 2_000_000
@@ -891,7 +892,7 @@ def _picker_ui(
     directly, since `curses.wrapper` cannot nest. `allow_stdout=False`
     drops STDOUT from the `d` cycle — meaningless when curses owns the
     terminal. `allow_git_verbs=True` enables the `v` verb cycle through
-    Commit/PR/Review in addition to the default Bundle; non-git
+    Commit/PR/Item in addition to the default Bundle; non-git
     directories should leave it False so the cycle collapses to Bundle."""
     if not nodes:
         dest = initial_destination
@@ -908,7 +909,7 @@ def _picker_ui(
             initial_destination = Destination.FILE
 
     verb_allowed: tuple[Verb, ...] = (
-        (Verb.BUNDLE, Verb.COMMIT, Verb.PR, Verb.REVIEW)
+        (Verb.BUNDLE, Verb.COMMIT, Verb.PR, Verb.ITEM)
         if allow_git_verbs else (Verb.BUNDLE,)
     )
 
@@ -916,7 +917,8 @@ def _picker_ui(
     destination = initial_destination
     include_tree = initial_include_tree
     verb = Verb.BUNDLE
-    review_pr: int | None = None
+    item_kind: str | None = None
+    item_id: str | None = None
     preview_visible = root is not None
 
     curses.curs_set(0)
@@ -1175,11 +1177,13 @@ def _picker_ui(
         elif ch == ord("v"):
             verb = cycle_verb(verb, verb_allowed)
         elif ch in (10, 13):
-            if verb == Verb.REVIEW:
-                pr = _prompt_pr_number(stdscr)
-                if pr is None:
+            if verb == Verb.ITEM:
+                if root is None:
                     continue
-                review_pr = pr
+                picked = _prompt_item_id(stdscr, root)
+                if picked is None:
+                    continue
+                item_kind, item_id = picked
             break
         elif ch in (ord("q"), 3):
             cancelled = True
@@ -1196,7 +1200,8 @@ def _picker_ui(
         destination=destination,
         include_tree=include_tree,
         verb=verb,
-        review_pr=review_pr,
+        item_kind=item_kind,
+        item_id=item_id,
     )
 
 
@@ -1210,7 +1215,7 @@ def pick(
     """CLI entry: run `_picker_ui` under its own `curses.wrapper`.
 
     The launcher TUI calls `_picker_ui` directly (curses.wrapper can't nest).
-    `allow_git_verbs=True` enables the `v` verb cycle through Commit/PR/Review
+    `allow_git_verbs=True` enables the `v` verb cycle through Commit/PR/Item
     in the footer; callers should pass True only when `root` is a git repo.
     """
     if not nodes:
@@ -1314,6 +1319,12 @@ def _slug(s: str) -> str:
 def pick_git_output_path(repo_name: str, branch_label: str, kind: str) -> Path:
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
     stem = f"{_slug(repo_name)}-{_slug(branch_label)}-{kind}-{ts}"
+    return _unique_path(Path.cwd() / f"{stem}.txt", start=2)
+
+
+def pick_item_output_path(repo_name: str, kind: str, ident: str) -> Path:
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    stem = f"{_slug(repo_name)}-{kind}-{_slug(ident)}-{ts}"
     return _unique_path(Path.cwd() / f"{stem}.txt", start=2)
 
 
@@ -1541,9 +1552,15 @@ def _emit_git_bundle(
     destination: Destination,
     *,
     interactive: bool = True,
+    item_id: str | None = None,
 ) -> int:
     output = render_git_bundle(repo_name, kind, branch_label, sections, tree)
     size = len(output)
+
+    def _out_path() -> Path:
+        if item_id is not None:
+            return pick_item_output_path(repo_name, kind, item_id)
+        return pick_git_output_path(repo_name, branch_label, kind)
 
     if destination == Destination.STDOUT:
         sys.stdout.write(output)
@@ -1563,7 +1580,7 @@ def _emit_git_bundle(
             print("  output:   clipboard (no tool found; will fall back to file)",
                   file=sys.stderr)
     else:
-        out_path = pick_git_output_path(repo_name, branch_label, kind)
+        out_path = _out_path()
         print(f"  output:   {out_path}", file=sys.stderr)
     if size > GIT_BUNDLE_WARN_BYTES:
         print(f"  warn:     bundle exceeds {GIT_BUNDLE_WARN_BYTES:,} bytes",
@@ -1579,7 +1596,7 @@ def _emit_git_bundle(
             "falling back to a file.",
             file=sys.stderr,
         )
-        out_path = pick_git_output_path(repo_name, branch_label, kind)
+        out_path = _out_path()
 
     try:
         out_path.write_text(output, encoding="utf-8")
@@ -1909,9 +1926,9 @@ def cmd_pr(repo: str, base: str | None, destination: Destination = Destination.F
     )
 
 
-# ---------- review ----------
+# ---------- item: pr (formerly review) ----------
 
-_REVIEW_TIMELINE_KEEP = {
+_PR_TIMELINE_KEEP = {
     "review_requested",
     "assigned",
     "unassigned",
@@ -1923,7 +1940,7 @@ _REVIEW_TIMELINE_KEEP = {
     "head_ref_force_pushed",
 }
 
-_REVIEW_THREADS_QUERY = """\
+_PR_REVIEW_THREADS_QUERY = """\
 query($owner: String!, $repo: String!, $number: Int!) {
   repository(owner: $owner, name: $repo) {
     pullRequest(number: $number) {
@@ -2088,13 +2105,36 @@ def _format_review_threads(graphql_result: dict) -> str:
     return "\n\n".join(parts)
 
 
-def _format_timeline(events: list) -> str:
+_ISSUE_TIMELINE_KEEP = {
+    "assigned",
+    "unassigned",
+    "labeled",
+    "unlabeled",
+    "milestoned",
+    "demilestoned",
+    "renamed",
+    "cross-referenced",
+    "referenced",
+    "closed",
+    "reopened",
+    "locked",
+    "unlocked",
+    "pinned",
+    "unpinned",
+    "transferred",
+    "moved_columns_in_project",
+    "added_to_project",
+    "removed_from_project",
+}
+
+
+def _format_timeline(events: list, keep: set[str] = _PR_TIMELINE_KEEP) -> str:
     if not events:
         return ""
     lines: list[str] = []
     for ev in events:
         kind = ev.get("event")
-        if kind not in _REVIEW_TIMELINE_KEEP:
+        if kind not in keep:
             continue
         actor = ((ev.get("actor") or {}).get("login")) or "?"
         when = ev.get("created_at") or ""
@@ -2106,6 +2146,25 @@ def _format_timeline(events: list) -> str:
         elif kind in ("assigned", "unassigned"):
             who = ((ev.get("assignee") or {}).get("login")) or "?"
             suffix = f": @{who}"
+        elif kind == "labeled" or kind == "unlabeled":
+            label = ((ev.get("label") or {}).get("name")) or "?"
+            suffix = f": {label}"
+        elif kind == "milestoned" or kind == "demilestoned":
+            title = ((ev.get("milestone") or {}).get("title")) or "?"
+            suffix = f": {title}"
+        elif kind == "renamed":
+            ren = ev.get("rename") or {}
+            suffix = f": {ren.get('from', '?')!r} -> {ren.get('to', '?')!r}"
+        elif kind == "cross-referenced":
+            src = ((ev.get("source") or {}).get("issue") or {})
+            num = src.get("number")
+            ttl = src.get("title") or ""
+            url = src.get("html_url") or ""
+            suffix = f": #{num} {ttl}  {url}".rstrip()
+        elif kind == "referenced":
+            sha = (ev.get("commit_id") or "")[:7]
+            url = ev.get("commit_url") or ""
+            suffix = f": commit {sha}  {url}".rstrip()
         elif kind == "head_ref_force_pushed":
             before = (ev.get("before") or "")[:7]
             after = (ev.get("after") or "")[:7]
@@ -2133,12 +2192,27 @@ def _section(name: str, body: str) -> tuple[str, str]:
     return name, body if body else "(none)"
 
 
-def cmd_review(
-    repo: str, pr_number: int, include_diff: bool,
+def cmd_item_pr(
+    repo: str, pr_number: int | None, include_diff: bool,
     destination: Destination = Destination.FILE,
 ) -> int:
     _require_gh()
     root, repo_name = _resolve_git_repo(repo)
+
+    if pr_number is None:
+        rc, view_out, err = _run(
+            ["gh", "pr", "view", "--json", "number", "-q", ".number"], root,
+        )
+        if rc != 0 or not view_out.strip():
+            raise NomnomError(
+                "no PR found for current branch; pass a PR number explicitly"
+            )
+        try:
+            pr_number = int(view_out.strip())
+        except ValueError as e:
+            raise NomnomError(
+                f"gh pr view returned non-numeric: {view_out.strip()!r}"
+            ) from e
 
     if pr_number <= 0:
         raise NomnomError(f"pr number must be positive, got {pr_number}")
@@ -2200,7 +2274,7 @@ def cmd_review(
         "-F", f"owner={owner}",
         "-F", f"repo={name}",
         "-F", f"number={pr_number}",
-        "-f", f"query={_REVIEW_THREADS_QUERY}",
+        "-f", f"query={_PR_REVIEW_THREADS_QUERY}",
     ]) or {}
 
     timeline = _api_json([
@@ -2254,7 +2328,823 @@ def cmd_review(
 
     branch_label = f"pr-{pr_number}"
     return _emit_git_bundle(
-        repo_name, "review", branch_label, sections, tree, destination,
+        repo_name, "pr", branch_label, sections, tree, destination,
+        item_id=str(pr_number),
+    )
+
+
+# ---------- item: shared helpers ----------
+
+
+def _resolve_owner_repo(root: Path) -> tuple[str, str]:
+    rc, owner_repo, err = _run(
+        ["gh", "repo", "view", "--json", "nameWithOwner",
+         "-q", ".nameWithOwner"],
+        root,
+    )
+    owner_repo = owner_repo.strip()
+    if rc != 0 or "/" not in owner_repo:
+        raise NomnomError(
+            f"could not resolve gh repo: "
+            f"{err.strip() or owner_repo or 'unknown error'}"
+        )
+    owner, name = owner_repo.split("/", 1)
+    return owner, name
+
+
+def _gh_api_json(root: Path, args: list[str]) -> object:
+    rc, out, _ = _run(args, root)
+    if rc != 0 or not out.strip():
+        return None
+    try:
+        return json.loads(out)
+    except json.JSONDecodeError:
+        return None
+
+
+# ---------- item: issue ----------
+
+
+_ISSUE_LINKED_PRS_QUERY = """\
+query($owner: String!, $repo: String!, $number: Int!) {
+  repository(owner: $owner, name: $repo) {
+    issue(number: $number) {
+      closedByPullRequestsReferences(first: 30, includeClosedPrs: true) {
+        nodes { number title url state }
+      }
+    }
+  }
+}
+"""
+
+
+def _format_issue_meta(issue: dict) -> str:
+    user = ((issue.get("user") or {}).get("login")) or "?"
+    labels = ", ".join(
+        (l.get("name") if isinstance(l, dict) else l) or ""
+        for l in (issue.get("labels") or [])
+    ) or "(none)"
+    assignees = ", ".join(
+        f"@{(a.get('login') or '?')}"
+        for a in (issue.get("assignees") or [])
+    ) or "(none)"
+    milestone = ((issue.get("milestone") or {}).get("title")) or "(none)"
+    return "\n".join([
+        f"number:    #{issue.get('number', '?')}",
+        f"title:     {issue.get('title', '')}",
+        f"url:       {issue.get('html_url', '')}",
+        f"author:    @{user}",
+        f"state:     {issue.get('state', '?')}",
+        f"labels:    {labels}",
+        f"milestone: {milestone}",
+        f"assignees: {assignees}",
+        f"created:   {issue.get('created_at', '')}",
+        f"updated:   {issue.get('updated_at', '')}",
+    ])
+
+
+def cmd_item_issue(
+    repo: str, issue_number: int,
+    destination: Destination = Destination.FILE,
+) -> int:
+    _require_gh()
+    root, repo_name = _resolve_git_repo(repo)
+
+    if issue_number <= 0:
+        raise NomnomError(
+            f"issue number must be positive, got {issue_number}"
+        )
+
+    owner, name = _resolve_owner_repo(root)
+
+    issue = _gh_api_json(root, [
+        "gh", "api", f"repos/{owner}/{name}/issues/{issue_number}",
+    ])
+    if not isinstance(issue, dict) or not issue:
+        raise NomnomError(
+            f"gh api /issues/{issue_number} returned no data"
+        )
+    if isinstance(issue.get("pull_request"), dict):
+        raise NomnomError(
+            f"#{issue_number} is a pull request; "
+            f"use `nomnom item pr {issue_number}`"
+        )
+
+    comments = _gh_api_json(root, [
+        "gh", "api",
+        f"repos/{owner}/{name}/issues/{issue_number}/comments",
+        "--paginate",
+    ]) or []
+
+    timeline = _gh_api_json(root, [
+        "gh", "api",
+        f"repos/{owner}/{name}/issues/{issue_number}/timeline",
+        "--paginate",
+    ]) or []
+
+    linked_data = _gh_api_json(root, [
+        "gh", "api", "graphql",
+        "-F", f"owner={owner}",
+        "-F", f"repo={name}",
+        "-F", f"number={issue_number}",
+        "-f", f"query={_ISSUE_LINKED_PRS_QUERY}",
+    ]) or {}
+    try:
+        linked_prs = (
+            linked_data["data"]["repository"]["issue"]
+            ["closedByPullRequestsReferences"]["nodes"]
+        ) or []
+    except (KeyError, TypeError):
+        linked_prs = []
+
+    sections: list[tuple[str, str]] = [
+        _section("issue_meta", _format_issue_meta(issue)),
+        _section("issue_body", (issue.get("body") or "").rstrip()),
+        _section("linked_prs", _format_linked_issues(linked_prs)),
+        _section("issue_comments", _format_issue_comments(comments)),
+        _section("timeline", _format_timeline(timeline, _ISSUE_TIMELINE_KEEP)),
+    ]
+
+    branch_label = f"issue-{issue_number}"
+    return _emit_git_bundle(
+        repo_name, "issue", branch_label, sections, None, destination,
+        item_id=str(issue_number),
+    )
+
+
+# ---------- item: discussion ----------
+
+
+_DISCUSSION_QUERY = """\
+query($owner: String!, $repo: String!, $number: Int!) {
+  repository(owner: $owner, name: $repo) {
+    discussion(number: $number) {
+      number
+      title
+      url
+      author { login }
+      createdAt
+      updatedAt
+      category { name }
+      labels(first: 20) { nodes { name } }
+      body
+      answer { id author { login } body createdAt }
+      comments(first: 50) {
+        nodes {
+          id
+          author { login }
+          body
+          createdAt
+          replies(first: 20) {
+            nodes {
+              author { login }
+              body
+              createdAt
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"""
+
+
+def _format_discussion_meta(d: dict) -> str:
+    author = ((d.get("author") or {}).get("login")) or "?"
+    category = ((d.get("category") or {}).get("name")) or "(none)"
+    labels = ", ".join(
+        n.get("name") or ""
+        for n in ((d.get("labels") or {}).get("nodes") or [])
+    ) or "(none)"
+    return "\n".join([
+        f"number:   #{d.get('number', '?')}",
+        f"title:    {d.get('title', '')}",
+        f"url:      {d.get('url', '')}",
+        f"author:   @{author}",
+        f"category: {category}",
+        f"labels:   {labels}",
+        f"created:  {d.get('createdAt', '')}",
+        f"updated:  {d.get('updatedAt', '')}",
+    ])
+
+
+def _format_discussion_comments(d: dict) -> str:
+    nodes = ((d.get("comments") or {}).get("nodes")) or []
+    if not nodes:
+        return ""
+    answer = d.get("answer") or {}
+    answer_id = answer.get("id") if isinstance(answer, dict) else None
+    parts: list[str] = []
+    for c in nodes:
+        login = ((c.get("author") or {}).get("login")) or "?"
+        when = c.get("createdAt") or ""
+        body = (c.get("body") or "").rstrip()
+        tag = "  [answer]" if c.get("id") == answer_id and answer_id else ""
+        head = f"## @{login} {when}{tag}".rstrip()
+        parts.append(head + "\n" + (body if body else "(no body)"))
+        replies = ((c.get("replies") or {}).get("nodes")) or []
+        for r in replies:
+            r_login = ((r.get("author") or {}).get("login")) or "?"
+            r_when = r.get("createdAt") or ""
+            r_body = (r.get("body") or "").rstrip()
+            indented = "\n".join(
+                "    " + line for line in (r_body or "(no body)").split("\n")
+            )
+            parts.append(f"    > @{r_login} {r_when}\n{indented}")
+    return "\n\n".join(parts)
+
+
+def _format_discussion_answer(d: dict) -> str:
+    answer = d.get("answer")
+    if not isinstance(answer, dict) or not answer:
+        return ""
+    login = ((answer.get("author") or {}).get("login")) or "?"
+    when = answer.get("createdAt") or ""
+    body = (answer.get("body") or "").rstrip()
+    return f"@{login} {when}\n{body if body else '(no body)'}"
+
+
+def cmd_item_discussion(
+    repo: str, discussion_number: int,
+    destination: Destination = Destination.FILE,
+) -> int:
+    _require_gh()
+    root, repo_name = _resolve_git_repo(repo)
+
+    if discussion_number <= 0:
+        raise NomnomError(
+            f"discussion number must be positive, got {discussion_number}"
+        )
+
+    owner, name = _resolve_owner_repo(root)
+
+    result = _gh_api_json(root, [
+        "gh", "api", "graphql",
+        "-F", f"owner={owner}",
+        "-F", f"repo={name}",
+        "-F", f"number={discussion_number}",
+        "-f", f"query={_DISCUSSION_QUERY}",
+    ]) or {}
+    try:
+        d = result["data"]["repository"]["discussion"]
+    except (KeyError, TypeError):
+        d = None
+    if not isinstance(d, dict) or not d:
+        raise NomnomError(
+            f"discussion #{discussion_number} not found "
+            f"(or discussions are disabled for this repo)"
+        )
+
+    sections: list[tuple[str, str]] = [
+        _section("discussion_meta", _format_discussion_meta(d)),
+        _section("discussion_body", (d.get("body") or "").rstrip()),
+        _section("answer", _format_discussion_answer(d)),
+        _section("comments", _format_discussion_comments(d)),
+    ]
+
+    branch_label = f"discussion-{discussion_number}"
+    return _emit_git_bundle(
+        repo_name, "discussion", branch_label, sections, None, destination,
+        item_id=str(discussion_number),
+    )
+
+
+# ---------- item: commit ----------
+
+
+_COMMIT_SHA_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
+
+
+def _format_commit_meta(commit: dict) -> str:
+    sha = commit.get("sha", "?")
+    info = commit.get("commit") or {}
+    author = info.get("author") or {}
+    committer = info.get("committer") or {}
+    parents = ", ".join(
+        (p.get("sha", "") or "")[:7] for p in (commit.get("parents") or [])
+    ) or "(none)"
+    stats = commit.get("stats") or {}
+    return "\n".join([
+        f"sha:        {sha}",
+        f"short:      {sha[:7] if sha != '?' else '?'}",
+        f"url:        {commit.get('html_url', '')}",
+        f"author:     {author.get('name', '?')} <{author.get('email', '')}>",
+        f"authored:   {author.get('date', '')}",
+        f"committer:  {committer.get('name', '?')} <{committer.get('email', '')}>",
+        f"committed:  {committer.get('date', '')}",
+        f"parents:    {parents}",
+        f"stats:      +{stats.get('additions', 0)} -{stats.get('deletions', 0)} "
+        f"({stats.get('total', 0)})",
+    ])
+
+
+def _format_commit_comments(comments: list) -> str:
+    if not comments:
+        return ""
+    parts: list[str] = []
+    for c in comments:
+        login = ((c.get("user") or {}).get("login")) or "?"
+        when = c.get("created_at") or ""
+        path = c.get("path") or ""
+        line = c.get("line") or c.get("position")
+        if path:
+            head = (
+                f"## {path}:{line if line is not None else '?'}  "
+                f"@{login} {when}".rstrip()
+            )
+        else:
+            head = f"## @{login} {when}".rstrip()
+        body = (c.get("body") or "").rstrip()
+        parts.append(head + "\n" + (body or "(no body)"))
+    return "\n\n".join(parts)
+
+
+def _commit_diff(root: Path, owner: str, name: str, sha: str) -> str:
+    rc, out, _ = _run(["git", "show", "--format=", sha], root)
+    if rc == 0:
+        return out
+    rc, out, _ = _run([
+        "gh", "api", f"repos/{owner}/{name}/commits/{sha}",
+        "-H", "Accept: application/vnd.github.diff",
+    ], root)
+    return out if rc == 0 else ""
+
+
+def cmd_item_commit(
+    repo: str, sha: str, include_diff: bool,
+    destination: Destination = Destination.FILE,
+) -> int:
+    _require_gh()
+    root, repo_name = _resolve_git_repo(repo)
+
+    sha = sha.strip()
+    if not _COMMIT_SHA_RE.match(sha):
+        raise NomnomError(
+            f"commit sha must be 7-40 hex chars, got {sha!r}"
+        )
+
+    owner, name = _resolve_owner_repo(root)
+
+    commit = _gh_api_json(root, [
+        "gh", "api", f"repos/{owner}/{name}/commits/{sha}",
+    ])
+    if not isinstance(commit, dict) or not commit:
+        raise NomnomError(
+            f"gh api /commits/{sha} returned no data"
+        )
+
+    comments = _gh_api_json(root, [
+        "gh", "api", f"repos/{owner}/{name}/commits/{sha}/comments",
+        "--paginate",
+    ]) or []
+
+    files_for_summary = [
+        {
+            "path": f.get("filename", "") or "",
+            "additions": f.get("additions", 0),
+            "deletions": f.get("deletions", 0),
+        }
+        for f in (commit.get("files") or [])
+    ]
+
+    diff_full = ""
+    if include_diff:
+        diff_full = _commit_diff(root, owner, name, sha)
+
+    message = ((commit.get("commit") or {}).get("message") or "").rstrip()
+
+    sections: list[tuple[str, str]] = [
+        _section("commit_meta", _format_commit_meta(commit)),
+        _section("commit_message", message),
+        _section("diff_summary", _format_diff_summary(files_for_summary)),
+    ]
+    if include_diff:
+        sections.append(_section("diff", diff_full.rstrip()))
+    sections.append(_section("commit_comments", _format_commit_comments(comments)))
+
+    changed = sorted({
+        (f.get("filename") or "")
+        for f in (commit.get("files") or [])
+        if f.get("filename")
+    })
+    tree = render_ascii_tree(changed, repo_name) if changed else None
+
+    sha7 = (commit.get("sha") or sha)[:7]
+    branch_label = f"commit-{sha7}"
+    return _emit_git_bundle(
+        repo_name, "commit", branch_label, sections, tree, destination,
+        item_id=sha7,
+    )
+
+
+# ---------- item: release ----------
+
+
+def _format_release_meta(rel: dict) -> str:
+    author = ((rel.get("author") or {}).get("login")) or "?"
+    return "\n".join([
+        f"tag:           {rel.get('tag_name', '?')}",
+        f"name:          {rel.get('name', '') or '(none)'}",
+        f"url:           {rel.get('html_url', '')}",
+        f"author:        @{author}",
+        f"target:        {rel.get('target_commitish', '')}",
+        f"published:     {rel.get('published_at', '')}",
+        f"created:       {rel.get('created_at', '')}",
+        f"draft:         {'true' if rel.get('draft') else 'false'}",
+        f"prerelease:    {'true' if rel.get('prerelease') else 'false'}",
+    ])
+
+
+def _format_release_assets(assets: list) -> str:
+    if not assets:
+        return ""
+    lines: list[str] = []
+    for a in assets:
+        name = a.get("name", "") or "?"
+        size = a.get("size", 0) or 0
+        url = a.get("browser_download_url", "") or ""
+        downloads = a.get("download_count", 0) or 0
+        lines.append(
+            f"{name}  ({_fmt_size(size)})  downloads:{downloads}  {url}".rstrip()
+        )
+    return "\n".join(lines)
+
+
+def cmd_item_release(
+    repo: str, tag_or_id: str,
+    destination: Destination = Destination.FILE,
+) -> int:
+    _require_gh()
+    root, repo_name = _resolve_git_repo(repo)
+
+    tag_or_id = tag_or_id.strip()
+    if not tag_or_id:
+        raise NomnomError("release tag must not be empty")
+
+    owner, name = _resolve_owner_repo(root)
+
+    release = _gh_api_json(root, [
+        "gh", "api", f"repos/{owner}/{name}/releases/tags/{tag_or_id}",
+    ])
+    if not isinstance(release, dict) and tag_or_id.isdigit():
+        release = _gh_api_json(root, [
+            "gh", "api", f"repos/{owner}/{name}/releases/{tag_or_id}",
+        ])
+    if not isinstance(release, dict) or not release:
+        raise NomnomError(f"release {tag_or_id!r} not found")
+
+    sections: list[tuple[str, str]] = [
+        _section("release_meta", _format_release_meta(release)),
+        _section("release_notes", (release.get("body") or "").rstrip()),
+        _section("assets", _format_release_assets(release.get("assets") or [])),
+    ]
+
+    tag = release.get("tag_name") or tag_or_id
+    branch_label = f"release-{tag}"
+    return _emit_git_bundle(
+        repo_name, "release", branch_label, sections, None, destination,
+        item_id=tag,
+    )
+
+
+# ---------- item: workflow run / job ----------
+
+
+def _format_run_meta(run: dict) -> str:
+    sha = (run.get("headSha") or "")[:7]
+    return "\n".join([
+        f"id:         {run.get('databaseId') or run.get('id', '?')}",
+        f"number:     {run.get('number', '?')}",
+        f"workflow:   {run.get('workflowName', '')}",
+        f"title:      {run.get('displayTitle', '')}",
+        f"url:        {run.get('url', '')}",
+        f"branch:     {run.get('headBranch', '')}",
+        f"sha:        {sha}",
+        f"event:      {run.get('event', '')}",
+        f"status:     {run.get('status', '')}",
+        f"conclusion: {run.get('conclusion', '')}",
+        f"attempt:    {run.get('attempt', '?')}",
+        f"created:    {run.get('createdAt', '')}",
+        f"updated:    {run.get('updatedAt', '')}",
+    ])
+
+
+def _format_run_jobs(jobs: list) -> str:
+    if not jobs:
+        return ""
+    width = max((len(j.get("name", "") or "?") for j in jobs), default=0)
+    lines: list[str] = []
+    for j in jobs:
+        name = j.get("name", "") or "?"
+        status = j.get("status", "") or ""
+        conclusion = j.get("conclusion", "") or ""
+        url = j.get("url", "") or ""
+        started = j.get("startedAt", "")
+        completed = j.get("completedAt", "")
+        label = conclusion or status or "?"
+        lines.append(
+            f"{label:<12} {name:<{width}}  {started} -> {completed}  {url}".rstrip()
+        )
+    return "\n".join(lines)
+
+
+def _format_job_meta(job: dict) -> str:
+    return "\n".join([
+        f"id:         {job.get('id', '?')}",
+        f"name:       {job.get('name', '')}",
+        f"run_id:     {job.get('run_id', '?')}",
+        f"run_url:    {job.get('run_url', '')}",
+        f"url:        {job.get('html_url', '')}",
+        f"workflow:   {job.get('workflow_name', '')}",
+        f"status:     {job.get('status', '')}",
+        f"conclusion: {job.get('conclusion', '')}",
+        f"started:    {job.get('started_at', '')}",
+        f"completed:  {job.get('completed_at', '')}",
+        f"runner:     {job.get('runner_name', '')}",
+    ])
+
+
+def _format_job_steps(steps: list) -> str:
+    if not steps:
+        return ""
+    width = max((len(s.get("name", "") or "?") for s in steps), default=0)
+    lines: list[str] = []
+    for s in steps:
+        n = s.get("name", "") or "?"
+        st = s.get("status", "") or ""
+        co = s.get("conclusion", "") or ""
+        label = co or st or "?"
+        lines.append(f"{label:<12} {n:<{width}}")
+    return "\n".join(lines)
+
+
+def _format_log_slice(log_text: str, max_lines_per_step: int = 200) -> str:
+    if not log_text.strip():
+        return ""
+    groups: list[tuple[str, list[str]]] = []
+    current_key: str | None = None
+    for line in log_text.splitlines():
+        parts = line.split("\t", 2)
+        if len(parts) >= 2 and parts[0]:
+            key = f"{parts[0]} / {parts[1]}"
+        else:
+            key = current_key or "(unknown)"
+        if key != current_key:
+            groups.append((key, []))
+            current_key = key
+        groups[-1][1].append(line)
+
+    out: list[str] = []
+    for key, lines in groups:
+        if len(lines) > max_lines_per_step:
+            kept = lines[-max_lines_per_step:]
+            out.append(
+                f"--- {key} (last {max_lines_per_step} of "
+                f"{len(lines)} lines) ---"
+            )
+            out.extend(kept)
+        else:
+            out.append(f"--- {key} ({len(lines)} lines) ---")
+            out.extend(lines)
+    return "\n".join(out)
+
+
+def cmd_item_run(
+    repo: str, run_id: int, all_logs: bool = False,
+    destination: Destination = Destination.FILE,
+) -> int:
+    _require_gh()
+    root, repo_name = _resolve_git_repo(repo)
+    if run_id <= 0:
+        raise NomnomError(f"run id must be positive, got {run_id}")
+
+    fields = (
+        "databaseId,number,attempt,status,conclusion,event,workflowName,"
+        "displayTitle,headBranch,headSha,jobs,createdAt,updatedAt,url"
+    )
+    rc, run_view, err = _run(
+        ["gh", "run", "view", str(run_id), "--json", fields], root,
+    )
+    if rc != 0:
+        raise NomnomError(
+            f"gh run view {run_id} failed: "
+            f"{err.strip() or 'unknown error'}"
+        )
+    try:
+        run = json.loads(run_view) if run_view.strip() else {}
+    except json.JSONDecodeError as e:
+        raise NomnomError(f"gh run view returned invalid json: {e}") from e
+
+    log_flag = "--log" if all_logs else "--log-failed"
+    _, log_text, _ = _run(
+        ["gh", "run", "view", str(run_id), log_flag], root,
+    )
+    log_section = log_text if all_logs else _format_log_slice(log_text)
+
+    sections: list[tuple[str, str]] = [
+        _section("run_meta", _format_run_meta(run)),
+        _section("jobs", _format_run_jobs(run.get("jobs") or [])),
+        _section("logs" if all_logs else "failed_logs", log_section),
+    ]
+
+    branch_label = f"run-{run_id}"
+    return _emit_git_bundle(
+        repo_name, "run", branch_label, sections, None, destination,
+        item_id=str(run_id),
+    )
+
+
+def cmd_item_job(
+    repo: str, job_id: int, all_logs: bool = False,
+    destination: Destination = Destination.FILE,
+) -> int:
+    _require_gh()
+    root, repo_name = _resolve_git_repo(repo)
+    if job_id <= 0:
+        raise NomnomError(f"job id must be positive, got {job_id}")
+
+    owner, name = _resolve_owner_repo(root)
+
+    job = _gh_api_json(root, [
+        "gh", "api", f"repos/{owner}/{name}/actions/jobs/{job_id}",
+    ])
+    if not isinstance(job, dict) or not job:
+        raise NomnomError(
+            f"gh api /actions/jobs/{job_id} returned no data"
+        )
+
+    log_text = ""
+    run_id = job.get("run_id")
+    if run_id:
+        log_flag = "--log" if all_logs else "--log-failed"
+        _, log_text, _ = _run(
+            ["gh", "run", "view", str(run_id),
+             "--job", str(job_id), log_flag],
+            root,
+        )
+    log_section = log_text if all_logs else _format_log_slice(log_text)
+
+    sections: list[tuple[str, str]] = [
+        _section("job_meta", _format_job_meta(job)),
+        _section("steps", _format_job_steps(job.get("steps") or [])),
+        _section("logs" if all_logs else "failed_logs", log_section),
+    ]
+
+    branch_label = f"job-{job_id}"
+    return _emit_git_bundle(
+        repo_name, "job", branch_label, sections, None, destination,
+        item_id=str(job_id),
+    )
+
+
+# ---------- item: dispatcher + auto-detect ----------
+
+
+ITEM_KINDS = ("pr", "issue", "discussion", "commit", "release", "run", "job")
+
+
+def _classify_item_id(value: str) -> str | None:
+    """Infer kind from `value`'s shape. Returns None for ambiguous numeric ids."""
+    value = value.strip()
+    if not value:
+        return None
+    if _COMMIT_SHA_RE.match(value):
+        return "commit"
+    if not value.isdigit():
+        return "release"
+    return None
+
+
+def _probe_numeric_id(
+    root: Path, owner: str, name: str, n: int,
+) -> list[tuple[str, str]]:
+    """Probe /issues/{n} and /actions/runs/{n} in parallel. Returns [(kind, label)].
+
+    /issues/{n} serves both issues and PRs (PRs have a `pull_request` key),
+    so we don't need a separate /pulls/{n} fetch.
+    """
+    results: dict[str, object] = {"issue": None, "run": None}
+
+    def _fetch(key: str, path: str) -> None:
+        rc, out, _ = _run(
+            ["gh", "api", f"repos/{owner}/{name}/{path}"], root,
+        )
+        if rc != 0 or not out.strip():
+            return
+        try:
+            data = json.loads(out)
+        except json.JSONDecodeError:
+            return
+        if isinstance(data, dict):
+            results[key] = data
+
+    threads = [
+        threading.Thread(target=_fetch, args=("issue", f"issues/{n}")),
+        threading.Thread(target=_fetch, args=("run", f"actions/runs/{n}")),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    matches: list[tuple[str, str]] = []
+    issue = results["issue"]
+    if isinstance(issue, dict):
+        title = issue.get("title") or ""
+        if isinstance(issue.get("pull_request"), dict):
+            matches.append(("pr", title))
+        else:
+            matches.append(("issue", title))
+    run = results["run"]
+    if isinstance(run, dict):
+        label = (
+            run.get("name") or run.get("display_title")
+            or run.get("workflow_name") or ""
+        )
+        matches.append(("run", label))
+    return matches
+
+
+def _dispatch_item_kind(
+    repo: str, kind: str, ident: str,
+    include_diff: bool, all_logs: bool, destination: Destination,
+) -> int:
+    if kind == "pr":
+        return cmd_item_pr(repo, int(ident), include_diff, destination)
+    if kind == "issue":
+        return cmd_item_issue(repo, int(ident), destination)
+    if kind == "discussion":
+        return cmd_item_discussion(repo, int(ident), destination)
+    if kind == "commit":
+        return cmd_item_commit(repo, ident, include_diff, destination)
+    if kind == "release":
+        return cmd_item_release(repo, ident, destination)
+    if kind == "run":
+        return cmd_item_run(repo, int(ident), all_logs, destination)
+    if kind == "job":
+        return cmd_item_job(repo, int(ident), all_logs, destination)
+    raise NomnomError(f"unknown item kind: {kind!r}")
+
+
+def cmd_item(
+    repo: str,
+    kind_or_id: str,
+    ident: str | None = None,
+    include_diff: bool = False,
+    all_logs: bool = False,
+    destination: Destination = Destination.FILE,
+) -> int:
+    _require_gh()
+
+    if kind_or_id in ITEM_KINDS:
+        kind = kind_or_id
+        if ident is None:
+            if kind == "pr":
+                return cmd_item_pr(repo, None, include_diff, destination)
+            raise NomnomError(f"`item {kind}` requires an id")
+        return _dispatch_item_kind(
+            repo, kind, ident, include_diff, all_logs, destination,
+        )
+
+    if ident is not None:
+        raise NomnomError(
+            f"unknown kind {kind_or_id!r}; "
+            f"valid: {', '.join(ITEM_KINDS)}"
+        )
+
+    value = kind_or_id.strip()
+    if not value:
+        raise NomnomError("item id required")
+
+    inferred = _classify_item_id(value)
+    if inferred == "commit":
+        return cmd_item_commit(repo, value, include_diff, destination)
+    if inferred == "release":
+        return cmd_item_release(repo, value, destination)
+
+    if not value.isdigit():
+        raise NomnomError(f"could not infer kind from {value!r}")
+
+    n = int(value)
+    root, _ = _resolve_git_repo(repo)
+    owner, name = _resolve_owner_repo(root)
+    matches = _probe_numeric_id(root, owner, name, n)
+    if not matches:
+        raise NomnomError(
+            f"no PR, issue, or workflow run found for #{n}"
+        )
+    if len(matches) > 1:
+        opts = " / ".join(
+            f"{k} (#{n}: {label})" for k, label in matches
+        )
+        raise NomnomError(
+            f"ambiguous: #{n} matches multiple kinds: {opts}. "
+            f"Disambiguate with `nomnom item <kind> {n}`"
+        )
+    kind = matches[0][0]
+    return _dispatch_item_kind(
+        repo, kind, value, include_diff, all_logs, destination,
     )
 
 
@@ -5075,7 +5965,7 @@ class LauncherScreen(Screen):
             ("Feeds",      "List, leave, and inspect joined feeds"),
             ("Commit",     "Bundle staged/unstaged diffs + recent commits"),
             ("PR",         "Bundle commits since base + diff for an LLM"),
-            ("Review",     "Bundle a PR's meta, diff, and comments"),
+            ("Item",       "Bundle a github item (pr/issue/commit/release/run/job)"),
             ("Rebuild",    "Reconstruct a file tree from a bundle .txt"),
             ("Extensions", "Edit the text/binary/name/secret lists"),
         ]
@@ -5135,8 +6025,8 @@ def _launcher_open(verb: str):
         return CommitScreen()
     if verb == "PR":
         return PRScreen()
-    if verb == "Review":
-        return ReviewScreen()
+    if verb == "Item":
+        return ItemScreen()
     if verb == "Send":
         return PlaceholderScreen(
             "Send",
@@ -5841,7 +6731,7 @@ class BundleScreen(Screen):
         return True
 
     def _run_git_verb(self, result, root: Path) -> None:
-        """Run cmd_commit / cmd_pr / cmd_review without disturbing curses.
+        """Run cmd_commit / cmd_pr / cmd_item without disturbing curses.
 
         The handlers print progress to stdout/stderr; redirect both into
         StringIO buffers and route them through `self.messages` so the
@@ -5857,13 +6747,14 @@ class BundleScreen(Screen):
                     rc = cmd_commit(str(root), destination=result.destination)
                 elif result.verb == Verb.PR:
                     rc = cmd_pr(str(root), None, destination=result.destination)
-                elif result.verb == Verb.REVIEW:
-                    if result.review_pr is None:
+                elif result.verb == Verb.ITEM:
+                    if result.item_kind is None or result.item_id is None:
                         raise NomnomError(
-                            "review verb selected without a PR number",
+                            "item verb selected without an id",
                         )
-                    rc = cmd_review(
-                        str(root), result.review_pr, True,
+                    rc = cmd_item(
+                        str(root), result.item_kind, result.item_id,
+                        include_diff=True,
                         destination=result.destination,
                     )
         except NomnomError as e:
@@ -5968,7 +6859,7 @@ class _GitContextScreen(Screen):
         )
 
     def _run_cmd(self) -> int:
-        """Subclass hook: dispatch to cmd_commit/pr/review with collected
+        """Subclass hook: dispatch to cmd_commit/pr/item with collected
         inputs. May raise NomnomError; stdout/stderr are captured by the
         caller."""
         raise NotImplementedError
@@ -6140,15 +7031,15 @@ class PRScreen(_GitContextScreen):
         return cmd_pr(self.repo_buf.strip(), base, destination=self.destination)
 
 
-class ReviewScreen(_GitContextScreen):
-    """Bundle PR meta + diff + threads via `cmd_review`."""
+class ItemScreen(_GitContextScreen):
+    """Bundle any github item via `cmd_item` (auto-detects pr/issue/commit/etc)."""
 
-    title = "Review"
-    verb = "Review"
-    _TEXT_FIDS = ("repo", "pr")
+    title = "Item"
+    verb = "Item"
+    _TEXT_FIDS = ("repo", "id")
     help_lines = [
         "tab/arrows  move between fields",
-        "type        edit fields (PR number is digits-only)",
+        "type        edit fields (id accepts number / sha / tag)",
         "space       toggle the diff field when focused",
         "d           cycle destination (file/clipboard/send)",
         "enter       run; esc/q to go back",
@@ -6156,31 +7047,31 @@ class ReviewScreen(_GitContextScreen):
 
     def __init__(self) -> None:
         super().__init__()
-        self.pr_buf = ""
+        self.id_buf = ""
         self.include_diff = False
 
     @property
     def fields(self) -> list[tuple[str, str]]:
         return [
             ("repo", "Repo path:"),
-            ("pr", "PR number:"),
+            ("id", "Item id:"),
             ("diff", "Include diff:"),
             ("dest", "Destination:"),
         ]
 
     def _field_value(self, fid: str) -> str:
-        if fid == "pr":
-            return self.pr_buf or "(required)"
+        if fid == "id":
+            return self.id_buf or "(required)"
         if fid == "diff":
             return "yes" if self.include_diff else "no"
         return super()._field_value(fid)
 
     def _edit_field(self, fid: str, ch: int) -> None:
-        if fid == "pr":
+        if fid == "id":
             if ch in (curses.KEY_BACKSPACE, 127, 8):
-                self.pr_buf = self.pr_buf[:-1]
-            elif ord("0") <= ch <= ord("9"):
-                self.pr_buf += chr(ch)
+                self.id_buf = self.id_buf[:-1]
+            elif 32 <= ch < 127:
+                self.id_buf += chr(ch)
             return
         if fid == "diff":
             if ch == ord(" "):
@@ -6189,15 +7080,12 @@ class ReviewScreen(_GitContextScreen):
         super()._edit_field(fid, ch)
 
     def _run_cmd(self) -> int:
-        pr_text = self.pr_buf.strip()
-        if not pr_text:
-            raise NomnomError("PR number is required")
-        try:
-            n = int(pr_text)
-        except ValueError:
-            raise NomnomError(f"PR number must be an integer: {pr_text!r}")
-        return cmd_review(
-            self.repo_buf.strip(), n, self.include_diff,
+        id_text = self.id_buf.strip()
+        if not id_text:
+            raise NomnomError("item id is required")
+        return cmd_item(
+            self.repo_buf.strip(), id_text, None,
+            include_diff=self.include_diff,
             destination=self.destination,
         )
 
@@ -6292,56 +7180,147 @@ def _confirm_modal(
             return default
 
 
-def _prompt_pr_number(stdscr) -> int | None:  # pragma: no cover - curses I/O
-    """Centered overlay collecting a digits-only PR number.
+def _draw_overlay(
+    stdscr, body: list[str], min_w: int = 50,
+) -> None:  # pragma: no cover - curses I/O
+    h, w = stdscr.getmaxyx()
+    box_w = min(max(1, w - 2), max(max(len(r) for r in body) + 4, min_w))
+    box_h = min(max(1, h - 2), len(body) + 2)
+    y0 = max(0, (h - box_h) // 2)
+    x0 = max(0, (w - box_w) // 2)
+    for i in range(box_h):
+        try:
+            stdscr.addstr(y0 + i, x0, " " * box_w, curses.A_REVERSE)
+        except curses.error:
+            pass
+    for i, line in enumerate(body[: box_h - 1]):
+        try:
+            stdscr.addstr(
+                y0 + 1 + i, x0 + 2,
+                line[: max(0, box_w - 4)], curses.A_REVERSE,
+            )
+        except curses.error:
+            pass
+    stdscr.refresh()
 
-    Returns the int on Enter (when the buffer is non-empty), None on Esc."""
+
+def _prompt_item_id(
+    stdscr, root: Path,
+) -> tuple[str, str] | None:  # pragma: no cover - curses I/O
+    """Centered overlay collecting an item id; auto-detect the kind.
+
+    Returns (kind, ident) on Enter, None on Esc. Hex strings route to
+    `commit`, non-numeric strings to `release`, pure numbers run a
+    parallel /issues/{n} + /actions/runs/{n} probe to disambiguate
+    pr / issue / run (shown as a picker on multiple matches).
+    """
     buf = ""
+    status = ""
     try:
         stdscr.timeout(-1)
     except curses.error:
         pass
     while True:
-        h, w = stdscr.getmaxyx()
-        title = " PR number ".center(50, "─")
+        title = " item id ".center(50, "─")
         prompt = f"  > {buf}_"
-        body = [title, "", prompt, "", "─" * 50, "  enter: confirm   esc: cancel"]
-        box_w = min(max(1, w - 2), max(len(r) for r in body) + 4)
-        box_h = min(max(1, h - 2), len(body) + 2)
-        y0 = max(0, (h - box_h) // 2)
-        x0 = max(0, (w - box_w) // 2)
-        for i in range(box_h):
-            try:
-                stdscr.addstr(y0 + i, x0, " " * box_w, curses.A_REVERSE)
-            except curses.error:
-                pass
-        for i, line in enumerate(body[: box_h - 1]):
-            try:
-                stdscr.addstr(y0 + 1 + i, x0 + 2,
-                              line[: max(0, box_w - 4)], curses.A_REVERSE)
-            except curses.error:
-                pass
-        stdscr.refresh()
+        body = [
+            title, "", prompt, "",
+            "  number / sha / tag — nomnom infers the kind",
+        ]
+        if status:
+            body.append(f"  {status}")
+        body.extend([
+            "", "─" * 50, "  enter: confirm   esc: cancel",
+        ])
+        _draw_overlay(stdscr, body)
         ch = stdscr.getch()
         if ch == -1:
             continue
         if ch in (27, 3):
             return None
         if ch in (10, 13):
-            if buf:
-                try:
-                    n = int(buf)
-                except ValueError:
-                    buf = ""
-                    continue
-                if n > 0:
-                    return n
-            continue
+            value = buf.strip()
+            if not value:
+                continue
+            inferred = _classify_item_id(value)
+            if inferred == "commit":
+                return ("commit", value)
+            if inferred == "release":
+                return ("release", value)
+            try:
+                n = int(value)
+            except ValueError:
+                status = "invalid id"
+                continue
+            if n <= 0:
+                status = "id must be positive"
+                continue
+            try:
+                owner, name = _resolve_owner_repo(root)
+            except NomnomError as e:
+                status = str(e)
+                continue
+            status = "checking github…"
+            _draw_overlay(stdscr, [
+                title, "", prompt, "", f"  {status}",
+                "", "─" * 50, "  enter: confirm   esc: cancel",
+            ])
+            matches = _probe_numeric_id(root, owner, name, n)
+            if not matches:
+                status = f"no pr/issue/run found for #{n}"
+                continue
+            if len(matches) == 1:
+                return (matches[0][0], value)
+            chosen = _pick_item_kind(stdscr, n, matches)
+            if chosen is None:
+                status = ""
+                continue
+            return (chosen, value)
         if ch in (curses.KEY_BACKSPACE, 127, 8):
             buf = buf[:-1]
+            status = ""
             continue
-        if ord("0") <= ch <= ord("9"):
+        if 32 <= ch < 127:
             buf += chr(ch)
+            status = ""
+
+
+def _pick_item_kind(
+    stdscr, n: int, matches: list[tuple[str, str]],
+) -> str | None:  # pragma: no cover - curses I/O
+    """Show a picker for ambiguous numeric ids; return chosen kind or None."""
+    try:
+        stdscr.timeout(-1)
+    except curses.error:
+        pass
+    sel = 0
+    while True:
+        title = " disambiguate ".center(60, "─")
+        rows = [title, ""]
+        for i, (kind, label) in enumerate(matches):
+            mark = ">" if i == sel else " "
+            row = f"  {mark} {i + 1}. {kind} #{n}: {label}"
+            rows.append(row[:60])
+        rows.extend([
+            "", "─" * 60,
+            "  1-9 / ↑↓ select   enter: confirm   esc: cancel",
+        ])
+        _draw_overlay(stdscr, rows, min_w=60)
+        ch = stdscr.getch()
+        if ch == -1:
+            continue
+        if ch in (27, 3):
+            return None
+        if ch in (10, 13):
+            return matches[sel][0]
+        if ord("1") <= ch <= ord("9"):
+            idx = ch - ord("1")
+            if idx < len(matches):
+                return matches[idx][0]
+        if ch in (curses.KEY_UP, ord("k")):
+            sel = (sel - 1) % len(matches)
+        elif ch in (curses.KEY_DOWN, ord("j")):
+            sel = (sel + 1) % len(matches)
 
 
 # ---------- main ----------
@@ -6423,31 +7402,47 @@ def _build_pr_parser() -> argparse.ArgumentParser:
     return sub
 
 
-def _build_review_parser() -> argparse.ArgumentParser:
+def _build_item_parser() -> argparse.ArgumentParser:
     sub = argparse.ArgumentParser(
-        prog="nomnom review",
+        prog="nomnom item",
         description=(
-            "Bundle gh context for an existing PR (title, body, comments, "
-            "reviews, inline review threads, checks) into a .txt for an LLM "
-            "to reason about the review."
+            "Bundle gh context for a GitHub item (pr / issue / discussion / "
+            "commit / release / workflow run / job) into a .txt for an LLM. "
+            "Pass a bare id and nomnom infers the kind; or pass `<kind> <id>` "
+            "explicitly (required for run/discussion/job, since their ids "
+            "live in separate namespaces from pr/issue numbers)."
         ),
     )
     sub.add_argument(
-        "pr_number", type=int,
-        help="PR number to fetch (resolves against the current repo's gh remote).",
+        "kind_or_id",
+        help=(
+            "Either a bare id (number / commit sha / tag) for auto-detect, "
+            "or one of: " + ", ".join(ITEM_KINDS) + "."
+        ),
     )
     sub.add_argument(
-        "repo", nargs="?", default=".",
+        "ident", nargs="?", default=None,
+        help="Id when the first argument names a kind (e.g. `pr 123`).",
+    )
+    sub.add_argument(
+        "--repo", default=".",
         help="Path to the project repo (default: current directory).",
     )
-    _add_destination_flags(sub)
     sub.add_argument(
         "--diff", action="store_true",
         help=(
-            "Include the full diff (off by default; inline review comments "
-            "carry their own diff hunks)."
+            "Include the full diff for pr/commit (off by default; inline "
+            "review comments carry their own diff hunks)."
         ),
     )
+    sub.add_argument(
+        "--all-logs", action="store_true",
+        help=(
+            "For run/job: include all logs instead of only the failing "
+            "step output."
+        ),
+    )
+    _add_destination_flags(sub)
     return sub
 
 
@@ -6706,10 +7701,14 @@ _DISPATCH = {
         _build_pr_parser,
         lambda a: cmd_pr(a.repo, a.base, destination=_destination_from_args(a)),
     ),
-    "review": (
-        _build_review_parser,
-        lambda a: cmd_review(a.repo, a.pr_number, a.diff,
-                             destination=_destination_from_args(a)),
+    "item": (
+        _build_item_parser,
+        lambda a: cmd_item(
+            a.repo, a.kind_or_id, a.ident,
+            include_diff=a.diff,
+            all_logs=a.all_logs,
+            destination=_destination_from_args(a),
+        ),
     ),
     "rebuild": (
         _build_rebuild_parser,
@@ -6880,7 +7879,7 @@ def main() -> int:
         description="nomnom: feed your repo to the LLM, one .txt snack at a time.",
         epilog=(
             "subcommands: register / unregister edit the auto-managed "
-            "extension lists; commit / pr / review bundle git context for "
+            "extension lists; commit / pr / item bundle git context for "
             "an LLM; rebuild reconstructs a file tree from a bundle .txt; "
             "relay init sets up a new relay on this machine; join <token> "
             "joins an existing relay from another device; pair adds a new "
@@ -7002,13 +8001,14 @@ def main() -> int:
                     return cmd_commit(str(root), destination=result.destination)
                 if result.verb == Verb.PR:
                     return cmd_pr(str(root), None, destination=result.destination)
-                if result.verb == Verb.REVIEW:
-                    if result.review_pr is None:
+                if result.verb == Verb.ITEM:
+                    if result.item_kind is None or result.item_id is None:
                         raise NomnomError(
-                            "review verb selected without a PR number",
+                            "item verb selected without an id",
                         )
-                    return cmd_review(
-                        str(root), result.review_pr, True,
+                    return cmd_item(
+                        str(root), result.item_kind, result.item_id,
+                        include_diff=True,
                         destination=result.destination,
                     )
             except NomnomError as e:
