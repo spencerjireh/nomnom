@@ -53,6 +53,22 @@ function isFeedIdentity(id: unknown): id is Identity {
   );
 }
 
+/** True if the stored value has the shape of a feeds-v2 Feed record. */
+function isFeed(f: unknown): f is Feed {
+  if (!f || typeof f !== "object") return false;
+  const x = f as Feed;
+  return (
+    typeof x.name === "string" &&
+    typeof x.feed_id === "string" &&
+    typeof x.feed_token === "string" &&
+    typeof x.url === "string" &&
+    typeof x.member_id === "string" &&
+    typeof x.expires_at === "number" &&
+    typeof x.joined_at === "number" &&
+    typeof x.last_post_ts === "number"
+  );
+}
+
 export const persistence = {
   loadIdentity: (): Identity | null => {
     if (read<number>(K.schema) !== SCHEMA) return null; // legacy / absent
@@ -70,10 +86,11 @@ export const persistence = {
   loadFeeds: (): FeedsConfig => {
     const cfg = read<FeedsConfig>(K.feeds);
     if (!cfg || !Array.isArray(cfg.feeds)) return { default: null, feeds: [] };
-    const def = typeof cfg.default === "string" && cfg.feeds.some((f) => f.name === cfg.default)
+    const feeds = cfg.feeds.filter(isFeed);
+    const def = typeof cfg.default === "string" && feeds.some((f) => f.name === cfg.default)
       ? cfg.default
       : null;
-    return { default: def, feeds: cfg.feeds };
+    return { default: def, feeds };
   },
   saveFeeds: (cfg: FeedsConfig): void => write(K.feeds, cfg),
 

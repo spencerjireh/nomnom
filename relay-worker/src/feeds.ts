@@ -13,6 +13,8 @@
 //   /feeds/:id/*                 — feed-key signature (URL token IS the credential)
 
 import { pollSlot } from "./poll";
+import { errorResponse, jsonResponse, sleep } from "./http";
+import { urlsafeBase64Encode } from "./crypto-util";
 
 const FEED_ID_RE = /^[A-Za-z0-9_-]{8,32}$/;
 const MEMBER_ID_RE = /^[A-Za-z0-9_-]{8,64}$/;
@@ -22,6 +24,7 @@ const DEFAULT_TTL_SEC = 86_400; // 1 day
 const MAX_TTL_SEC = 90 * 86_400; // 90 days
 const MIN_TTL_SEC = 60; // 1 minute (sanity floor)
 const MAX_MEMBER_CARD_BYTES = 4096;
+const MAX_MEMBER_NAME_LEN = 128;
 const MAX_BODY_BYTES = 256 * 1024 * 1024; // 256 MB
 const MAX_MEMBER_COUNT = 64; // bound roster size per feed
 
@@ -29,6 +32,10 @@ const MEMBER_POLL_INTERVAL_MS = 1000;
 const SLOT_LIST_POLL_INTERVAL_MS = 1000;
 const MAX_BUDGET_MS = 30_000;
 const LIST_BATCH_SIZE = 1000;
+// Cap on concurrent R2 sub-requests within readSlotsSince. Workers free tier
+// allows 50 subrequests per invocation, paid 1000; 16 keeps us comfortable
+// even with the long-poll's surrounding reads.
+const SLOT_HEAD_CONCURRENCY = 16;
 
 export function validateFeedId(id: string): boolean {
   return FEED_ID_RE.test(id);
@@ -72,7 +79,8 @@ export async function mintFeed(
     typeof card.member_id !== "string" ||
     !validateMemberId(card.member_id) ||
     typeof card.identity_pubkey !== "string" ||
-    typeof card.name !== "string"
+    typeof card.name !== "string" ||
+    card.name.length > MAX_MEMBER_NAME_LEN
   ) {
     return errorResponse("bad-member-card", 400);
   }
@@ -177,6 +185,10 @@ export async function closeFeed(
   bucket: R2Bucket,
   feedId: string,
 ): Promise<Response> {
+  const head = await bucket.head(`feeds/${feedId}/meta`);
+  if (head === null) {
+    return errorResponse("feed-not-found", 404);
+  }
   await purgeFeed(bucket, feedId);
   return new Response(null, { status: 204 });
 }
@@ -206,7 +218,8 @@ export async function putMember(
     typeof card.member_id !== "string" ||
     card.member_id !== memberId ||
     typeof card.identity_pubkey !== "string" ||
-    typeof card.name !== "string"
+    typeof card.name !== "string" ||
+    card.name.length > MAX_MEMBER_NAME_LEN
   ) {
     return errorResponse("bad-member-card", 400);
   }
@@ -287,10 +300,12 @@ async function readMembersSince(
     prefix: `feeds/${feedId}/members/`,
     limit: MAX_MEMBER_COUNT + 1,
   });
+  // Fan out in parallel — roster is bounded at MAX_MEMBER_COUNT (64), well
+  // under the per-invocation subrequest cap.
+  const bodies = await Promise.all(list.objects.map((o) => bucket.get(o.key)));
   const cards: MemberCard[] = [];
   const fresh: MemberCard[] = [];
-  for (const obj of list.objects) {
-    const body = await bucket.get(obj.key);
+  for (const body of bodies) {
     if (body === null) continue;
     const joinedAt = parseTs(body.customMetadata?.created_at) ?? 0;
     let parsed: { member_id: string; identity_pubkey: string; name: string };
@@ -415,12 +430,22 @@ async function readSlotsSince(
 ): Promise<SlotIndex[]> {
   const prefix = `feeds/${feedId}/slots/`;
   const list = await bucket.list({ prefix, limit: LIST_BATCH_SIZE });
+  // List can return up to LIST_BATCH_SIZE keys; a naive Promise.all over all
+  // of them would blow the Workers per-invocation subrequest cap. Process in
+  // chunks of SLOT_HEAD_CONCURRENCY to stay under the ceiling while still
+  // pipelining the head calls.
   const out: SlotIndex[] = [];
-  for (const obj of list.objects) {
-    const head = await bucket.head(obj.key);
-    const createdAt = parseTs(head?.customMetadata?.created_at);
-    if (createdAt === null || createdAt <= sinceTs) continue;
-    out.push({ slot_id: obj.key.slice(prefix.length), created_at: createdAt });
+  for (let i = 0; i < list.objects.length; i += SLOT_HEAD_CONCURRENCY) {
+    const slice = list.objects.slice(i, i + SLOT_HEAD_CONCURRENCY);
+    const heads = await Promise.all(slice.map((o) => bucket.head(o.key)));
+    for (let j = 0; j < slice.length; j++) {
+      const createdAt = parseTs(heads[j]?.customMetadata?.created_at);
+      if (createdAt === null || createdAt <= sinceTs) continue;
+      out.push({
+        slot_id: slice[j].key.slice(prefix.length),
+        created_at: createdAt,
+      });
+    }
   }
   out.sort((a, b) => a.created_at - b.created_at);
   return out;
@@ -434,12 +459,6 @@ function generateFeedId(): string {
   const bytes = new Uint8Array(9);
   crypto.getRandomValues(bytes);
   return urlsafeBase64Encode(bytes);
-}
-
-function urlsafeBase64Encode(bytes: Uint8Array): string {
-  let bin = "";
-  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
-  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
 function clampTtl(input: unknown): number {
@@ -493,22 +512,9 @@ async function purgeFeed(bucket: R2Bucket, feedId: string): Promise<void> {
   do {
     const list = await bucket.list({ prefix, limit: LIST_BATCH_SIZE, cursor });
     if (list.objects.length === 0) break;
-    await Promise.all(list.objects.map((o) => bucket.delete(o.key)));
+    // R2Bucket.delete accepts string[] — collapses up to LIST_BATCH_SIZE
+    // class-A operations into one billable op.
+    await bucket.delete(list.objects.map((o) => o.key));
     cursor = list.truncated ? list.cursor : undefined;
   } while (cursor !== undefined);
-}
-
-function jsonResponse(body: unknown, status: number): Response {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { "Content-Type": "application/json" },
-  });
-}
-
-export function errorResponse(reason: string, status: number): Response {
-  return jsonResponse({ error: reason }, status);
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }

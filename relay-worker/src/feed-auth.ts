@@ -14,18 +14,17 @@
 // leaks don't compromise the rest of the relay.
 
 import {
-  bytesToHex,
   constantTimeEqualHex,
+  hmacSha256Hex,
+  parseSignedAuth,
   urlsafeBase64Decode,
+  type AuthResult,
 } from "./crypto-util";
 
-const TIMESTAMP_WINDOW_SEC = 300;
+export type { AuthResult } from "./crypto-util";
+
 const AUTH_PREFIX = "NMNM-FEEDKEY-SHA256 ";
 const HKDF_SALT = new TextEncoder().encode("nomnom-feed-v1");
-
-export type AuthResult =
-  | { ok: true }
-  | { ok: false; status: number; reason: string };
 
 export async function deriveFeedKey(feedId: string): Promise<Uint8Array> {
   const ikm = urlsafeBase64Decode(feedId);
@@ -50,24 +49,11 @@ export async function verifyFeedKey(
   feedId: string,
 ): Promise<AuthResult> {
   const header = req.headers.get("Authorization") ?? "";
-  if (!header.startsWith(AUTH_PREFIX)) {
-    return { ok: false, status: 401, reason: "missing-feed-mac" };
-  }
-  const rest = header.slice(AUTH_PREFIX.length);
-  const colon = rest.indexOf(":");
-  if (colon < 0) {
-    return { ok: false, status: 401, reason: "bad-feed-mac" };
-  }
-  const tsStr = rest.slice(0, colon);
-  const macHex = rest.slice(colon + 1).toLowerCase();
-  const ts = Number.parseInt(tsStr, 10);
-  if (!Number.isFinite(ts) || tsStr !== String(ts)) {
-    return { ok: false, status: 401, reason: "bad-feed-mac" };
-  }
-  const now = Math.floor(Date.now() / 1000);
-  if (Math.abs(now - ts) > TIMESTAMP_WINDOW_SEC) {
-    return { ok: false, status: 401, reason: "clock-skew" };
-  }
+  const parsed = parseSignedAuth(header, AUTH_PREFIX, {
+    missing: "missing-feed-mac",
+    bad: "bad-feed-mac",
+  });
+  if ("ok" in parsed) return parsed;
 
   let feedKey: Uint8Array;
   try {
@@ -77,26 +63,10 @@ export async function verifyFeedKey(
   }
 
   const url = new URL(req.url);
-  const msg = `${req.method}\n${url.pathname}\n${tsStr}`;
+  const msg = `${req.method}\n${url.pathname}\n${parsed.tsStr}`;
   const expected = await hmacSha256Hex(feedKey, msg);
-  if (!constantTimeEqualHex(expected, macHex)) {
+  if (!constantTimeEqualHex(expected, parsed.macHex)) {
     return { ok: false, status: 401, reason: "bad-feed-mac" };
   }
   return { ok: true };
-}
-
-async function hmacSha256Hex(key: Uint8Array, msg: string): Promise<string> {
-  const cryptoKey = await crypto.subtle.importKey(
-    "raw",
-    key,
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["sign"],
-  );
-  const sig = await crypto.subtle.sign(
-    "HMAC",
-    cryptoKey,
-    new TextEncoder().encode(msg),
-  );
-  return bytesToHex(new Uint8Array(sig));
 }

@@ -303,6 +303,13 @@ describe("extend / close", () => {
     const metaRes = await SELF.fetch(metaReq);
     expect(metaRes.status).toBe(404);
   });
+
+  it("DELETE /feeds/:id 404s on an absent feed (not silently idempotent)", async () => {
+    const fakeId = randomBase64(9);
+    const delReq = await signedFeedRequest("DELETE", `/feeds/${fakeId}`, fakeId);
+    const delRes = await SELF.fetch(delReq);
+    expect(delRes.status).toBe(404);
+  });
 });
 
 describe("legacy /slots/:id (unchanged)", () => {

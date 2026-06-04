@@ -6,6 +6,7 @@
 import { create } from "zustand";
 import { persistence } from "./persistence";
 import { generateIdentity } from "../crypto/identity";
+import { cryptoClient } from "../worker/cryptoClient";
 import {
   feedPeerId,
   type Feed,
@@ -168,7 +169,7 @@ export const useStore = create<Store>((set, get) => {
 
     // --- TOFU pins ---
 
-    isPinned: (sigPub) => Object.values(get().peers).some((p) => p.sig_pub === sigPub),
+    isPinned: (sigPub) => get().peers[feedPeerId(sigPub)]?.sig_pub === sigPub,
 
     pinPeer: (sigPub, name) => {
       const peers = { ...get().peers };
@@ -243,6 +244,10 @@ export const useStore = create<Store>((set, get) => {
     },
 
     factoryReset: () => {
+      // Tear down any in-flight transfer first so its abort controller and
+      // worker thread don't leak past the reset.
+      get().transfer.abort?.abort();
+      cryptoClient.cancel();
       persistence.reset();
       const identity = generateIdentity();
       persistence.saveIdentity(identity);

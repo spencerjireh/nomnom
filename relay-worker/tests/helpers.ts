@@ -1,8 +1,16 @@
 // Test helpers: signed-request builders for the relay's two auth schemes.
+// All crypto + encoding primitives come from `../src/` so the tests can't drift
+// out of sync with the production code they're checking.
+
+import {
+  bytesToHex,
+  hmacSha256Hex,
+  urlsafeBase64Encode,
+} from "../src/crypto-util";
+import { deriveFeedKey } from "../src/feed-auth";
 
 const HMAC_PREFIX = "NMNM-HMAC-SHA256";
 const FEED_KEY_PREFIX = "NMNM-FEEDKEY-SHA256";
-const HKDF_SALT = new TextEncoder().encode("nomnom-feed-v1");
 
 export const TEST_SECRET = "test-secret-do-not-use-in-prod";
 export const BASE = "https://relay.test";
@@ -19,7 +27,7 @@ export async function signedHmacRequest(
 ): Promise<Request> {
   const ts = Math.floor(Date.now() / 1000);
   const msg = `${method}\n${pathOnly(path)}\n${ts}`;
-  const mac = await hmacSha256Hex(new TextEncoder().encode(TEST_SECRET), msg);
+  const mac = await hmacSha256Hex(TEST_SECRET, msg);
   const headers: Record<string, string> = {
     Authorization: `${HMAC_PREFIX} ${ts}:${mac}`,
   };
@@ -41,7 +49,7 @@ export async function signedFeedRequest(
 ): Promise<Request> {
   const ts = Math.floor(Date.now() / 1000);
   const msg = `${method}\n${pathOnly(path)}\n${ts}`;
-  const feedKey = await deriveFeedKeyBytes(feedId);
+  const feedKey = await deriveFeedKey(feedId);
   const mac = await hmacSha256Hex(feedKey, msg);
   const headers: Record<string, string> = {
     Authorization: `${FEED_KEY_PREFIX} ${ts}:${mac}`,
@@ -56,60 +64,6 @@ export async function signedFeedRequest(
   });
 }
 
-export async function deriveFeedKeyBytes(feedId: string): Promise<Uint8Array> {
-  const ikm = urlsafeBase64Decode(feedId);
-  const info = new TextEncoder().encode(feedId);
-  const baseKey = await crypto.subtle.importKey(
-    "raw",
-    ikm,
-    "HKDF",
-    false,
-    ["deriveBits"],
-  );
-  const bits = await crypto.subtle.deriveBits(
-    { name: "HKDF", hash: "SHA-256", salt: HKDF_SALT, info },
-    baseKey,
-    256,
-  );
-  return new Uint8Array(bits);
-}
-
-async function hmacSha256Hex(
-  key: Uint8Array,
-  msg: string,
-): Promise<string> {
-  const cryptoKey = await crypto.subtle.importKey(
-    "raw",
-    key,
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["sign"],
-  );
-  const sig = await crypto.subtle.sign(
-    "HMAC",
-    cryptoKey,
-    new TextEncoder().encode(msg),
-  );
-  return bytesToHex(new Uint8Array(sig));
-}
-
-function bytesToHex(bytes: Uint8Array): string {
-  let out = "";
-  for (let i = 0; i < bytes.length; i++) {
-    out += bytes[i].toString(16).padStart(2, "0");
-  }
-  return out;
-}
-
-function urlsafeBase64Decode(s: string): Uint8Array {
-  let padded = s.replace(/-/g, "+").replace(/_/g, "/");
-  while (padded.length % 4 !== 0) padded += "=";
-  const bin = atob(padded);
-  const bytes = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-  return bytes;
-}
-
 export function randomMemberId(): string {
   const bytes = new Uint8Array(16);
   crypto.getRandomValues(bytes);
@@ -119,12 +73,7 @@ export function randomMemberId(): string {
 export function randomBase64(byteLen: number): string {
   const bytes = new Uint8Array(byteLen);
   crypto.getRandomValues(bytes);
-  let bin = "";
-  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
-  return btoa(bin)
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_")
-    .replace(/=+$/, "");
+  return urlsafeBase64Encode(bytes);
 }
 
 export interface MintedFeed {

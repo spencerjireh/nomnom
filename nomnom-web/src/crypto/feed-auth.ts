@@ -21,7 +21,7 @@ export function feedAuthHeader(
   path: string,
   nowSeconds?: number,
 ): string {
-  const ts = Math.floor(nowSeconds ?? Date.now() / 1000);
+  const ts = nowSeconds ?? Math.floor(Date.now() / 1000);
   const barePath = path.split("?", 1)[0];
   const mac = feedRequestMac(feedKey, method, barePath, ts);
   return `${FEED_AUTH_PREFIX}${ts}:${mac}`;

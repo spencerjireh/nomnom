@@ -34,11 +34,19 @@ export interface SlotMeta {
   created_at: number;
 }
 
-/** `?wait=..&since=..` for positive ints only, kwargs order — matches nomnom `_qs`. */
+/**
+ * `?wait=..&since=..` — drop only `undefined`. `wait=0` is dropped because the
+ * Worker treats absent and 0 identically (no long-poll). `since=0` is a real
+ * "from the beginning" cursor that the Worker accepts (>= 0). Kwargs order
+ * matches nomnom `_qs`.
+ */
 function qs(params: { wait?: number; since?: number }): string {
   const parts: string[] = [];
   for (const [k, v] of Object.entries(params)) {
-    if (v && v > 0) parts.push(`${k}=${Math.floor(v)}`);
+    if (v === undefined) continue;
+    if (k === "wait" && v <= 0) continue;
+    if (v < 0) continue;
+    parts.push(`${k}=${Math.floor(v)}`);
   }
   return parts.length ? "?" + parts.join("&") : "";
 }
