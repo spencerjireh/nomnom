@@ -271,14 +271,55 @@ export async function listMembers(
   if (live.status !== 200) return live;
 
   const deadline = Date.now() + Math.min(Math.max(waitMs, 0), MAX_BUDGET_MS);
+  // Cache parsed cards across long-poll iterations keyed by R2 key.
+  // Member cards are immutable per (member_id, joined_at) tuple, so once a key
+  // is in this map we never need to re-fetch its body. Per iteration we issue
+  // exactly ONE bucket.list to detect joins/leaves; bodies are fetched only
+  // for keys we haven't seen yet. This keeps the worst-case subrequest count
+  // bounded at (initial_roster_size + iteration_count) instead of
+  // (roster_size * iteration_count).
+  const cards = new Map<string, MemberCard>();
   while (true) {
-    const result = await readMembersSince(bucket, feedId, sinceTs);
-    if (result.fresh.length > 0 || waitMs <= 0) {
-      return jsonResponse({ members: result.all, fresh: result.fresh }, 200);
+    const list = await bucket.list({
+      prefix: `feeds/${feedId}/members/`,
+      limit: MAX_MEMBER_COUNT + 1,
+    });
+    const currentKeys = new Set(list.objects.map((o) => o.key));
+    // Drop members who have left since the last iteration.
+    for (const k of cards.keys()) {
+      if (!currentKeys.has(k)) cards.delete(k);
+    }
+    // Fetch bodies only for keys we haven't seen yet.
+    const newObjs = list.objects.filter((o) => !cards.has(o.key));
+    if (newObjs.length > 0) {
+      const bodies = await Promise.all(newObjs.map((o) => bucket.get(o.key)));
+      for (let i = 0; i < newObjs.length; i++) {
+        const body = bodies[i];
+        if (body === null) continue;
+        const joinedAt = parseTs(body.customMetadata?.created_at) ?? 0;
+        let parsed: { member_id: string; identity_pubkey: string; name: string };
+        try {
+          parsed = JSON.parse(await body.text());
+        } catch {
+          continue;
+        }
+        cards.set(newObjs[i].key, {
+          member_id: parsed.member_id,
+          identity_pubkey: parsed.identity_pubkey,
+          name: parsed.name,
+          joined_at: joinedAt,
+        });
+      }
+    }
+
+    const all = [...cards.values()];
+    const fresh = all.filter((m) => m.joined_at > sinceTs);
+    if (fresh.length > 0 || waitMs <= 0) {
+      return jsonResponse({ members: all, fresh }, 200);
     }
     const remaining = deadline - Date.now();
     if (remaining <= 0) {
-      return jsonResponse({ members: result.all, fresh: [] }, 200);
+      return jsonResponse({ members: all, fresh: [] }, 200);
     }
     await sleep(Math.min(MEMBER_POLL_INTERVAL_MS, remaining));
   }
@@ -289,41 +330,6 @@ interface MemberCard {
   identity_pubkey: string;
   name: string;
   joined_at: number;
-}
-
-async function readMembersSince(
-  bucket: R2Bucket,
-  feedId: string,
-  sinceTs: number,
-): Promise<{ all: MemberCard[]; fresh: MemberCard[] }> {
-  const list = await bucket.list({
-    prefix: `feeds/${feedId}/members/`,
-    limit: MAX_MEMBER_COUNT + 1,
-  });
-  // Fan out in parallel — roster is bounded at MAX_MEMBER_COUNT (64), well
-  // under the per-invocation subrequest cap.
-  const bodies = await Promise.all(list.objects.map((o) => bucket.get(o.key)));
-  const cards: MemberCard[] = [];
-  const fresh: MemberCard[] = [];
-  for (const body of bodies) {
-    if (body === null) continue;
-    const joinedAt = parseTs(body.customMetadata?.created_at) ?? 0;
-    let parsed: { member_id: string; identity_pubkey: string; name: string };
-    try {
-      parsed = JSON.parse(await body.text());
-    } catch {
-      continue;
-    }
-    const card: MemberCard = {
-      member_id: parsed.member_id,
-      identity_pubkey: parsed.identity_pubkey,
-      name: parsed.name,
-      joined_at: joinedAt,
-    };
-    cards.push(card);
-    if (joinedAt > sinceTs) fresh.push(card);
-  }
-  return { all: cards, fresh };
 }
 
 // ---------- PUT /feeds/:id/slots/:slot_id ----------
@@ -404,9 +410,41 @@ export async function listFeedSlots(
   const live = await ensureFeedLive(bucket, feedId);
   if (live.status !== 200) return live;
 
+  const prefix = `feeds/${feedId}/slots/`;
   const deadline = Date.now() + Math.min(Math.max(waitMs, 0), MAX_BUDGET_MS);
+  // Cache slot created_at across long-poll iterations keyed by R2 key. Slots
+  // are immutable once written; bucket.head returns the same created_at on
+  // every call. Per iteration we issue ONE bucket.list to discover NEW keys
+  // and only head the ones we haven't seen — bounding the worst case at
+  // (current_slot_count + iteration_count * new_keys) rather than
+  // (slot_count * iteration_count) head calls.
+  const seen = new Map<string, number>(); // key -> created_at
   while (true) {
-    const fresh = await readSlotsSince(bucket, feedId, sinceTs);
+    const list = await bucket.list({ prefix, limit: LIST_BATCH_SIZE });
+    const newObjs = list.objects.filter((o) => !seen.has(o.key));
+    // Drop departed keys (slot expired / feed extended past slot lifetime).
+    const currentKeys = new Set(list.objects.map((o) => o.key));
+    for (const k of seen.keys()) {
+      if (!currentKeys.has(k)) seen.delete(k);
+    }
+    // Head only the new keys, chunked to respect the Workers subrequest cap.
+    for (let i = 0; i < newObjs.length; i += SLOT_HEAD_CONCURRENCY) {
+      const slice = newObjs.slice(i, i + SLOT_HEAD_CONCURRENCY);
+      const heads = await Promise.all(slice.map((o) => bucket.head(o.key)));
+      for (let j = 0; j < slice.length; j++) {
+        const createdAt = parseTs(heads[j]?.customMetadata?.created_at);
+        if (createdAt === null) continue;
+        seen.set(slice[j].key, createdAt);
+      }
+    }
+
+    const fresh: SlotIndex[] = [];
+    for (const [key, createdAt] of seen) {
+      if (createdAt <= sinceTs) continue;
+      fresh.push({ slot_id: key.slice(prefix.length), created_at: createdAt });
+    }
+    fresh.sort((a, b) => a.created_at - b.created_at);
+
     if (fresh.length > 0 || waitMs <= 0) {
       return jsonResponse({ slots: fresh }, 200);
     }
@@ -421,34 +459,6 @@ export async function listFeedSlots(
 interface SlotIndex {
   slot_id: string;
   created_at: number;
-}
-
-async function readSlotsSince(
-  bucket: R2Bucket,
-  feedId: string,
-  sinceTs: number,
-): Promise<SlotIndex[]> {
-  const prefix = `feeds/${feedId}/slots/`;
-  const list = await bucket.list({ prefix, limit: LIST_BATCH_SIZE });
-  // List can return up to LIST_BATCH_SIZE keys; a naive Promise.all over all
-  // of them would blow the Workers per-invocation subrequest cap. Process in
-  // chunks of SLOT_HEAD_CONCURRENCY to stay under the ceiling while still
-  // pipelining the head calls.
-  const out: SlotIndex[] = [];
-  for (let i = 0; i < list.objects.length; i += SLOT_HEAD_CONCURRENCY) {
-    const slice = list.objects.slice(i, i + SLOT_HEAD_CONCURRENCY);
-    const heads = await Promise.all(slice.map((o) => bucket.head(o.key)));
-    for (let j = 0; j < slice.length; j++) {
-      const createdAt = parseTs(heads[j]?.customMetadata?.created_at);
-      if (createdAt === null || createdAt <= sinceTs) continue;
-      out.push({
-        slot_id: slice[j].key.slice(prefix.length),
-        created_at: createdAt,
-      });
-    }
-  }
-  out.sort((a, b) => a.created_at - b.created_at);
-  return out;
 }
 
 // ---------- helpers ----------

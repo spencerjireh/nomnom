@@ -75,10 +75,9 @@ class CryptoClient {
   }
 
   /** Terminate the worker (cancelling in-flight work) and reject all pending.
-   * No-op when nothing is in flight — keeps the warm worker around for the
-   * next seal/open instead of paying a fresh module-worker boot. */
+   * factoryReset depends on this fully tearing down, so we always terminate
+   * the worker even when nothing is currently pending. */
   cancel(): void {
-    if (this.pending.size === 0) return;
     if (this.worker) {
       this.worker.terminate();
       this.worker = null;
