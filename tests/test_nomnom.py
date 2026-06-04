@@ -544,7 +544,7 @@ class TestCycleVerb:
     def test_full_cycle(self):
         v = nomnom.Verb.BUNDLE
         for expected in (nomnom.Verb.COMMIT, nomnom.Verb.PR,
-                         nomnom.Verb.REVIEW, nomnom.Verb.BUNDLE):
+                         nomnom.Verb.ITEM, nomnom.Verb.BUNDLE):
             v = nomnom.cycle_verb(v)
             assert v == expected
 
@@ -627,7 +627,7 @@ class TestFormatFooter:
             (nomnom.Verb.BUNDLE, "verb: bundle"),
             (nomnom.Verb.COMMIT, "verb: commit"),
             (nomnom.Verb.PR, "verb: pr"),
-            (nomnom.Verb.REVIEW, "verb: review"),
+            (nomnom.Verb.ITEM, "verb: item"),
         ]:
             out = nomnom.format_footer(
                 nomnom.Destination.FILE, True, (3, 1000, 250), 120, verb,
@@ -714,7 +714,7 @@ class TestLauncherScreen:
     def test_tiles_include_every_verb(self):
         s = nomnom.LauncherScreen()
         labels = [t[0] for t in s.tiles]
-        for v in ("Bundle", "Commit", "PR", "Review", "Rebuild",
+        for v in ("Bundle", "Commit", "PR", "Item", "Rebuild",
                   "Send", "Receive", "Extensions", "Feeds"):
             assert v in labels
 
@@ -1177,23 +1177,21 @@ class TestPRScreen:
         assert called["base"] is None
 
 
-class TestReviewScreen:
-    def test_fields_include_pr_and_diff(self):
-        s = nomnom.ReviewScreen()
+class TestItemScreen:
+    def test_fields_include_id_and_diff(self):
+        s = nomnom.ItemScreen()
         field_ids = [fid for fid, _ in s.fields]
-        assert field_ids == ["repo", "pr", "diff", "dest"]
+        assert field_ids == ["repo", "id", "diff", "dest"]
 
-    def test_pr_number_accepts_only_digits(self):
-        s = nomnom.ReviewScreen()
-        s.field_cursor = 1  # focus PR number
-        s.handle_key(ord("1"))
-        s.handle_key(ord("2"))
-        s.handle_key(ord("x"))  # non-digit, ignored
-        s.handle_key(ord("3"))
-        assert s.pr_buf == "123"
+    def test_id_accepts_printable_chars(self):
+        s = nomnom.ItemScreen()
+        s.field_cursor = 1  # focus id
+        for ch in "v1.2.3":
+            s.handle_key(ord(ch))
+        assert s.id_buf == "v1.2.3"
 
     def test_diff_toggled_by_space_when_focused(self):
-        s = nomnom.ReviewScreen()
+        s = nomnom.ItemScreen()
         s.field_cursor = 2  # focus diff
         assert s.include_diff is False
         s.handle_key(ord(" "))
@@ -1201,12 +1199,12 @@ class TestReviewScreen:
         s.handle_key(ord(" "))
         assert s.include_diff is False
 
-    def test_run_errors_on_missing_pr_number(self, monkeypatch):
-        monkeypatch.setattr(nomnom, "cmd_review",
+    def test_run_errors_on_missing_id(self, monkeypatch):
+        monkeypatch.setattr(nomnom, "cmd_item",
                             lambda *a, **k: 0)
-        s = nomnom.ReviewScreen()
+        s = nomnom.ItemScreen()
         s.repo_buf = "/tmp/r"
-        s.pr_buf = ""
+        s.id_buf = ""
         s.handle_key(10)
         assert s.rc == 1
         assert "required" in s.error.lower()
@@ -1214,20 +1212,44 @@ class TestReviewScreen:
     def test_run_passes_args(self, monkeypatch):
         called: dict = {}
 
-        def fake_cmd_review(repo, pr_number, include_diff, *, destination):
-            called["pr"] = pr_number
+        def fake_cmd_item(
+            repo, kind_or_id, ident=None, *,
+            include_diff=False, all_logs=False, destination,
+        ):
+            called["repo"] = repo
+            called["kind_or_id"] = kind_or_id
+            called["ident"] = ident
             called["diff"] = include_diff
             called["dest"] = destination
             return 0
-        monkeypatch.setattr(nomnom, "cmd_review", fake_cmd_review)
-        s = nomnom.ReviewScreen()
+        monkeypatch.setattr(nomnom, "cmd_item", fake_cmd_item)
+        s = nomnom.ItemScreen()
         s.repo_buf = "/tmp/r"
-        s.pr_buf = "42"
+        s.id_buf = "42"
         s.include_diff = True
         s.destination = nomnom.Destination.CLIPBOARD
         s.handle_key(10)
-        assert called == {"pr": 42, "diff": True,
-                          "dest": nomnom.Destination.CLIPBOARD}
+        assert called == {
+            "repo": "/tmp/r", "kind_or_id": "42", "ident": None,
+            "diff": True, "dest": nomnom.Destination.CLIPBOARD,
+        }
+
+    def test_kind_prefix_input_routes_explicit_kind(self, monkeypatch):
+        called: dict = {}
+
+        def fake_cmd_item(
+            repo, kind_or_id, ident=None, *,
+            include_diff=False, all_logs=False, destination,
+        ):
+            called["kind_or_id"] = kind_or_id
+            called["ident"] = ident
+            return 0
+        monkeypatch.setattr(nomnom, "cmd_item", fake_cmd_item)
+        s = nomnom.ItemScreen()
+        s.repo_buf = "/tmp/r"
+        s.id_buf = "discussion 7"
+        s.handle_key(10)
+        assert called == {"kind_or_id": "discussion", "ident": "7"}
 
 
 class _FakeStdscr:
@@ -2065,7 +2087,7 @@ class TestPrBundle:
         assert ("x" * 501) not in text
 
 
-# ---------- cmd_review ----------
+# ---------- cmd_item_pr ----------
 
 def _review_stub(payloads: dict, original_run, diff_called: list | None = None):
     """Stub for nomnom._run that routes review-mode gh calls.
@@ -2114,7 +2136,7 @@ def _minimal_pr_payload(number: int = 1) -> str:
     })
 
 
-class TestReviewBundle:
+class TestItemPrBundle:
     def test_missing_gh_errors(self, tmp_path, monkeypatch):
         repo = tmp_path / "p"
         make_git_repo(repo, initial={"a.txt": "1\n"})
@@ -2124,7 +2146,7 @@ class TestReviewBundle:
         )
         monkeypatch.chdir(tmp_path)
         with pytest.raises(nomnom.NomnomError, match="requires gh"):
-            nomnom.cmd_review(
+            nomnom.cmd_item_pr(
                 str(repo), pr_number=1, include_diff=False,
             )
 
@@ -2135,7 +2157,7 @@ class TestReviewBundle:
                             lambda name: f"/usr/bin/{name}")
         monkeypatch.chdir(tmp_path)
         with pytest.raises(nomnom.NomnomError, match="must be positive"):
-            nomnom.cmd_review(
+            nomnom.cmd_item_pr(
                 str(repo), pr_number=0, include_diff=False,
             )
 
@@ -2155,7 +2177,7 @@ class TestReviewBundle:
         monkeypatch.setattr(nomnom, "_run", stub)
         monkeypatch.chdir(tmp_path)
         with pytest.raises(nomnom.NomnomError) as ei:
-            nomnom.cmd_review(
+            nomnom.cmd_item_pr(
                 str(repo), pr_number=42, include_diff=False,
             )
         msg = str(ei.value)
@@ -2178,7 +2200,7 @@ class TestReviewBundle:
         monkeypatch.setattr(nomnom, "_run", stub)
         monkeypatch.chdir(tmp_path)
         with pytest.raises(nomnom.NomnomError, match="no remote configured"):
-            nomnom.cmd_review(
+            nomnom.cmd_item_pr(
                 str(repo), pr_number=1, include_diff=False,
             )
 
@@ -2200,11 +2222,11 @@ class TestReviewBundle:
         out_dir = tmp_path / "out"
         out_dir.mkdir()
         monkeypatch.chdir(out_dir)
-        rc = nomnom.cmd_review(
+        rc = nomnom.cmd_item_pr(
             str(repo), pr_number=7, include_diff=False,
         )
         assert rc == 0
-        bundles = list(out_dir.glob("p-pr-7-review-*.txt"))
+        bundles = list(out_dir.glob("p-pr-7-*.txt"))
         assert len(bundles) == 1
         text = bundles[0].read_text()
         for sec in (
@@ -2309,11 +2331,11 @@ class TestReviewBundle:
         out_dir = tmp_path / "out"
         out_dir.mkdir()
         monkeypatch.chdir(out_dir)
-        rc = nomnom.cmd_review(
+        rc = nomnom.cmd_item_pr(
             str(repo), pr_number=99, include_diff=False,
         )
         assert rc == 0
-        text = next(out_dir.glob("p-pr-99-review-*.txt")).read_text()
+        text = next(out_dir.glob("p-pr-99-*.txt")).read_text()
         # Meta fields
         assert "Big change" in text
         assert "@alice" in text
@@ -2387,10 +2409,10 @@ class TestReviewBundle:
         out_dir = tmp_path / "out"
         out_dir.mkdir()
         monkeypatch.chdir(out_dir)
-        nomnom.cmd_review(
+        nomnom.cmd_item_pr(
             str(repo), pr_number=5, include_diff=False,
         )
-        text = next(out_dir.glob("p-pr-5-review-*.txt")).read_text()
+        text = next(out_dir.glob("p-pr-5-*.txt")).read_text()
         i_a10 = text.index("## src/a.py:10")
         i_a20 = text.index("## src/a.py:20")
         i_b5 = text.index("## src/b.py:5")
@@ -2428,10 +2450,10 @@ class TestReviewBundle:
         out_dir = tmp_path / "out"
         out_dir.mkdir()
         monkeypatch.chdir(out_dir)
-        nomnom.cmd_review(
+        nomnom.cmd_item_pr(
             str(repo), pr_number=8, include_diff=False,
         )
-        text = next(out_dir.glob("p-pr-8-review-*.txt")).read_text()
+        text = next(out_dir.glob("p-pr-8-*.txt")).read_text()
         assert "ready_for_review" in text
         assert "head_ref_force_pushed" in text
         assert "abcdef0 -> 1234567" in text
@@ -2460,11 +2482,11 @@ class TestReviewBundle:
         out_dir = tmp_path / "out"
         out_dir.mkdir()
         monkeypatch.chdir(out_dir)
-        nomnom.cmd_review(
+        nomnom.cmd_item_pr(
             str(repo), pr_number=1, include_diff=False,
         )
         assert diff_called == []
-        text = next(out_dir.glob("p-pr-1-review-*.txt")).read_text()
+        text = next(out_dir.glob("p-pr-1-*.txt")).read_text()
         assert '<section name="diff">' not in text
 
     def test_diff_flag_includes_diff(self, tmp_path, monkeypatch):
@@ -2488,11 +2510,11 @@ class TestReviewBundle:
         out_dir = tmp_path / "out"
         out_dir.mkdir()
         monkeypatch.chdir(out_dir)
-        nomnom.cmd_review(
+        nomnom.cmd_item_pr(
             str(repo), pr_number=2, include_diff=True,
         )
         assert len(diff_called) == 1
-        text = next(out_dir.glob("p-pr-2-review-*.txt")).read_text()
+        text = next(out_dir.glob("p-pr-2-*.txt")).read_text()
         assert '<section name="diff">' in text
         assert "diff --git" in text
 
@@ -2520,14 +2542,724 @@ class TestReviewBundle:
         out_dir = tmp_path / "out"
         out_dir.mkdir()
         monkeypatch.chdir(out_dir)
-        rc = nomnom.cmd_review(
+        rc = nomnom.cmd_item_pr(
             str(repo), pr_number=3, include_diff=False,
             destination=nomnom.Destination.CLIPBOARD,
         )
         assert rc == 0
-        assert list(out_dir.glob("p-pr-3-review-*.txt")) == []
+        assert list(out_dir.glob("p-pr-3-*.txt")) == []
         assert len(captured) == 1
         assert '<section name="pr_meta">' in captured[0]
+
+
+# ---------- cmd_item_issue ----------
+
+
+class TestItemIssueBundle:
+    def test_happy_path(self, tmp_path, monkeypatch):
+        repo = tmp_path / "p"
+        make_git_repo(repo, initial={"a.txt": "1\n"})
+        monkeypatch.setattr(nomnom.shutil, "which",
+                            lambda name: f"/usr/bin/{name}")
+        issue_payload = json.dumps({
+            "number": 42, "title": "broken thing",
+            "html_url": "https://github.com/owner/name/issues/42",
+            "body": "describe the issue",
+            "user": {"login": "alice"},
+            "state": "open",
+            "labels": [{"name": "bug"}],
+            "milestone": {"title": "v1.0"},
+            "assignees": [{"login": "bob"}],
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-02T00:00:00Z",
+        })
+        comments_payload = json.dumps([
+            {"user": {"login": "carol"}, "body": "+1",
+             "created_at": "2026-01-01T01:00:00Z"},
+        ])
+        timeline_payload = json.dumps([
+            {"event": "labeled", "actor": {"login": "alice"},
+             "created_at": "2026-01-01T00:30:00Z",
+             "label": {"name": "bug"}},
+            {"event": "cross-referenced", "actor": {"login": "bob"},
+             "created_at": "2026-01-01T02:00:00Z",
+             "source": {"issue": {"number": 100, "title": "related pr",
+                                  "html_url": "https://example.com/pr"}}},
+        ])
+        graphql_payload = json.dumps({
+            "data": {"repository": {"issue": {
+                "closedByPullRequestsReferences": {"nodes": [
+                    {"number": 50, "title": "fix it",
+                     "url": "https://github.com/owner/name/pull/50",
+                     "state": "OPEN"},
+                ]}
+            }}}
+        })
+        original = nomnom._run
+
+        def stub(cmd, cwd):
+            t = tuple(cmd)
+            if t[:3] == ("gh", "repo", "view"):
+                return (0, "owner/name\n", "")
+            if t[:3] == ("gh", "api", "graphql"):
+                return (0, graphql_payload, "")
+            if t[:2] == ("gh", "api"):
+                url = t[2]
+                if url.endswith("/comments"):
+                    return (0, comments_payload, "")
+                if url.endswith("/timeline"):
+                    return (0, timeline_payload, "")
+                return (0, issue_payload, "")
+            return original(cmd, cwd)
+
+        monkeypatch.setattr(nomnom, "_run", stub)
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        monkeypatch.chdir(out_dir)
+        rc = nomnom.cmd_item_issue(str(repo), 42)
+        assert rc == 0
+        bundles = list(out_dir.glob("p-issue-42-*.txt"))
+        assert len(bundles) == 1
+        text = bundles[0].read_text()
+        for sec in ("issue_meta", "issue_body", "linked_prs",
+                    "issue_comments", "timeline"):
+            assert f'<section name="{sec}">' in text
+        assert "broken thing" in text
+        assert "@alice" in text
+        assert "#50" in text and "fix it" in text
+        assert "+1" in text
+        # cross-referenced kept in _ISSUE_TIMELINE_KEEP
+        assert "cross-referenced" in text
+        # labeled also kept for issues
+        assert "labeled" in text
+
+    def test_rejects_pr_number(self, tmp_path, monkeypatch):
+        repo = tmp_path / "p"
+        make_git_repo(repo, initial={"a.txt": "1\n"})
+        monkeypatch.setattr(nomnom.shutil, "which",
+                            lambda name: f"/usr/bin/{name}")
+        pr_as_issue = json.dumps({
+            "number": 5, "title": "a pr",
+            "pull_request": {"url": "https://example.com"},
+        })
+        original = nomnom._run
+
+        def stub(cmd, cwd):
+            t = tuple(cmd)
+            if t[:3] == ("gh", "repo", "view"):
+                return (0, "owner/name\n", "")
+            if t[:2] == ("gh", "api"):
+                return (0, pr_as_issue, "")
+            return original(cmd, cwd)
+
+        monkeypatch.setattr(nomnom, "_run", stub)
+        monkeypatch.chdir(tmp_path)
+        with pytest.raises(nomnom.NomnomError, match="pull request"):
+            nomnom.cmd_item_issue(str(repo), 5)
+
+
+# ---------- cmd_item_discussion ----------
+
+
+class TestItemDiscussionBundle:
+    def test_happy_path(self, tmp_path, monkeypatch):
+        repo = tmp_path / "p"
+        make_git_repo(repo, initial={"a.txt": "1\n"})
+        monkeypatch.setattr(nomnom.shutil, "which",
+                            lambda name: f"/usr/bin/{name}")
+        graphql_payload = json.dumps({
+            "data": {"repository": {"discussion": {
+                "number": 7, "title": "best practices?",
+                "url": "https://github.com/owner/name/discussions/7",
+                "author": {"login": "alice"},
+                "createdAt": "2026-01-01T00:00:00Z",
+                "updatedAt": "2026-01-02T00:00:00Z",
+                "category": {"name": "Q&A"},
+                "labels": {"nodes": [{"name": "help"}]},
+                "body": "how do I do X?",
+                "answer": {
+                    "id": "C_abc",
+                    "author": {"login": "bob"},
+                    "body": "use the foo flag",
+                    "createdAt": "2026-01-01T01:00:00Z",
+                },
+                "comments": {"nodes": [
+                    {
+                        "id": "C_abc",
+                        "author": {"login": "bob"},
+                        "body": "use the foo flag",
+                        "createdAt": "2026-01-01T01:00:00Z",
+                        "replies": {"nodes": [
+                            {"author": {"login": "alice"},
+                             "body": "thanks",
+                             "createdAt": "2026-01-01T01:30:00Z"},
+                        ]},
+                    },
+                ]},
+            }}}
+        })
+        original = nomnom._run
+
+        def stub(cmd, cwd):
+            t = tuple(cmd)
+            if t[:3] == ("gh", "repo", "view"):
+                return (0, "owner/name\n", "")
+            if t[:3] == ("gh", "api", "graphql"):
+                return (0, graphql_payload, "")
+            return original(cmd, cwd)
+
+        monkeypatch.setattr(nomnom, "_run", stub)
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        monkeypatch.chdir(out_dir)
+        rc = nomnom.cmd_item_discussion(str(repo), 7)
+        assert rc == 0
+        bundles = list(out_dir.glob("p-discussion-7-*.txt"))
+        assert len(bundles) == 1
+        text = bundles[0].read_text()
+        for sec in ("discussion_meta", "discussion_body",
+                    "answer", "comments"):
+            assert f'<section name="{sec}">' in text
+        assert "best practices?" in text
+        assert "Q&A" in text
+        assert "use the foo flag" in text
+        assert "[answer]" in text
+        assert "thanks" in text  # nested reply
+
+    def test_not_found_errors(self, tmp_path, monkeypatch):
+        repo = tmp_path / "p"
+        make_git_repo(repo, initial={"a.txt": "1\n"})
+        monkeypatch.setattr(nomnom.shutil, "which",
+                            lambda name: f"/usr/bin/{name}")
+        original = nomnom._run
+
+        def stub(cmd, cwd):
+            t = tuple(cmd)
+            if t[:3] == ("gh", "repo", "view"):
+                return (0, "owner/name\n", "")
+            if t[:3] == ("gh", "api", "graphql"):
+                return (0, "{}", "")
+            return original(cmd, cwd)
+
+        monkeypatch.setattr(nomnom, "_run", stub)
+        monkeypatch.chdir(tmp_path)
+        with pytest.raises(nomnom.NomnomError, match="not found"):
+            nomnom.cmd_item_discussion(str(repo), 999)
+
+
+# ---------- cmd_item_commit ----------
+
+
+class TestItemCommitBundle:
+    def test_happy_path(self, tmp_path, monkeypatch):
+        repo = tmp_path / "p"
+        make_git_repo(repo, initial={"a.txt": "1\n"})
+        monkeypatch.setattr(nomnom.shutil, "which",
+                            lambda name: f"/usr/bin/{name}")
+        commit_payload = json.dumps({
+            "sha": "abc1234deadbeef0000000000000000000000000",
+            "html_url": "https://github.com/owner/name/commit/abc1234",
+            "commit": {
+                "author": {"name": "Alice", "email": "a@example.com",
+                           "date": "2026-01-01T00:00:00Z"},
+                "committer": {"name": "Alice", "email": "a@example.com",
+                              "date": "2026-01-01T00:00:00Z"},
+                "message": "fix the thing",
+            },
+            "parents": [{"sha": "def5678aaaaaaaaaa"}],
+            "stats": {"additions": 10, "deletions": 2, "total": 12},
+            "files": [
+                {"filename": "src/a.py", "additions": 5, "deletions": 1},
+                {"filename": "src/b.py", "additions": 5, "deletions": 1},
+            ],
+        })
+        comments_payload = json.dumps([
+            {"user": {"login": "bob"}, "body": "nice fix",
+             "created_at": "2026-01-01T01:00:00Z",
+             "path": "src/a.py", "line": 10},
+        ])
+        original = nomnom._run
+
+        def stub(cmd, cwd):
+            t = tuple(cmd)
+            if t[:3] == ("gh", "repo", "view"):
+                return (0, "owner/name\n", "")
+            if t[:2] == ("git", "show"):
+                return (0, "diff --git a b\n+x\n", "")
+            if t[:2] == ("gh", "api"):
+                url = t[2]
+                if url.endswith("/comments"):
+                    return (0, comments_payload, "")
+                return (0, commit_payload, "")
+            return original(cmd, cwd)
+
+        monkeypatch.setattr(nomnom, "_run", stub)
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        monkeypatch.chdir(out_dir)
+        rc = nomnom.cmd_item_commit(
+            str(repo), "abc1234deadbeef0000000000000000000000000",
+            include_diff=True,
+        )
+        assert rc == 0
+        bundles = list(out_dir.glob("p-commit-abc1234-*.txt"))
+        assert len(bundles) == 1
+        text = bundles[0].read_text()
+        for sec in ("commit_meta", "commit_message", "diff_summary",
+                    "diff", "commit_comments"):
+            assert f'<section name="{sec}">' in text
+        assert "fix the thing" in text
+        assert "Alice" in text
+        assert "diff --git" in text
+        assert "src/a.py" in text and "+5" in text
+        assert "nice fix" in text
+
+    def test_invalid_sha_errors(self, tmp_path, monkeypatch):
+        repo = tmp_path / "p"
+        make_git_repo(repo, initial={"a.txt": "1\n"})
+        monkeypatch.setattr(nomnom.shutil, "which",
+                            lambda name: f"/usr/bin/{name}")
+        monkeypatch.chdir(tmp_path)
+        with pytest.raises(nomnom.NomnomError, match="7-40 hex"):
+            nomnom.cmd_item_commit(str(repo), "xyz", include_diff=False)
+
+
+# ---------- cmd_item_release ----------
+
+
+class TestItemReleaseBundle:
+    def test_happy_path(self, tmp_path, monkeypatch):
+        repo = tmp_path / "p"
+        make_git_repo(repo, initial={"a.txt": "1\n"})
+        monkeypatch.setattr(nomnom.shutil, "which",
+                            lambda name: f"/usr/bin/{name}")
+        release_payload = json.dumps({
+            "tag_name": "v1.2.3",
+            "name": "Version 1.2.3",
+            "html_url": "https://github.com/owner/name/releases/tag/v1.2.3",
+            "author": {"login": "alice"},
+            "target_commitish": "main",
+            "published_at": "2026-01-01T00:00:00Z",
+            "created_at": "2026-01-01T00:00:00Z",
+            "draft": False,
+            "prerelease": False,
+            "body": "release notes here",
+            "assets": [
+                {"name": "binary.tar.gz", "size": 1048576,
+                 "download_count": 42,
+                 "browser_download_url": "https://example.com/binary.tar.gz"},
+            ],
+        })
+        original = nomnom._run
+
+        def stub(cmd, cwd):
+            t = tuple(cmd)
+            if t[:3] == ("gh", "repo", "view"):
+                return (0, "owner/name\n", "")
+            if t[:2] == ("gh", "api"):
+                return (0, release_payload, "")
+            return original(cmd, cwd)
+
+        monkeypatch.setattr(nomnom, "_run", stub)
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        monkeypatch.chdir(out_dir)
+        rc = nomnom.cmd_item_release(str(repo), "v1.2.3")
+        assert rc == 0
+        bundles = list(out_dir.glob("p-release-v1.2.3-*.txt"))
+        assert len(bundles) == 1
+        text = bundles[0].read_text()
+        for sec in ("release_meta", "release_notes", "assets"):
+            assert f'<section name="{sec}">' in text
+        assert "Version 1.2.3" in text
+        assert "v1.2.3" in text
+        assert "release notes here" in text
+        assert "binary.tar.gz" in text
+        assert "downloads:42" in text
+
+    def test_not_found_errors(self, tmp_path, monkeypatch):
+        repo = tmp_path / "p"
+        make_git_repo(repo, initial={"a.txt": "1\n"})
+        monkeypatch.setattr(nomnom.shutil, "which",
+                            lambda name: f"/usr/bin/{name}")
+        original = nomnom._run
+
+        def stub(cmd, cwd):
+            t = tuple(cmd)
+            if t[:3] == ("gh", "repo", "view"):
+                return (0, "owner/name\n", "")
+            if t[:2] == ("gh", "api"):
+                return (1, "", "not found")
+            return original(cmd, cwd)
+
+        monkeypatch.setattr(nomnom, "_run", stub)
+        monkeypatch.chdir(tmp_path)
+        with pytest.raises(nomnom.NomnomError, match="not found"):
+            nomnom.cmd_item_release(str(repo), "v9.9.9")
+
+    def test_tag_with_slash_is_url_encoded(self, tmp_path, monkeypatch):
+        """Tags with `/` (e.g. `releases/v1.2.3`) must be percent-encoded so
+        the slash doesn't break out of the `/releases/tags/{tag}` path."""
+        repo = tmp_path / "p"
+        make_git_repo(repo, initial={"a.txt": "1\n"})
+        monkeypatch.setattr(nomnom.shutil, "which",
+                            lambda name: f"/usr/bin/{name}")
+        observed: list[str] = []
+        release_payload = json.dumps({
+            "tag_name": "releases/v1.2.3", "name": "n",
+            "html_url": "u", "author": {"login": "a"},
+            "target_commitish": "main",
+            "body": "", "assets": [],
+        })
+        original = nomnom._run
+
+        def stub(cmd, cwd):
+            t = tuple(cmd)
+            if t[:3] == ("gh", "repo", "view"):
+                return (0, "owner/name\n", "")
+            if t[:2] == ("gh", "api"):
+                observed.append(t[2])
+                return (0, release_payload, "")
+            return original(cmd, cwd)
+
+        monkeypatch.setattr(nomnom, "_run", stub)
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        monkeypatch.chdir(out_dir)
+        nomnom.cmd_item_release(str(repo), "releases/v1.2.3")
+        assert any("releases%2Fv1.2.3" in u for u in observed), observed
+
+
+# ---------- cmd_item_run / cmd_item_job ----------
+
+
+class TestItemRunBundle:
+    def test_happy_path_failed_logs(self, tmp_path, monkeypatch):
+        repo = tmp_path / "p"
+        make_git_repo(repo, initial={"a.txt": "1\n"})
+        monkeypatch.setattr(nomnom.shutil, "which",
+                            lambda name: f"/usr/bin/{name}")
+        run_payload = json.dumps({
+            "databaseId": 555, "number": 12, "attempt": 1,
+            "status": "completed", "conclusion": "failure",
+            "event": "push", "workflowName": "CI",
+            "displayTitle": "Fix things",
+            "headBranch": "main",
+            "headSha": "abc1234deadbeef",
+            "jobs": [
+                {"name": "build", "status": "completed",
+                 "conclusion": "failure",
+                 "url": "https://ex/build",
+                 "startedAt": "2026-01-01T00:00:00Z",
+                 "completedAt": "2026-01-01T00:05:00Z"},
+            ],
+            "createdAt": "2026-01-01T00:00:00Z",
+            "updatedAt": "2026-01-01T00:05:00Z",
+            "url": "https://github.com/owner/name/actions/runs/555",
+        })
+        # Synthetic log lines with the job/step prefix format
+        log_lines = "\n".join(
+            f"build\tcompile\t2026-01-01T00:00:{i:02d}Z line {i}"
+            for i in range(5)
+        )
+        original = nomnom._run
+        log_flags: list = []
+
+        def stub(cmd, cwd):
+            t = tuple(cmd)
+            if t[:3] == ("gh", "run", "view") and "--json" in cmd:
+                return (0, run_payload, "")
+            if t[:3] == ("gh", "run", "view"):
+                log_flags.append([c for c in cmd if c.startswith("--log")])
+                return (0, log_lines, "")
+            return original(cmd, cwd)
+
+        monkeypatch.setattr(nomnom, "_run", stub)
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        monkeypatch.chdir(out_dir)
+        rc = nomnom.cmd_item_run(str(repo), 555, all_logs=False)
+        assert rc == 0
+        # Default: failing-step output only via --log-failed
+        assert ["--log-failed"] in log_flags
+        bundles = list(out_dir.glob("p-run-555-*.txt"))
+        assert len(bundles) == 1
+        text = bundles[0].read_text()
+        for sec in ("run_meta", "jobs", "failed_logs"):
+            assert f'<section name="{sec}">' in text
+        assert "CI" in text
+        assert "build" in text
+        assert "failure" in text
+        assert "line 0" in text  # log content kept
+
+    def test_all_logs_flag(self, tmp_path, monkeypatch):
+        repo = tmp_path / "p"
+        make_git_repo(repo, initial={"a.txt": "1\n"})
+        monkeypatch.setattr(nomnom.shutil, "which",
+                            lambda name: f"/usr/bin/{name}")
+        original = nomnom._run
+        log_flags: list = []
+
+        def stub(cmd, cwd):
+            t = tuple(cmd)
+            if t[:3] == ("gh", "run", "view") and "--json" in cmd:
+                return (0, json.dumps({
+                    "databaseId": 1, "number": 1, "status": "completed",
+                    "conclusion": "success", "jobs": [],
+                }), "")
+            if t[:3] == ("gh", "run", "view"):
+                log_flags.append([c for c in cmd if c.startswith("--log")])
+                return (0, "all the logs", "")
+            return original(cmd, cwd)
+
+        monkeypatch.setattr(nomnom, "_run", stub)
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        monkeypatch.chdir(out_dir)
+        nomnom.cmd_item_run(str(repo), 1, all_logs=True)
+        assert ["--log"] in log_flags
+        text = next(out_dir.glob("p-run-1-*.txt")).read_text()
+        assert '<section name="logs">' in text
+
+
+class TestItemJobBundle:
+    def test_happy_path(self, tmp_path, monkeypatch):
+        repo = tmp_path / "p"
+        make_git_repo(repo, initial={"a.txt": "1\n"})
+        monkeypatch.setattr(nomnom.shutil, "which",
+                            lambda name: f"/usr/bin/{name}")
+        job_payload = json.dumps({
+            "id": 9876, "name": "build",
+            "run_id": 555,
+            "run_url": "https://example.com/runs/555",
+            "html_url": "https://example.com/jobs/9876",
+            "workflow_name": "CI",
+            "status": "completed",
+            "conclusion": "failure",
+            "started_at": "2026-01-01T00:00:00Z",
+            "completed_at": "2026-01-01T00:05:00Z",
+            "runner_name": "ubuntu-latest",
+            "steps": [
+                {"name": "checkout", "status": "completed",
+                 "conclusion": "success"},
+                {"name": "compile", "status": "completed",
+                 "conclusion": "failure"},
+            ],
+        })
+        original = nomnom._run
+
+        def stub(cmd, cwd):
+            t = tuple(cmd)
+            if t[:3] == ("gh", "repo", "view"):
+                return (0, "owner/name\n", "")
+            if t[:2] == ("gh", "api"):
+                return (0, job_payload, "")
+            if t[:3] == ("gh", "run", "view"):
+                return (0, "build\tcompile\tt error log\n", "")
+            return original(cmd, cwd)
+
+        monkeypatch.setattr(nomnom, "_run", stub)
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        monkeypatch.chdir(out_dir)
+        rc = nomnom.cmd_item_job(str(repo), 9876, all_logs=False)
+        assert rc == 0
+        bundles = list(out_dir.glob("p-job-9876-*.txt"))
+        assert len(bundles) == 1
+        text = bundles[0].read_text()
+        for sec in ("job_meta", "steps", "failed_logs"):
+            assert f'<section name="{sec}">' in text
+        assert "build" in text
+        assert "compile" in text
+        assert "failure" in text
+
+
+# ---------- cmd_item dispatcher + id resolver ----------
+
+
+class TestItemDispatcher:
+    def _force_kind_stubs(self, monkeypatch):
+        called: dict = {}
+
+        def stub_pr(repo, n, diff, destination=nomnom.Destination.FILE):
+            called["pr"] = (repo, n, diff)
+            return 0
+
+        def stub_issue(repo, n, destination=nomnom.Destination.FILE):
+            called["issue"] = (repo, n)
+            return 0
+
+        def stub_commit(repo, sha, diff, destination=nomnom.Destination.FILE):
+            called["commit"] = (repo, sha, diff)
+            return 0
+
+        def stub_release(repo, tag, destination=nomnom.Destination.FILE):
+            called["release"] = (repo, tag)
+            return 0
+
+        def stub_run(repo, n, all_logs=False, destination=nomnom.Destination.FILE):
+            called["run"] = (repo, n, all_logs)
+            return 0
+
+        def stub_job(repo, n, all_logs=False, destination=nomnom.Destination.FILE):
+            called["job"] = (repo, n, all_logs)
+            return 0
+
+        def stub_discussion(repo, n, destination=nomnom.Destination.FILE):
+            called["discussion"] = (repo, n)
+            return 0
+
+        monkeypatch.setattr(nomnom, "cmd_item_pr", stub_pr)
+        monkeypatch.setattr(nomnom, "cmd_item_issue", stub_issue)
+        monkeypatch.setattr(nomnom, "cmd_item_commit", stub_commit)
+        monkeypatch.setattr(nomnom, "cmd_item_release", stub_release)
+        monkeypatch.setattr(nomnom, "cmd_item_run", stub_run)
+        monkeypatch.setattr(nomnom, "cmd_item_job", stub_job)
+        monkeypatch.setattr(nomnom, "cmd_item_discussion", stub_discussion)
+        monkeypatch.setattr(nomnom.shutil, "which",
+                            lambda name: f"/usr/bin/{name}")
+        return called
+
+    def test_explicit_kind_routes(self, monkeypatch):
+        called = self._force_kind_stubs(monkeypatch)
+        nomnom.cmd_item(".", "issue", "42")
+        assert called["issue"] == (".", 42)
+
+    def test_explicit_pr_no_id_passes_none(self, monkeypatch):
+        called = self._force_kind_stubs(monkeypatch)
+        nomnom.cmd_item(".", "pr", None)
+        assert called["pr"] == (".", None, False)
+
+    def test_explicit_non_pr_no_id_errors(self, monkeypatch):
+        self._force_kind_stubs(monkeypatch)
+        with pytest.raises(nomnom.NomnomError, match="requires an id"):
+            nomnom.cmd_item(".", "issue", None)
+
+    def test_hex_short_circuits_to_commit(self, monkeypatch):
+        called = self._force_kind_stubs(monkeypatch)
+        nomnom.cmd_item(".", "abc1234def", None, include_diff=True)
+        assert called["commit"] == (".", "abc1234def", True)
+
+    def test_tag_short_circuits_to_release(self, monkeypatch):
+        called = self._force_kind_stubs(monkeypatch)
+        nomnom.cmd_item(".", "v1.2.3", None)
+        assert called["release"] == (".", "v1.2.3")
+
+    def test_unknown_kind_with_ident_errors(self, monkeypatch):
+        self._force_kind_stubs(monkeypatch)
+        with pytest.raises(nomnom.NomnomError, match="unknown kind"):
+            nomnom.cmd_item(".", "foobar", "123")
+
+    def test_non_numeric_pr_id_raises_nomnom_error(self, monkeypatch):
+        self._force_kind_stubs(monkeypatch)
+        with pytest.raises(nomnom.NomnomError, match="invalid pr id"):
+            nomnom.cmd_item(".", "pr", "abc")
+
+    def test_non_numeric_issue_id_raises_nomnom_error(self, monkeypatch):
+        self._force_kind_stubs(monkeypatch)
+        with pytest.raises(nomnom.NomnomError, match="invalid issue id"):
+            nomnom.cmd_item(".", "issue", "x42")
+
+
+class TestProbeNumericId:
+    def test_solo_pr_match(self, tmp_path, monkeypatch):
+        repo = tmp_path / "p"
+        make_git_repo(repo, initial={"a.txt": "1\n"})
+        issue_as_pr = json.dumps({
+            "number": 7, "title": "fix",
+            "pull_request": {"url": "..."},
+        })
+
+        def stub(cmd, cwd):
+            t = tuple(cmd)
+            if t[:2] == ("gh", "api") and "/issues/7" in t[2]:
+                return (0, issue_as_pr, "")
+            if t[:2] == ("gh", "api") and "/actions/runs/7" in t[2]:
+                return (1, "", "not found")
+            return (1, "", "")
+
+        monkeypatch.setattr(nomnom, "_run", stub)
+        matches = nomnom._probe_numeric_id(repo, "owner", "name", 7)
+        assert matches == [("pr", "fix")]
+
+    def test_solo_issue_match(self, tmp_path, monkeypatch):
+        repo = tmp_path / "p"
+        make_git_repo(repo, initial={"a.txt": "1\n"})
+        plain_issue = json.dumps({"number": 8, "title": "bug"})
+
+        def stub(cmd, cwd):
+            t = tuple(cmd)
+            if t[:2] == ("gh", "api") and "/issues/8" in t[2]:
+                return (0, plain_issue, "")
+            return (1, "", "")
+
+        monkeypatch.setattr(nomnom, "_run", stub)
+        matches = nomnom._probe_numeric_id(repo, "owner", "name", 8)
+        assert matches == [("issue", "bug")]
+
+    def test_no_matches(self, tmp_path, monkeypatch):
+        repo = tmp_path / "p"
+        make_git_repo(repo, initial={"a.txt": "1\n"})
+
+        def stub(cmd, cwd):
+            return (1, "", "")
+
+        monkeypatch.setattr(nomnom, "_run", stub)
+        assert nomnom._probe_numeric_id(repo, "owner", "name", 99) == []
+
+    def test_ambiguous_issue_and_run(self, tmp_path, monkeypatch):
+        repo = tmp_path / "p"
+        make_git_repo(repo, initial={"a.txt": "1\n"})
+        issue = json.dumps({"number": 5, "title": "report"})
+        run = json.dumps({
+            "name": "Release", "display_title": "ship",
+            "workflow_name": "Release",
+        })
+
+        def stub(cmd, cwd):
+            t = tuple(cmd)
+            if t[:2] == ("gh", "api") and "/issues/5" in t[2]:
+                return (0, issue, "")
+            if t[:2] == ("gh", "api") and "/actions/runs/5" in t[2]:
+                return (0, run, "")
+            return (1, "", "")
+
+        monkeypatch.setattr(nomnom, "_run", stub)
+        matches = nomnom._probe_numeric_id(repo, "owner", "name", 5)
+        kinds = [m[0] for m in matches]
+        assert "issue" in kinds and "run" in kinds
+
+
+class TestClassifyItemId:
+    @pytest.mark.parametrize("value,expected", [
+        ("abc1234", "commit"),
+        ("abc1234deadbeef0000000000000000000000000", "commit"),
+        ("v1.2.3", "release"),
+        ("rel-2026", "release"),
+        ("123", None),  # ambiguous numeric
+        ("", None),
+        ("0123abc1234567", "commit"),  # 14-char hex still counts as commit
+    ])
+    def test_classify(self, value, expected):
+        assert nomnom._classify_item_id(value) == expected
+
+
+# ---------- pick_item_output_path ----------
+
+
+class TestPickItemOutputPath:
+    def test_includes_kind_and_ident(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        p = nomnom.pick_item_output_path("repo", "pr", "123")
+        assert p.parent == tmp_path
+        assert p.name.startswith("repo-pr-123-")
+        assert p.suffix == ".txt"
+
+    def test_slugifies_tag(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        p = nomnom.pick_item_output_path("repo", "release", "v1/2.3")
+        # forward slashes become double-underscore via _slug
+        assert "v1__2.3" in p.name
 
 
 # ---------- pick_git_output_path ----------
