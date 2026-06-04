@@ -1234,6 +1234,23 @@ class TestItemScreen:
             "diff": True, "dest": nomnom.Destination.CLIPBOARD,
         }
 
+    def test_kind_prefix_input_routes_explicit_kind(self, monkeypatch):
+        called: dict = {}
+
+        def fake_cmd_item(
+            repo, kind_or_id, ident=None, *,
+            include_diff=False, all_logs=False, destination,
+        ):
+            called["kind_or_id"] = kind_or_id
+            called["ident"] = ident
+            return 0
+        monkeypatch.setattr(nomnom, "cmd_item", fake_cmd_item)
+        s = nomnom.ItemScreen()
+        s.repo_buf = "/tmp/r"
+        s.id_buf = "discussion 7"
+        s.handle_key(10)
+        assert called == {"kind_or_id": "discussion", "ident": "7"}
+
 
 class _FakeStdscr:
     """Just enough stdscr surface for SendScreen / ReceiveScreen tests."""
@@ -2880,6 +2897,38 @@ class TestItemReleaseBundle:
         with pytest.raises(nomnom.NomnomError, match="not found"):
             nomnom.cmd_item_release(str(repo), "v9.9.9")
 
+    def test_tag_with_slash_is_url_encoded(self, tmp_path, monkeypatch):
+        """Tags with `/` (e.g. `releases/v1.2.3`) must be percent-encoded so
+        the slash doesn't break out of the `/releases/tags/{tag}` path."""
+        repo = tmp_path / "p"
+        make_git_repo(repo, initial={"a.txt": "1\n"})
+        monkeypatch.setattr(nomnom.shutil, "which",
+                            lambda name: f"/usr/bin/{name}")
+        observed: list[str] = []
+        release_payload = json.dumps({
+            "tag_name": "releases/v1.2.3", "name": "n",
+            "html_url": "u", "author": {"login": "a"},
+            "target_commitish": "main",
+            "body": "", "assets": [],
+        })
+        original = nomnom._run
+
+        def stub(cmd, cwd):
+            t = tuple(cmd)
+            if t[:3] == ("gh", "repo", "view"):
+                return (0, "owner/name\n", "")
+            if t[:2] == ("gh", "api"):
+                observed.append(t[2])
+                return (0, release_payload, "")
+            return original(cmd, cwd)
+
+        monkeypatch.setattr(nomnom, "_run", stub)
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        monkeypatch.chdir(out_dir)
+        nomnom.cmd_item_release(str(repo), "releases/v1.2.3")
+        assert any("releases%2Fv1.2.3" in u for u in observed), observed
+
 
 # ---------- cmd_item_run / cmd_item_job ----------
 
@@ -3100,6 +3149,16 @@ class TestItemDispatcher:
         self._force_kind_stubs(monkeypatch)
         with pytest.raises(nomnom.NomnomError, match="unknown kind"):
             nomnom.cmd_item(".", "foobar", "123")
+
+    def test_non_numeric_pr_id_raises_nomnom_error(self, monkeypatch):
+        self._force_kind_stubs(monkeypatch)
+        with pytest.raises(nomnom.NomnomError, match="invalid pr id"):
+            nomnom.cmd_item(".", "pr", "abc")
+
+    def test_non_numeric_issue_id_raises_nomnom_error(self, monkeypatch):
+        self._force_kind_stubs(monkeypatch)
+        with pytest.raises(nomnom.NomnomError, match="invalid issue id"):
+            nomnom.cmd_item(".", "issue", "x42")
 
 
 class TestProbeNumericId:

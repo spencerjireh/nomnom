@@ -2249,8 +2249,15 @@ def cmd_item_pr(
         raise NomnomError(f"gh pr view returned invalid json: {e}") from e
 
     def _api_json(args: list[str]) -> object:
-        rc, out, _ = _run(args, root)
-        if rc != 0 or not out.strip():
+        rc, out, err = _run(args, root)
+        if rc != 0:
+            msg = err.strip() or out.strip() or "(no error message)"
+            print(
+                f"warn: {' '.join(args[:3])} … exited {rc}: {msg}",
+                file=sys.stderr,
+            )
+            return None
+        if not out.strip():
             return None
         try:
             return json.loads(out)
@@ -2353,8 +2360,15 @@ def _resolve_owner_repo(root: Path) -> tuple[str, str]:
 
 
 def _gh_api_json(root: Path, args: list[str]) -> object:
-    rc, out, _ = _run(args, root)
-    if rc != 0 or not out.strip():
+    rc, out, err = _run(args, root)
+    if rc != 0:
+        msg = err.strip() or out.strip() or "(no error message)"
+        print(
+            f"warn: {' '.join(args[:3])} … exited {rc}: {msg}",
+            file=sys.stderr,
+        )
+        return None
+    if not out.strip():
         return None
     try:
         return json.loads(out)
@@ -2784,8 +2798,9 @@ def cmd_item_release(
 
     owner, name = _resolve_owner_repo(root)
 
+    encoded_tag = urllib.parse.quote(tag_or_id, safe="")
     release = _gh_api_json(root, [
-        "gh", "api", f"repos/{owner}/{name}/releases/tags/{tag_or_id}",
+        "gh", "api", f"repos/{owner}/{name}/releases/tags/{encoded_tag}",
     ])
     if not isinstance(release, dict) and tag_or_id.isdigit():
         release = _gh_api_json(root, [
@@ -3066,24 +3081,41 @@ def _probe_numeric_id(
     return matches
 
 
+def _parse_item_int(kind: str, ident: str) -> int:
+    try:
+        return int(ident)
+    except (TypeError, ValueError) as e:
+        raise NomnomError(f"invalid {kind} id: {ident!r}") from e
+
+
 def _dispatch_item_kind(
     repo: str, kind: str, ident: str,
     include_diff: bool, all_logs: bool, destination: Destination,
 ) -> int:
     if kind == "pr":
-        return cmd_item_pr(repo, int(ident), include_diff, destination)
+        return cmd_item_pr(
+            repo, _parse_item_int("pr", ident), include_diff, destination,
+        )
     if kind == "issue":
-        return cmd_item_issue(repo, int(ident), destination)
+        return cmd_item_issue(
+            repo, _parse_item_int("issue", ident), destination,
+        )
     if kind == "discussion":
-        return cmd_item_discussion(repo, int(ident), destination)
+        return cmd_item_discussion(
+            repo, _parse_item_int("discussion", ident), destination,
+        )
     if kind == "commit":
         return cmd_item_commit(repo, ident, include_diff, destination)
     if kind == "release":
         return cmd_item_release(repo, ident, destination)
     if kind == "run":
-        return cmd_item_run(repo, int(ident), all_logs, destination)
+        return cmd_item_run(
+            repo, _parse_item_int("run", ident), all_logs, destination,
+        )
     if kind == "job":
-        return cmd_item_job(repo, int(ident), all_logs, destination)
+        return cmd_item_job(
+            repo, _parse_item_int("job", ident), all_logs, destination,
+        )
     raise NomnomError(f"unknown item kind: {kind!r}")
 
 
@@ -6754,7 +6786,7 @@ class BundleScreen(Screen):
                         )
                     rc = cmd_item(
                         str(root), result.item_kind, result.item_id,
-                        include_diff=True,
+                        include_diff=False,
                         destination=result.destination,
                     )
         except NomnomError as e:
@@ -7083,8 +7115,13 @@ class ItemScreen(_GitContextScreen):
         id_text = self.id_buf.strip()
         if not id_text:
             raise NomnomError("item id is required")
+        parts = id_text.split(maxsplit=1)
+        if len(parts) == 2 and parts[0] in ITEM_KINDS:
+            kind_or_id, ident = parts[0], parts[1]
+        else:
+            kind_or_id, ident = id_text, None
         return cmd_item(
-            self.repo_buf.strip(), id_text, None,
+            self.repo_buf.strip(), kind_or_id, ident,
             include_diff=self.include_diff,
             destination=self.destination,
         )
@@ -7226,6 +7263,7 @@ def _prompt_item_id(
         body = [
             title, "", prompt, "",
             "  number / sha / tag — nomnom infers the kind",
+            "  or `<kind> <id>` (e.g. `discussion 7`, `job 42`)",
         ]
         if status:
             body.append(f"  {status}")
@@ -7242,6 +7280,9 @@ def _prompt_item_id(
             value = buf.strip()
             if not value:
                 continue
+            parts = value.split(maxsplit=1)
+            if len(parts) == 2 and parts[0] in ITEM_KINDS:
+                return (parts[0], parts[1])
             inferred = _classify_item_id(value)
             if inferred == "commit":
                 return ("commit", value)

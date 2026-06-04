@@ -98,7 +98,7 @@ nomnom item run 123456 [--all-logs]  # workflow run jobs + failing-step logs
 nomnom item job 67890 [--all-logs]   # single job + steps + logs
 ```
 
-`commit` errors on a clean tree. `pr` and `item` require [`gh`](https://cli.github.com); `pr` auto-detects the base. `nomnom item <id>` infers the kind: hex strings → commit, non-numeric tag-like strings → release, pure numbers run a parallel probe of pr / issue / workflow run and either auto-route on a unique hit or refuse with a disambiguation hint. `discussion` and `job` ids live in their own namespaces so they need explicit `nomnom item discussion <n>` / `nomnom item job <n>`. `pr` and `commit` honor `--diff` (off by default); `run` and `job` default to failing-step logs, `--all-logs` includes everything. Each verb accepts `--clipboard` or `--stdout`.
+`commit` errors on a clean tree. `pr` and `item` require [`gh`](https://cli.github.com); `pr` auto-detects the base. `nomnom item <id>` infers the kind: hex strings → commit, non-numeric tag-like strings → release, pure numbers fan out two parallel `gh api` calls to `/issues/{n}` and `/actions/runs/{n}` (the issues endpoint serves both issues and PRs — PR responses carry a `pull_request` key, which is how `item` tells them apart). It auto-routes on a unique hit and refuses with a disambiguation hint when multiple match. `discussion` and `job` ids live in their own namespaces so they need explicit `nomnom item discussion <n>` / `nomnom item job <n>`. `pr` and `commit` honor `--diff` (off by default); `run` and `job` default to failing-step logs, `--all-logs` includes everything. Each verb accepts `--clipboard` or `--stdout`.
 
 ## Rebuild
 
