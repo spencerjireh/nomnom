@@ -8,56 +8,32 @@
 // over the ciphertext). The relay's HMAC authenticates the client to the
 // Worker; it does not vouch for what the client is sending.
 
-import { bytesToHex, constantTimeEqualHex } from "./crypto-util";
+import {
+  constantTimeEqualHex,
+  hmacSha256Hex,
+  parseSignedAuth,
+  type AuthResult,
+} from "./crypto-util";
 
-const TIMESTAMP_WINDOW_SEC = 300;
+export type { AuthResult } from "./crypto-util";
+
 const AUTH_PREFIX = "NMNM-HMAC-SHA256 ";
-
-export type AuthResult =
-  | { ok: true }
-  | { ok: false; status: number; reason: string };
 
 export async function verifyHmac(
   req: Request,
   secret: string,
 ): Promise<AuthResult> {
   const header = req.headers.get("Authorization") ?? "";
-  if (!header.startsWith(AUTH_PREFIX)) {
-    return { ok: false, status: 401, reason: "missing-mac" };
-  }
-  const rest = header.slice(AUTH_PREFIX.length);
-  const colon = rest.indexOf(":");
-  if (colon < 0) {
-    return { ok: false, status: 401, reason: "bad-mac" };
-  }
-  const tsStr = rest.slice(0, colon);
-  const macHex = rest.slice(colon + 1).toLowerCase();
-  const ts = Number.parseInt(tsStr, 10);
-  if (!Number.isFinite(ts) || tsStr !== String(ts)) {
-    return { ok: false, status: 401, reason: "bad-mac" };
-  }
-  const now = Math.floor(Date.now() / 1000);
-  if (Math.abs(now - ts) > TIMESTAMP_WINDOW_SEC) {
-    return { ok: false, status: 401, reason: "clock-skew" };
-  }
+  const parsed = parseSignedAuth(header, AUTH_PREFIX, {
+    missing: "missing-mac",
+    bad: "bad-mac",
+  });
+  if ("ok" in parsed) return parsed;
   const url = new URL(req.url);
-  const msg = `${req.method}\n${url.pathname}\n${tsStr}`;
+  const msg = `${req.method}\n${url.pathname}\n${parsed.tsStr}`;
   const expected = await hmacSha256Hex(secret, msg);
-  if (!constantTimeEqualHex(expected, macHex)) {
+  if (!constantTimeEqualHex(expected, parsed.macHex)) {
     return { ok: false, status: 401, reason: "bad-mac" };
   }
   return { ok: true };
-}
-
-async function hmacSha256Hex(secret: string, msg: string): Promise<string> {
-  const enc = new TextEncoder();
-  const key = await crypto.subtle.importKey(
-    "raw",
-    enc.encode(secret),
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["sign"],
-  );
-  const sig = await crypto.subtle.sign("HMAC", key, enc.encode(msg));
-  return bytesToHex(new Uint8Array(sig));
 }

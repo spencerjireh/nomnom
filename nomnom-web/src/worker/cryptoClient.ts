@@ -74,7 +74,9 @@ class CryptoClient {
     });
   }
 
-  /** Terminate the worker (cancelling in-flight work) and reject all pending. */
+  /** Terminate the worker (cancelling in-flight work) and reject all pending.
+   * factoryReset depends on this fully tearing down, so we always terminate
+   * the worker even when nothing is currently pending. */
   cancel(): void {
     if (this.worker) {
       this.worker.terminate();

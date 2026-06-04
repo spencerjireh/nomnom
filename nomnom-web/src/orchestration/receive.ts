@@ -6,6 +6,7 @@
 import { cryptoClient } from "../worker/cryptoClient";
 import { feedContext, refreshRoster, type TofuHooks } from "./feed-actions";
 import { RELAY_WAIT_MS } from "../config";
+import type { FeedHeader } from "../crypto/feeds";
 import type { Feed, Identity, Member, OnProgress } from "../types";
 
 export interface ReceivedFile {
@@ -72,7 +73,7 @@ export async function runReceive(p: ReceiveParams): Promise<number> {
     for (const entry of slots) {
       if (p.signal.aborted) break;
       const slotId = entry.slot_id;
-      const createdAt = entry.created_at || 0;
+      const createdAt = entry.created_at ?? 0;
       if (!slotId) continue;
 
       let raw: ArrayBuffer | null;
@@ -88,7 +89,8 @@ export async function runReceive(p: ReceiveParams): Promise<number> {
         continue;
       }
 
-      let header, body: ArrayBuffer;
+      let header: FeedHeader;
+      let body: ArrayBuffer;
       try {
         const opened = await cryptoClient.feedOpen({
           feedKeyHex: ctx.feedKeyHex,

@@ -3408,6 +3408,8 @@ _ED_D = -121665 * pow(121666, _ED_P - 2, _ED_P) % _ED_P
 _ED_I = pow(2, (_ED_P - 1) // 4, _ED_P)
 
 # Extended Edwards point: (X, Y, Z, T). Affine = (X/Z, Y/Z); T = XY/Z.
+# Module-level type alias (runtime expression): typing.Tuple keeps this working
+# on Python 3.8, where `tuple[...]` is not yet subscriptable at runtime.
 _EdPoint = Tuple[int, int, int, int]
 
 
@@ -5894,7 +5896,7 @@ class Screen:
     def render(self, stdscr) -> None:  # pragma: no cover - curses I/O
         raise NotImplementedError
 
-    def handle_key(self, ch: int, stdscr=None):  # -> ScreenAction | Screen  # pragma: no cover
+    def handle_key(self, ch: int, stdscr=None) -> ScreenAction | Screen:  # pragma: no cover
         raise NotImplementedError
 
 

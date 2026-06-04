@@ -21,10 +21,10 @@
 
 import { verifyHmac } from "./auth";
 import { verifyFeedKey } from "./feed-auth";
+import { errorResponse } from "./http";
 import {
   closeFeed,
   deleteMember,
-  errorResponse,
   extendFeed,
   getFeedMeta,
   getFeedSlot,
@@ -62,8 +62,7 @@ function corsHeaders(req: Request): Record<string, string> {
 }
 
 function withCors(res: Response, req: Request): Response {
-  const h = corsHeaders(req);
-  for (const k in h) res.headers.set(k, h[k]);
+  for (const [k, v] of Object.entries(corsHeaders(req))) res.headers.set(k, v);
   return res;
 }
 

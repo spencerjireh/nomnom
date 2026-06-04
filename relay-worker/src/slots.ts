@@ -9,7 +9,7 @@
 // objects older than 1 day so orphans (sender abandons after PUT, etc.)
 // don't accumulate. See relay-worker/README.md for the dashboard step.
 
-import { errorResponse } from "./feeds";
+import { errorResponse } from "./http";
 import { pollSlot } from "./poll";
 
 const SLOT_TTL_SEC = 300; // 5 minutes from PUT to expiry
