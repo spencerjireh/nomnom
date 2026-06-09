@@ -724,12 +724,14 @@ class Destination(enum.IntEnum):
     FILE = 0
     CLIPBOARD = 1
     STDOUT = 2
+    SEND = 3
 
 
 _DESTINATION_LABELS = {
     Destination.FILE: "file",
     Destination.CLIPBOARD: "clipboard",
     Destination.STDOUT: "stdout",
+    Destination.SEND: "send",
 }
 
 
@@ -900,13 +902,16 @@ def _picker_ui(
             dest = Destination.FILE
         return PickResult(set(), dest, initial_include_tree)
 
-    cycle_allowed: tuple[Destination, ...] | None
+    # STDOUT only when a TTY-free pipe is allowed (CLI); SEND only when a
+    # default feed exists to broadcast to.
+    base = [Destination.FILE, Destination.CLIPBOARD]
     if allow_stdout:
-        cycle_allowed = None
-    else:
-        cycle_allowed = (Destination.FILE, Destination.CLIPBOARD)
-        if initial_destination == Destination.STDOUT:
-            initial_destination = Destination.FILE
+        base.append(Destination.STDOUT)
+    if _has_send_target():
+        base.append(Destination.SEND)
+    cycle_allowed: tuple[Destination, ...] = tuple(base)
+    if initial_destination not in cycle_allowed:
+        initial_destination = Destination.FILE
 
     verb_allowed: tuple[Verb, ...] = (
         (Verb.BUNDLE, Verb.COMMIT, Verb.PR, Verb.ITEM)
@@ -1567,6 +1572,12 @@ def _emit_git_bundle(
         sys.stdout.flush()
         print(f"wrote {size:,} bytes to stdout.", file=sys.stderr)
         return 0
+
+    if destination == Destination.SEND:
+        rc, lines = _emit_to_feed(output.encode("utf-8"), _out_path().name)
+        for ln in lines:
+            print(ln, file=sys.stderr)
+        return rc
 
     print(file=sys.stderr)
     print(f"  sections: {len(sections)}", file=sys.stderr)
@@ -3836,6 +3847,15 @@ def _tofu_check_feed_member(
                 f"{_ik_fingerprint(sig_pub)})\n",
             )
         return True
+    # Inside the curses TUI, stdin/stderr are owned by curses (and may be
+    # captured), so input() can't prompt. A handler installed via
+    # `_tui_tofu` renders a modal instead and returns the user's choice.
+    handler = _TUI_TOFU_HANDLER
+    if handler is not None:
+        if handler(card):
+            _save_feed_pin(sig_pub, name)
+            return True
+        return False
     _tofu_assert_main_thread()
     sys.stderr.write("\n")
     sys.stderr.write(f"  first contact with {name!r}.\n")
@@ -5024,6 +5044,82 @@ def _refresh_roster_with_tofu(
     return roster
 
 
+def _feed_send_bytes(
+    target: "Feed", data: bytes, filename: str, *, trust_new: bool = False,
+) -> list[str]:
+    """Encrypt and broadcast `data` into `target`. Returns status lines.
+
+    Refreshes the roster (running TOFU on any newly-seen identities) before
+    sealing, so member counts are accurate and senders are authenticated.
+    Raises NomnomError on oversize input or a relay failure.
+    """
+    if len(data) > _RELAY_MAX_BODY:
+        raise NomnomError(
+            f"too large for relay ({len(data)} bytes; limit {_RELAY_MAX_BODY}).",
+        )
+    feed_key = _feed_key_from_token(target.feed_token)
+    host, _ = _parse_feed_url(target.url)
+
+    # Always-fresh roster on send: accurate member counts + TOFU on new identities.
+    roster = _refresh_roster_with_tofu(target, host, feed_key, trust_new=trust_new)
+    if roster is None:
+        raise NomnomError("could not refresh feed roster.")
+    others = [m for m in roster if m.get("member_id") != target.member_id]
+    lines: list[str] = []
+    if not others:
+        lines.append(
+            f"warning: feed {target.name!r} has no other members; the post "
+            "will sit until someone joins or the feed expires.",
+        )
+
+    ident = _load_identity()
+    blob = feed_seal(
+        feed_key=feed_key,
+        feed_id=target.feed_id,
+        sender_member_id=target.member_id,
+        sender_sig_priv_hex=ident["sig_priv"],
+        sender_sig_pub_hex=ident["sig_pub"],
+        filename=filename,
+        body=data,
+    )
+    slot_id = secrets.token_urlsafe(12)
+    _relay_put_feed_slot(host, target.feed_id, feed_key, slot_id, blob)
+    # Persist the cache refresh.
+    cfg = _load_feeds_config()
+    existing = _find_feed(cfg, target.name)
+    if existing is not None:
+        existing.members_cache = roster
+        _save_feeds_config(cfg)
+    lines.append(
+        f"sent {filename!r} ({len(data)} bytes) to feed {target.name!r} "
+        f"({len(others)} recipient(s)).",
+    )
+    return lines
+
+
+def _has_send_target() -> bool:
+    """True when a default feed is configured (so SEND is a usable destination)."""
+    try:
+        return _default_feed(_load_feeds_config()) is not None
+    except Exception:
+        return False
+
+
+def _emit_to_feed(data: bytes, filename: str) -> tuple[int, list[str]]:
+    """Broadcast already-rendered bytes to the default feed. (rc, status lines).
+
+    The SEND destination for bundle/commit/pr/item routes here. Targets the
+    default feed (switch it via the Feeds screen). Never raises.
+    """
+    target = _default_feed(_load_feeds_config())
+    if target is None:
+        return 1, ["no default feed; open or join one first."]
+    try:
+        return 0, _feed_send_bytes(target, data, _safe_filename(filename))
+    except NomnomError as e:
+        return 1, [f"send failed: {e}"]
+
+
 def cmd_send(path: str, *, feed: str | None = None, trust_new: bool = False) -> int:
     """Broadcast a file into the default feed (or --feed)."""
     p = Path(path).expanduser()
@@ -5050,46 +5146,13 @@ def cmd_send(path: str, *, feed: str | None = None, trust_new: bool = False) -> 
     target = _resolve_target_feed(feed)
     if target is None:
         return 1
-    feed_key = _feed_key_from_token(target.feed_token)
-    host, _ = _parse_feed_url(target.url)
-
-    # Always-fresh roster on send: accurate member counts + TOFU on new identities.
-    roster = _refresh_roster_with_tofu(target, host, feed_key, trust_new=trust_new)
-    if roster is None:
-        return 1
-    others = [m for m in roster if m.get("member_id") != target.member_id]
-    if not others:
-        sys.stderr.write(
-            f"warning: feed {target.name!r} has no other members; the post "
-            "will sit until someone joins or the feed expires.\n",
-        )
-
-    ident = _load_identity()
-    blob = feed_seal(
-        feed_key=feed_key,
-        feed_id=target.feed_id,
-        sender_member_id=target.member_id,
-        sender_sig_priv_hex=ident["sig_priv"],
-        sender_sig_pub_hex=ident["sig_pub"],
-        filename=p.name,
-        body=data,
-    )
-    slot_id = secrets.token_urlsafe(12)
     try:
-        _relay_put_feed_slot(host, target.feed_id, feed_key, slot_id, blob)
+        lines = _feed_send_bytes(target, data, p.name, trust_new=trust_new)
     except NomnomError as e:
         sys.stderr.write(f"error: {e}\n")
         return 1
-    # Persist the cache refresh.
-    cfg = _load_feeds_config()
-    existing = _find_feed(cfg, target.name)
-    if existing is not None:
-        existing.members_cache = roster
-        _save_feeds_config(cfg)
-    sys.stderr.write(
-        f"sent {p.name!r} ({len(data)} bytes) to feed {target.name!r} "
-        f"({len(others)} recipient(s)).\n",
-    )
+    for ln in lines:
+        sys.stderr.write(ln + "\n")
     return 0
 
 
@@ -5106,7 +5169,8 @@ def _receive_one_post(
 ) -> tuple[str, int, str, str] | None:
     """Fetch and verify a single post. Returns (filename, bytes, sender_name, out_path).
 
-    Returns None when the slot disappeared (already cleaned up). Raises
+    Returns None when the slot disappeared (already cleaned up) or the post
+    is this device's own broadcast (nothing to write back). Raises
     NomnomError on tamper / signature failure / unknown sender.
     """
     raw = _relay_get_feed_slot(host, feed.feed_id, feed_key, slot_id)
@@ -5120,6 +5184,8 @@ def _receive_one_post(
     except ValueError as e:
         raise NomnomError(f"feed post rejected: {e}") from e
     sender_id = header.get("smid")
+    if sender_id == feed.member_id:
+        return None  # our own broadcast comes back on the feed; don't rewrite it
     sender_pub = header.get("sik")
     sender_name = "(unknown)"
     for m in feed.members_cache or []:
@@ -5899,6 +5965,12 @@ class Screen:
     def handle_key(self, ch: int, stdscr=None) -> ScreenAction | Screen:  # pragma: no cover
         raise NotImplementedError
 
+    def on_idle(self, stdscr) -> ScreenAction | Screen:  # pragma: no cover
+        """Called when getch() times out (the screen set a non-blocking
+        timeout). Screens that poll (e.g. the receiver) do their work here;
+        the default is a no-op redraw."""
+        return ScreenAction.CONTINUE
+
 
 def show_help_modal(stdscr, lines: list[str]) -> None:  # pragma: no cover
     """Centered modal listing keybindings. Closes on any key.
@@ -5936,6 +6008,11 @@ def show_help_modal(stdscr, lines: list[str]) -> None:  # pragma: no cover
 
 _TUI_ACTIVE = False
 
+# When set (inside the curses TUI), `_tofu_check_feed_member` calls this
+# instead of input() to prompt for first-contact trust. Installed via
+# `_tui_tofu`; takes a member card dict and returns True to pin.
+_TUI_TOFU_HANDLER = None
+
 
 def _in_tui() -> bool:
     """True while `run_app` (the curses launcher) owns the terminal.
@@ -5944,6 +6021,63 @@ def _in_tui() -> bool:
     branch on this to avoid corrupting the curses display.
     """
     return _TUI_ACTIVE
+
+
+@contextlib.contextmanager
+def _tui_tofu(stdscr):  # pragma: no cover - curses I/O
+    """Install a curses TOFU prompt for the duration of a feed operation.
+
+    Feed send/receive may surface a first-contact prompt; inside curses that
+    must be a modal, not input(). Restores the previous handler on exit so
+    nesting is safe.
+    """
+    global _TUI_TOFU_HANDLER
+    prev = _TUI_TOFU_HANDLER
+    _TUI_TOFU_HANDLER = lambda card: _tofu_modal(stdscr, card)
+    try:
+        yield
+    finally:
+        _TUI_TOFU_HANDLER = prev
+
+
+def _tofu_modal(stdscr, card: dict) -> bool:  # pragma: no cover - curses I/O
+    """Blocking y/N modal for a first-contact feed identity. Returns True to pin."""
+    name = card.get("name") or "(no name)"
+    fp = _ik_fingerprint(card.get("identity_pubkey") or "")
+    rows = [
+        " first contact ".center(40, "─"),
+        f" {name}",
+        f"   fingerprint: {fp}",
+        " verify out-of-band if it matters.",
+        "─" * 40,
+        " trust and pin this device?  [y/N] ",
+    ]
+    h, w = stdscr.getmaxyx()
+    box_w = min(w - 2, max(len(r) for r in rows) + 2)
+    box_h = min(h - 2, len(rows) + 2)
+    y0 = max(0, (h - box_h) // 2)
+    x0 = max(0, (w - box_w) // 2)
+    for i in range(box_h):
+        try:
+            stdscr.addstr(y0 + i, x0, " " * box_w, curses.A_REVERSE)
+        except curses.error:
+            pass
+    for i, line in enumerate(rows[: box_h - 1]):
+        try:
+            stdscr.addstr(y0 + 1 + i, x0 + 1, line[: box_w - 2], curses.A_REVERSE)
+        except curses.error:
+            pass
+    stdscr.refresh()
+    try:
+        stdscr.timeout(-1)
+    except curses.error:
+        pass
+    while True:
+        ch = stdscr.getch()
+        if ch in (ord("y"), ord("Y")):
+            return True
+        if ch in (ord("n"), ord("N"), ord("q"), 3, 27, 10, 13, -1):
+            return False
 
 
 def run_app(initial: Screen) -> None:  # pragma: no cover - curses I/O
@@ -5958,15 +6092,18 @@ def run_app(initial: Screen) -> None:  # pragma: no cover - curses I/O
             current.render(stdscr)
             stdscr.refresh()
             ch = stdscr.getch()
-            if ch in (curses.KEY_RESIZE, -1):
-                # -1 means a non-blocking getch timed out; the active screen
-                # has set its own poll interval (e.g. for a progress bar) and
-                # wants the loop to re-render.
+            if ch == curses.KEY_RESIZE:
                 continue
-            if ch == ord("?"):
+            if ch == -1:
+                # Non-blocking getch timed out; the active screen set its own
+                # poll interval and gets an idle tick to do work (e.g. the
+                # receiver long-polls; a progress bar just redraws).
+                result = current.on_idle(stdscr)
+            elif ch == ord("?"):
                 show_help_modal(stdscr, current.help_lines)
                 continue
-            result = current.handle_key(ch, stdscr)
+            else:
+                result = current.handle_key(ch, stdscr)
             if isinstance(result, Screen):
                 stack.append(result)
             elif result == ScreenAction.BACK:
@@ -5994,8 +6131,8 @@ class LauncherScreen(Screen):
         self.cursor = 0
         self.tiles: list[tuple[str, str]] = [
             ("Bundle",     "Pick files and write a bundle .txt"),
-            ("Send",       "Broadcast a file to your default feed (CLI)"),
-            ("Receive",    "Watch a feed for incoming posts (CLI)"),
+            ("Send",       "Pick files (or v: commit/pr/item), send to a feed"),
+            ("Receive",    "Watch the default feed for incoming files"),
             ("Feeds",      "List, leave, and inspect joined feeds"),
             ("Commit",     "Bundle staged/unstaged diffs + recent commits"),
             ("PR",         "Bundle commits since base + diff for an LLM"),
@@ -6062,18 +6199,11 @@ def _launcher_open(verb: str):
     if verb == "Item":
         return ItemScreen()
     if verb == "Send":
-        return PlaceholderScreen(
-            "Send",
-            "Run `nomnom send <file>` from the shell to broadcast to your "
-            "default feed. The CLI is the source of truth in feeds v2; the "
-            "in-curses sender is being rebuilt around the new transport.",
-        )
+        # Send is a destination, not a separate flow: open the picker, then
+        # cycle the destination to "send" (v cycles bundle/commit/pr/item).
+        return BundleScreen()
     if verb == "Receive":
-        return PlaceholderScreen(
-            "Receive",
-            "Run `nomnom receive` from the shell to watch your default "
-            "feed. The in-curses receiver is being rebuilt around feeds.",
-        )
+        return ReceiveScreen()
     return PlaceholderScreen(
         verb,
         f"`nomnom {verb.lower()}` works from the shell.",
@@ -6111,6 +6241,152 @@ class PlaceholderScreen(Screen):
 
     def handle_key(self, ch: int, stdscr=None):
         if ch in (ord("q"), 3, 27):
+            return ScreenAction.BACK
+        return ScreenAction.CONTINUE
+
+
+class ReceiveScreen(Screen):
+    """Watch the default feed for incoming posts, writing each to cwd.
+
+    Cooperative short-poll: `run_app` hands us idle ticks via `on_idle`,
+    where we run one bounded long-poll (`_POLL_MS`) and process any slots.
+    Keys stay responsive between polls. Esc/q stops. First-contact prompts
+    surface as a modal via `_tui_tofu`.
+    """
+
+    title = "Receive"
+    help_lines = [
+        "watching the default feed; files land in the current directory",
+        "esc / q     stop and return to the launcher",
+    ]
+    _POLL_MS = 700
+
+    def __init__(self) -> None:
+        self.received: list[str] = []
+        self.status = ""
+        self.error = ""
+        self.feed = _default_feed(_load_feeds_config())
+        self.host = ""
+        self.feed_key = b""
+        self.last_ts = 0
+        if self.feed is None:
+            self.error = (
+                "no default feed. open one (`nomnom open`) or join one "
+                "(`nomnom join <url>`), then set it default in Feeds."
+            )
+            return
+        try:
+            self.feed_key = _feed_key_from_token(self.feed.feed_token)
+            self.host, _ = _parse_feed_url(self.feed.url)
+        except NomnomError as e:
+            self.error = str(e)
+            self.feed = None
+            return
+        self.last_ts = self.feed.last_post_ts
+        self.status = f"watching {self.feed.name!r}..."
+
+    def render(self, stdscr) -> None:  # pragma: no cover - curses I/O
+        theme = _setup_theme()
+        try:
+            stdscr.timeout(self._POLL_MS)
+        except curses.error:
+            pass
+        h, w = stdscr.getmaxyx()
+        try:
+            stdscr.addstr(0, 0, f" {self.title} ".ljust(max(1, w - 1)),
+                          theme["filter"])
+        except curses.error:
+            pass
+        if self.error:
+            for i, line in enumerate(_wrap(self.error, max(10, w - 4))):
+                try:
+                    stdscr.addstr(2 + i, 2, line, theme["dim"])
+                except curses.error:
+                    pass
+        else:
+            if not self.received:
+                try:
+                    stdscr.addstr(2, 2, "nothing received yet — waiting...",
+                                  theme["dim"])
+                except curses.error:
+                    pass
+            # Show the most recent arrivals that fit.
+            visible = self.received[-(h - 5):] if h > 6 else self.received[-1:]
+            for i, line in enumerate(visible):
+                row = 2 + i
+                if row >= h - 2:
+                    break
+                try:
+                    stdscr.addstr(row, 2, line[: max(1, w - 3)], 0)
+                except curses.error:
+                    pass
+            if self.status:
+                try:
+                    stdscr.addstr(h - 2, 2, self.status[: max(1, w - 3)],
+                                  theme["dim"])
+                except curses.error:
+                    pass
+        footer = "esc/q:stop  ?:help" if not self.error else "esc/q:back"
+        try:
+            stdscr.addstr(h - 1, 0, footer[: max(1, w - 1)], theme["dim"])
+        except curses.error:
+            pass
+
+    def on_idle(self, stdscr) -> ScreenAction:  # pragma: no cover - curses I/O
+        if self.feed is None:
+            return ScreenAction.CONTINUE
+        # Redirect stderr: the feed helpers narrate to it, which would corrupt
+        # curses. The TOFU modal draws via curses directly, so it's unaffected.
+        err_buf = io.StringIO()
+        with _tui_tofu(stdscr), contextlib.redirect_stderr(err_buf):
+            roster = _refresh_roster_with_tofu(
+                self.feed, self.host, self.feed_key, trust_new=False,
+            )
+            if roster is not None:
+                self.feed.members_cache = roster
+            try:
+                slots = _relay_list_feed_slots(
+                    self.host, self.feed.feed_id, self.feed_key,
+                    since_ts=self.last_ts, wait_ms=self._POLL_MS,
+                )
+            except NomnomError as e:
+                self.status = f"relay error: {e}"
+                return ScreenAction.CONTINUE
+            for entry in slots:
+                slot_id = entry.get("slot_id")
+                created_at = int(entry.get("created_at") or 0)
+                if slot_id:
+                    try:
+                        res = _receive_one_post(
+                            feed=self.feed, host=self.host,
+                            feed_key=self.feed_key, slot_id=slot_id,
+                        )
+                    except (NomnomError, OSError) as e:
+                        self.status = f"dropped a post: {e}"
+                        res = None
+                    if res is not None:
+                        filename, nbytes, sender, out_path = res
+                        self.received.append(
+                            f"{filename} ({nbytes:,} bytes) from {sender} -> {out_path}",
+                        )
+                        self.status = f"received {filename!r}"
+                if created_at > self.last_ts:
+                    self.last_ts = created_at
+        # Persist last_post_ts so a restart doesn't re-fetch.
+        cfg_now = _load_feeds_config()
+        existing = _find_feed(cfg_now, self.feed.name)
+        if existing is not None and existing.last_post_ts != self.last_ts:
+            existing.last_post_ts = self.last_ts
+            _save_feeds_config(cfg_now)
+        return ScreenAction.CONTINUE
+
+    def handle_key(self, ch: int, stdscr=None):
+        if ch in (ord("q"), 3, 27):
+            if stdscr is not None:
+                try:
+                    stdscr.timeout(-1)
+                except curses.error:
+                    pass
             return ScreenAction.BACK
         return ScreenAction.CONTINUE
 
@@ -6735,7 +7011,7 @@ class BundleScreen(Screen):
             return False
 
         if result.verb != Verb.BUNDLE:
-            self._run_git_verb(result, root)
+            self._run_git_verb(result, root, stdscr)
             self.step = "done"
             return True
 
@@ -6748,7 +7024,10 @@ class BundleScreen(Screen):
 
         out_buf = io.StringIO()
         err_buf = io.StringIO()
-        with contextlib.redirect_stdout(out_buf), \
+        # _tui_tofu turns any first-contact prompt during a SEND into a modal
+        # (the redirected streams can't host input()).
+        with _tui_tofu(stdscr), \
+             contextlib.redirect_stdout(out_buf), \
              contextlib.redirect_stderr(err_buf):
             rc, lines = _emit_bundle(
                 repo_name, root, selected, result.include_tree,
@@ -6764,18 +7043,20 @@ class BundleScreen(Screen):
         self.step = "done"
         return True
 
-    def _run_git_verb(self, result, root: Path) -> None:
+    def _run_git_verb(self, result, root: Path, stdscr) -> None:
         """Run cmd_commit / cmd_pr / cmd_item without disturbing curses.
 
         The handlers print progress to stdout/stderr; redirect both into
         StringIO buffers and route them through `self.messages` so the
-        BundleScreen's render path owns the screen state.
+        BundleScreen's render path owns the screen state. `_tui_tofu` hosts
+        any first-contact prompt as a modal when the destination is SEND.
         """
         out_buf = io.StringIO()
         err_buf = io.StringIO()
         rc = 0
         try:
-            with contextlib.redirect_stdout(out_buf), \
+            with _tui_tofu(stdscr), \
+                 contextlib.redirect_stdout(out_buf), \
                  contextlib.redirect_stderr(err_buf):
                 if result.verb == Verb.COMMIT:
                     rc = cmd_commit(str(root), destination=result.destination)
@@ -6887,10 +7168,10 @@ class _GitContextScreen(Screen):
         return [("repo", "Repo path:"), ("dest", "Destination:")]
 
     def _cycle_dest(self) -> None:
-        self.destination = cycle_destination(
-            self.destination,
-            (Destination.FILE, Destination.CLIPBOARD),
-        )
+        allowed = (Destination.FILE, Destination.CLIPBOARD)
+        if _has_send_target():
+            allowed += (Destination.SEND,)
+        self.destination = cycle_destination(self.destination, allowed)
 
     def _run_cmd(self) -> int:
         """Subclass hook: dispatch to cmd_commit/pr/item with collected
@@ -6898,13 +7179,16 @@ class _GitContextScreen(Screen):
         caller."""
         raise NotImplementedError
 
-    def _execute(self) -> None:
+    def _execute(self, stdscr) -> None:
         self.error = ""
         self.output_lines = []
         out_buf = io.StringIO()
         err_buf = io.StringIO()
         try:
-            with contextlib.redirect_stdout(out_buf), \
+            # _tui_tofu hosts any first-contact prompt as a modal when the
+            # destination is SEND (redirected streams can't host input()).
+            with _tui_tofu(stdscr), \
+                 contextlib.redirect_stdout(out_buf), \
                  contextlib.redirect_stderr(err_buf):
                 self.rc = self._run_cmd()
         except NomnomError as e:
@@ -6994,7 +7278,7 @@ class _GitContextScreen(Screen):
                 self._cycle_dest()
                 return ScreenAction.CONTINUE
             if ch in (10, 13):
-                self._execute()
+                self._execute(stdscr)
                 return ScreenAction.CONTINUE
             fid = self.fields[self.field_cursor][0]
             self._edit_field(fid, ch)
@@ -7830,6 +8114,9 @@ def _emit_bundle(
         sys.stdout.write(output)
         sys.stdout.flush()
         return 0, [f"wrote {len(output):,} bytes to stdout."]
+
+    if destination == Destination.SEND:
+        return _emit_to_feed(output.encode("utf-8"), pick_output_path(repo_name).name)
 
     messages: list[str] = []
     if destination == Destination.CLIPBOARD:

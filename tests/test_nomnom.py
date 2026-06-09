@@ -522,8 +522,11 @@ class TestCycleDestination:
     def test_clipboard_to_stdout(self):
         assert nomnom.cycle_destination(nomnom.Destination.CLIPBOARD) == nomnom.Destination.STDOUT
 
-    def test_stdout_wraps_to_file(self):
-        assert nomnom.cycle_destination(nomnom.Destination.STDOUT) == nomnom.Destination.FILE
+    def test_stdout_to_send(self):
+        assert nomnom.cycle_destination(nomnom.Destination.STDOUT) == nomnom.Destination.SEND
+
+    def test_send_wraps_to_file(self):
+        assert nomnom.cycle_destination(nomnom.Destination.SEND) == nomnom.Destination.FILE
 
     def test_allowed_subset_cycles_without_stdout(self):
         allowed = (nomnom.Destination.FILE, nomnom.Destination.CLIPBOARD)
@@ -3944,6 +3947,183 @@ class TestCmdSendFeed:
     def test_send_nonexistent_file_errors(self, env, capsys):
         rc = nomnom.cmd_send("/nope/does/not/exist.txt")
         assert rc == 1
+
+
+class TestSendDestination:
+    """`Destination.SEND` — broadcasting bundle/commit/pr/item to a feed."""
+
+    @pytest.fixture
+    def env(self, tmp_path, monkeypatch):
+        """Configured default feed + mocked relay PUT/roster. Returns
+        (tmp_path, feed, posts) where posts records each Worker PUT."""
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        ident = nomnom._load_identity()
+        member_id = "a" * 32
+        token = nomnom.secrets.token_urlsafe(9)
+        feed = nomnom.Feed(
+            name="home",
+            feed_id=token,
+            feed_token=token,
+            url=f"https://relay.example.com/f/{token}",
+            expires_at=2_000_000_000,
+            joined_at=1_700_000_000,
+            member_id=member_id,
+            members_cache=[
+                {"member_id": member_id, "identity_pubkey": ident["sig_pub"],
+                 "name": ident["name"]},
+            ],
+        )
+        cfg = nomnom._empty_feeds_config()
+        nomnom._add_or_replace_feed(cfg, feed)
+        nomnom._save_feeds_config(cfg)
+        posts: list = []
+        monkeypatch.setattr(
+            nomnom, "_relay_list_members",
+            lambda *a, **k: {"members": feed.members_cache},
+        )
+        monkeypatch.setattr(
+            nomnom, "_relay_put_feed_slot",
+            lambda host, fid, fkey, slot_id, body: posts.append(
+                {"slot_id": slot_id, "body": body, "feed_id": fid},
+            ),
+        )
+        return tmp_path, feed, posts
+
+    def test_label(self):
+        assert nomnom._DESTINATION_LABELS[nomnom.Destination.SEND] == "send"
+
+    def test_cycle_includes_send_when_allowed(self):
+        D = nomnom.Destination
+        allowed = (D.FILE, D.CLIPBOARD, D.SEND)
+        assert nomnom.cycle_destination(D.CLIPBOARD, allowed) == D.SEND
+        assert nomnom.cycle_destination(D.SEND, allowed) == D.FILE
+
+    def test_cycle_snaps_when_send_not_allowed(self):
+        D = nomnom.Destination
+        # If we somehow hold SEND but it isn't allowed, snap to the first.
+        assert nomnom.cycle_destination(D.SEND, (D.FILE, D.CLIPBOARD)) == D.FILE
+
+    def test_has_send_target_false_without_feed(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        assert nomnom._has_send_target() is False
+
+    def test_has_send_target_true_with_default_feed(self, env):
+        assert nomnom._has_send_target() is True
+
+    def test_emit_to_feed_no_default_feed(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        rc, lines = nomnom._emit_to_feed(b"payload", "x.txt")
+        assert rc == 1
+        assert any("no default feed" in line for line in lines)
+
+    def test_emit_to_feed_sends(self, env):
+        _tmp, feed, posts = env
+        rc, lines = nomnom._emit_to_feed(b"payload", "x.txt")
+        assert rc == 0
+        assert len(posts) == 1
+        feed_key = nomnom._feed_key_from_token(feed.feed_token)
+        header, body = nomnom.feed_open(
+            feed_key=feed_key, feed_id=feed.feed_id, blob=posts[0]["body"],
+        )
+        assert body == b"payload"
+        assert header["fn"] == "x.txt"
+
+    def test_emit_bundle_send_destination(self, env, monkeypatch):
+        tmp_path, feed, posts = env
+        repo = tmp_path / "proj"
+        make_repo(repo, {"a.py": "print('a')\n"})
+        monkeypatch.chdir(tmp_path)
+        rc, lines = nomnom._emit_bundle(
+            repo.name, repo, ["a.py"], True, nomnom.Destination.SEND,
+        )
+        assert rc == 0
+        assert len(posts) == 1
+        assert any("sent " in line for line in lines)
+        feed_key = nomnom._feed_key_from_token(feed.feed_token)
+        _header, body = nomnom.feed_open(
+            feed_key=feed_key, feed_id=feed.feed_id, blob=posts[0]["body"],
+        )
+        assert b'<file path="a.py">' in body
+
+    def test_emit_git_bundle_send_destination(self, env, capsys):
+        _tmp, feed, posts = env
+        rc = nomnom._emit_git_bundle(
+            "proj", "commit", "main",
+            [("status", "M a.py")], None, nomnom.Destination.SEND,
+        )
+        assert rc == 0
+        assert len(posts) == 1
+        assert "sent " in capsys.readouterr().err
+
+    def test_emit_bundle_send_without_feed_reports(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        repo = tmp_path / "proj"
+        make_repo(repo, {"a.py": "x\n"})
+        monkeypatch.chdir(tmp_path)
+        rc, lines = nomnom._emit_bundle(
+            repo.name, repo, ["a.py"], False, nomnom.Destination.SEND,
+        )
+        assert rc == 1
+        assert any("no default feed" in line for line in lines)
+
+
+class TestTofuHandler:
+    """The TUI installs a modal handler so TOFU works without input()."""
+
+    def test_handler_used_when_set(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        monkeypatch.setattr(
+            "builtins.input",
+            lambda *a, **k: pytest.fail("input() must not fire when handler set"),
+        )
+        monkeypatch.setattr(nomnom, "_TUI_TOFU_HANDLER", lambda _card: True)
+        card = {"member_id": "m1", "identity_pubkey": "bb" * 32, "name": "bob"}
+        assert nomnom._tofu_check_feed_member(card) is True
+        assert nomnom._find_pinned_sig("bb" * 32) is not None
+
+    def test_handler_decline_does_not_pin(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        monkeypatch.setattr(nomnom, "_TUI_TOFU_HANDLER", lambda _card: False)
+        card = {"member_id": "m1", "identity_pubkey": "cc" * 32, "name": "carol"}
+        assert nomnom._tofu_check_feed_member(card) is False
+        assert nomnom._find_pinned_sig("cc" * 32) is None
+
+    def test_input_still_used_when_no_handler(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        monkeypatch.setattr(nomnom, "_TUI_TOFU_HANDLER", None)
+        monkeypatch.setattr("builtins.input", lambda *a, **k: "y")
+        card = {"member_id": "m1", "identity_pubkey": "dd" * 32, "name": "dave"}
+        assert nomnom._tofu_check_feed_member(card) is True
+
+
+class TestReceiveOnePostSkipsOwn:
+    def test_own_broadcast_returns_none(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        ident = nomnom._load_identity()
+        token = nomnom.secrets.token_urlsafe(9)
+        member_id = "a" * 32
+        feed = nomnom.Feed(
+            name="home", feed_id=token, feed_token=token,
+            url=f"https://relay.example.com/f/{token}",
+            expires_at=2_000_000_000, joined_at=1_700_000_000,
+            member_id=member_id,
+        )
+        feed_key = nomnom._feed_key_from_token(token)
+        blob = nomnom.feed_seal(
+            feed_key=feed_key, feed_id=feed.feed_id,
+            sender_member_id=member_id,
+            sender_sig_priv_hex=ident["sig_priv"],
+            sender_sig_pub_hex=ident["sig_pub"],
+            filename="mine.txt", body=b"loopback",
+        )
+        monkeypatch.setattr(nomnom, "_relay_get_feed_slot", lambda *a, **k: blob)
+        monkeypatch.chdir(tmp_path)
+        res = nomnom._receive_one_post(
+            feed=feed, host="relay.example.com", feed_key=feed_key, slot_id="s1",
+        )
+        assert res is None
+        # Nothing written back to disk.
+        assert not list(tmp_path.glob("mine*.txt"))
 
 
 class TestCmdReceiveFeed:
