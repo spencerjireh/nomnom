@@ -4,6 +4,12 @@
 
 Single-file Python CLI that bundles a repo into one `.txt` for an LLM. Stdlib only — no install, no venv, no deps.
 
+It does three things:
+
+- **Bundle** a repo (or git/PR/issue context) into one text file shaped for an LLM.
+- **Send** that file between your own machines over an end-to-end encrypted channel.
+- **Rebuild** the original tree on the other side.
+
 ## Install
 
 ```sh
@@ -19,7 +25,7 @@ nomnom .
 
 Opens a picker for the current directory. Pick files, hit `Enter`, get `./<repo>-<timestamp>.txt`. `.gitignore`, junk dirs (`.git`, `node_modules`, …), binaries, symlinks, and obvious secrets are skipped before the picker loads.
 
-Bare `nomnom` on a TTY opens a launcher with tiles for Bundle, Send, Receive, Feeds, Commit, PR, Item, Rebuild, and Extensions. Inside the picker, `v` cycles bundle / `commit` / `pr` / `item` when run from inside a git repo.
+Run bare `nomnom` on a TTY to open a launcher with tiles for Bundle, Send, Receive, Feeds, Commit, PR, Item, Rebuild, and Extensions. Inside the picker, `v` cycles bundle / `commit` / `pr` / `item` when run from inside a git repo.
 
 Output mirrors [repomix](https://github.com/yamadashy/repomix)'s shape:
 
@@ -98,7 +104,9 @@ nomnom item run 123456 [--all-logs]  # workflow run jobs + failing-step logs
 nomnom item job 67890 [--all-logs]   # single job + steps + logs
 ```
 
-`commit` errors on a clean tree. `pr` and `item` require [`gh`](https://cli.github.com); `pr` auto-detects the base. `nomnom item <id>` infers the kind: hex strings → commit, non-numeric tag-like strings → release, pure numbers fan out two parallel `gh api` calls to `/issues/{n}` and `/actions/runs/{n}` (the issues endpoint serves both issues and PRs — PR responses carry a `pull_request` key, which is how `item` tells them apart). It auto-routes on a unique hit and refuses with a disambiguation hint when multiple match. `discussion` and `job` ids live in their own namespaces so they need explicit `nomnom item discussion <n>` / `nomnom item job <n>`. `pr` and `commit` honor `--diff` (off by default); `run` and `job` default to failing-step logs, `--all-logs` includes everything. Each verb accepts `--clipboard` or `--stdout`.
+`commit` errors on a clean tree. `pr` and `item` require [`gh`](https://cli.github.com); `pr` auto-detects the base.
+
+`nomnom item <id>` figures out what you mean from the id: hex → commit, tag-like → release, plain number → a PR, issue, or workflow run (it auto-routes on a unique hit and asks you to disambiguate otherwise). `discussion` and `job` ids overlap with those, so name them explicitly: `nomnom item discussion <n>` / `nomnom item job <n>`. `pr` and `commit` honor `--diff` (off by default); `run` and `job` show failing-step logs by default, `--all-logs` includes everything. Every verb accepts `--clipboard` or `--stdout`.
 
 ## Rebuild
 
@@ -112,55 +120,66 @@ nomnom rebuild bundle.txt --name scratch # override folder name
 
 Never overwrites. Path-escape attempts (absolute paths, `..` segments) are refused. Git-context bundles aren't reconstructable and error out.
 
-## Send between machines (via your own relay)
+## Send between machines
 
-`open`, `join`, `send`, and `receive` move files between machines through a
-**feed** on a Cloudflare Worker you deploy to your own account. A feed is a
-durable broadcast channel: one device mints it and shares a short URL; every
-other device pastes the URL to join. Sends to a feed reach every member; the
-URL is the credential. The relay sees only ciphertext + opaque slot ids.
+Move a bundle (or any file) between your own devices over an end-to-end encrypted channel. No accounts and no shared third-party server — traffic flows through a small Cloudflare Worker you run yourself, and it only ever sees ciphertext.
 
-### One-time setup
+Think of a **feed** as a shared channel, a bit like a group chat for files: one device opens it and gets a short URL; any device that pastes the URL joins. Anything you `send` reaches every other member. The URL is the password — but even a leaked URL can't impersonate a sender (see [Trust on first use](#trust) below).
 
-Deploy the Worker (see [`relay-worker/README.md`](relay-worker/README.md)). On the device that will own this relay:
+Four verbs: `open` · `join` · `send` · `receive`.
+
+### Open a channel and invite a device
 
 ```sh
-nomnom relay init            # prompts for Worker URL; generates the HMAC secret
-                             # used to mint feeds; prints the `wrangler` commands
-                             # to push the secret and deploy.
-```
-
-### Open a feed and invite other devices
-
-```sh
-# device 1 (with relay configured)
+# device 1 (relay already configured — see setup below)
 nomnom open --name home --default
 # opened feed 'home' (TTL 86400s, expires at 1717459200).
 # share this URL with the other device:
 # https://relay.your-subdomain.workers.dev/f/k4n2pX9qLm3T
 
-# device 2 (no relay setup needed on this side — the URL is the credential)
+# device 2 (nothing to set up on this side — the URL is the credential)
 nomnom join 'https://relay.your-subdomain.workers.dev/f/k4n2pX9qLm3T'
 # joined feed 'feed-1' with 2 member(s).
 ```
 
-You can also open multiple feeds (`home`, `work`, etc.); `nomnom feeds default <name>` switches which feed `send`/`receive` use by default.
+Open as many feeds as you like (`home`, `work`, …); `nomnom feeds default <name>` picks which one `send`/`receive` use by default.
 
-### Day-to-day
+### Send and receive
 
 ```sh
 nomnom receive                       # watch the default feed; one line per received file
 nomnom send report.txt               # broadcast to every other member of the default feed
-nomnom send report.txt --feed work   # broadcast to a different joined feed
+nomnom send report.txt --feed work   # target a specific joined feed
 ```
 
-`receive` keeps the long-poll alive after each delivery, so you can leave a laptop listening and fire off `send` from another machine all afternoon. Pass `--once` to exit after the first received file (for scripting).
+`receive` stays open after each delivery, so you can leave a laptop listening and fire off `send` from another machine all afternoon. Pass `--once` to exit after the first file (handy for scripting).
 
-Each post is encrypted with the feed key derived from the URL token, and signed by the sender's Ed25519 identity key. Receivers verify the signature against the sender's pinned identity — a hostile relay (or a URL leak) can't impersonate a member without their identity private key.
+Max transfer size is 256 MB (100 MB on Cloudflare's free tier — see [`relay-worker/README.md`](relay-worker/README.md)).
 
-`--trust-new` auto-pins TOFU prompts (scriptable but loses verification; an audit line is still written to stderr). Max transfer size: 256 MB (capped at 100 MB on Cloudflare's free tier — see relay-worker/README.md).
+### From a browser
 
-### Managing feeds
+[`nomnom-web/`](nomnom-web/README.md) is a browser client (Vite + React) that joins the same feeds as the CLI — its crypto is a byte-for-byte TypeScript port of `nomnom.py`. It's deployed to Cloudflare Pages, and the relay Worker allowlists its origin for CORS.
+
+<details>
+<summary><b>First-time setup: deploy your relay</b></summary>
+
+`send`/`receive` need a relay — a small Cloudflare Worker you deploy once to your own account. It only ever sees ciphertext and opaque slot ids.
+
+1. Deploy the Worker — see [`relay-worker/README.md`](relay-worker/README.md).
+2. On the device that will own the relay:
+
+   ```sh
+   nomnom relay init    # prompts for the Worker URL, generates the HMAC secret
+                        # used to mint feeds, and prints the wrangler commands
+                        # to push the secret and deploy.
+   ```
+
+Other devices don't need any of this — they just `join` a feed URL. To let another device mint its own feeds on your relay, copy the token from `nomnom relay show --token` over to it.
+
+</details>
+
+<details>
+<summary><b>Managing feeds</b></summary>
 
 ```sh
 nomnom feeds list                                  # joined feeds + default marker + TTL
@@ -172,28 +191,12 @@ nomnom feeds extend home --ttl 604800              # bump expiry to a week from 
 nomnom feeds leave home                            # delete this device's member card, drop locally
 ```
 
-### Pinned identities
-
-Sender authenticity is the load-bearing TOFU surface in v2: the first time
-any feed introduces an identity that this device has never seen, you get a
-prompt. After accepting, that identity is trusted globally — joining another
-feed where the same person already participates is silent.
-
-```sh
-nomnom peers list                    # show pinned identities + fingerprints
-nomnom peers fingerprint alice-mac   # for out-of-band verification
-nomnom peers forget alice-mac        # drop a pin (TOFU fires fresh on next sighting)
-```
-
-### From a browser
-
-[`nomnom-web/`](nomnom-web/README.md) is a browser client (Vite + React) that
-participates in the same feeds as the CLI. Its crypto is a byte-for-byte
-TypeScript port of `nomnom.py`. Deployed to Cloudflare Pages; the relay
-Worker allowlists its origin for CORS.
+</details>
 
 <details>
-<summary><b>Trust on first use</b></summary>
+<summary><b><a name="trust"></a>Trust on first use</b></summary>
+
+Every post is encrypted with the feed key derived from the URL token and signed by the sender's Ed25519 identity. Receivers verify the signature against the sender's pinned identity, so a hostile relay (or a leaked URL) can't impersonate a member without their private key.
 
 Each machine mints a long-term Ed25519 identity in `~/.config/nomnom/identity.json` on first run. The first time you see a member's identity across all feeds, nomnom prompts:
 
@@ -204,9 +207,15 @@ Each machine mints a long-term Ed25519 identity in `~/.config/nomnom/identity.js
   trust and pin this device? [y/N]:
 ```
 
-Once pinned, that identity is trusted in every feed it appears in. Possessing a feed URL grants access to that one feed, but never impersonates anyone — the signature is the trust anchor, not the URL.
+Once pinned, that identity is trusted in every feed it appears in — joining another feed where the same person already participates is silent. Possessing a feed URL grants access to that one feed, but never impersonates anyone: the signature is the trust anchor, not the URL.
 
-`--trust-new` skips the prompt for scripted callers and writes an audit line to stderr.
+```sh
+nomnom peers list                    # show pinned identities + fingerprints
+nomnom peers fingerprint alice-mac   # for out-of-band verification
+nomnom peers forget alice-mac        # drop a pin (TOFU fires fresh on next sighting)
+```
+
+`--trust-new` auto-pins TOFU prompts for scripted callers (loses interactive verification; an audit line is still written to stderr).
 
 </details>
 
@@ -226,7 +235,7 @@ This split means a feed URL can be safely shared cross-account: the recipient ge
 </details>
 
 <details>
-<summary><b>Config commands</b></summary>
+<summary><b>All send/receive commands</b></summary>
 
 | Command | Effect |
 | --- | --- |
