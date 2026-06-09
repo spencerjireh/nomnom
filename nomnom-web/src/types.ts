@@ -15,7 +15,10 @@ export interface Member {
   joined_at?: number;
 }
 
-/** A feed this device has opened or joined. Shape mirrors the CLI's feeds.json. */
+/** A feed this device has opened or joined. Shape mirrors the CLI's feeds.json,
+ * plus a local-only `auto_save` toggle: when true, received files decrypt
+ * straight to disk; when false (the safe default) they hold in the timeline
+ * awaiting an explicit [save] / [discard]. */
 export interface Feed {
   name: string; // local nickname
   feed_id: string;
@@ -26,6 +29,7 @@ export interface Feed {
   member_id: string; // this device's id within the feed
   members_cache: Member[];
   last_post_ts: number;
+  auto_save: boolean;
 }
 
 /**
@@ -72,12 +76,30 @@ export interface TransferResult {
   outName?: string;
 }
 
-/** A file pulled off a feed during a receive watch (already downloaded). */
-export interface ReceivedItem {
+/** A row in a feed's session timeline — either a file we sent or a file we
+ * received. `body` is only attached while a received file is held awaiting
+ * [save]/[discard]; saving or discarding drops the reference. */
+export type TimelineKind = "send" | "receive";
+export type TimelineStatus =
+  | "in_flight"   // send: still encrypting/uploading
+  | "served"      // send: delivered
+  | "saved"       // receive: written to Downloads (or already-trusted auto-save)
+  | "held"        // receive: decrypted, waiting for the user to save or discard
+  | "discarded"   // receive: user discarded a held file
+  | "failed";     // send: error
+
+export interface TimelineEntry {
+  id: string;
+  kind: TimelineKind;
   name: string;
   bytes: number;
-  peerName: string;
   at: number; // epoch ms
+  status: TimelineStatus;
+  peerName?: string;   // receive only
+  recipients?: number; // send only
+  progress?: number;   // 0..1, for in_flight sends
+  error?: string;      // failed sends
+  body?: ArrayBuffer;  // only present while status === "held"
 }
 
 /** The synthetic global pin id for an Ed25519 identity (matches CLI `_feed_peer_id`). */

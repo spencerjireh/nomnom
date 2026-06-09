@@ -1,6 +1,6 @@
 import { useEffect } from "react";
 import { useStore } from "./state/store";
-import { TabShell } from "./components/TabShell";
+import { Shell } from "./components/Shell";
 
 export function App() {
   const identity = useStore((s) => s.identity);
@@ -13,5 +13,5 @@ export function App() {
   // can join a feed by URL with no relay. Relay setup (needed only to OPEN a feed)
   // lives in Settings. Wait for hydrate() to seed the identity before rendering.
   if (!identity) return null;
-  return <TabShell />;
+  return <Shell />;
 }

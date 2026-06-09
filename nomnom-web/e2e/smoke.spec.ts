@@ -3,11 +3,11 @@ import { mkdtempSync, truncateSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-// Offline, secret-free smoke test of the nomnom-web UI. We never hit the relay:
-// the app is usable with no relay (join-only), and feed state is seeded into
-// localStorage directly (shapes mirror src/state/persistence.ts) instead of
-// opening/joining over the network. See playwright.config.ts for why interop
-// lives elsewhere.
+// Offline, secret-free smoke test of the nomnom-web feed-timeline UI. We never
+// hit the relay: the app is usable with no relay (join-only), and feed state is
+// seeded into localStorage directly (shapes mirror src/state/persistence.ts)
+// instead of opening/joining over the network. See playwright.config.ts for why
+// interop lives elsewhere.
 
 const MAX_PAYLOAD_BYTES = 100 * 1024 * 1024; // keep in sync with src/config.ts
 
@@ -27,7 +27,6 @@ const RELAY = JSON.stringify({
   secret: "not-a-real-secret",
 });
 const FEEDS = JSON.stringify({
-  default: "home",
   feeds: [
     {
       name: "home",
@@ -42,60 +41,83 @@ const FEEDS = JSON.stringify({
         { member_id: PEER_MEMBER, identity_pubkey: PEER_SIG_PUB, name: "test-peer" },
       ],
       last_post_ts: 0,
+      auto_save: false,
     },
   ],
 });
 
-/** Seed a device. `withFeed` adds the `home` feed; `withRelay` adds a relay. */
+interface SeedOptions {
+  withFeed?: boolean;
+  withRelay?: boolean;
+  selectFeed?: string | null;
+}
+
+/** Seed a device. `withFeed` adds the `home` feed; `withRelay` adds a relay;
+ * `selectFeed` writes the last-selected-feed pointer (drives initial pane). */
 async function seed(
   page: Page,
-  { withFeed = true, withRelay = false } = {},
+  { withFeed = true, withRelay = false, selectFeed = null }: SeedOptions = {},
 ): Promise<void> {
   await page.addInitScript(
-    ([identity, feeds, relay, hasFeed, hasRelay]) => {
+    ([identity, feeds, relay, hasFeed, hasRelay, sel]) => {
       localStorage.setItem("nomnom:schema", "2");
       localStorage.setItem("nomnom:identity", identity as string);
       if (hasFeed) localStorage.setItem("nomnom:feeds", feeds as string);
       if (hasRelay) localStorage.setItem("nomnom:relay", relay as string);
+      if (sel) localStorage.setItem("nomnom:lastSelectedFeed", JSON.stringify(sel));
     },
-    [IDENTITY, FEEDS, RELAY, withFeed, withRelay] as const,
+    [IDENTITY, FEEDS, RELAY, withFeed, withRelay, selectFeed] as const,
   );
 }
 
-test.describe("nomnom-web UI smoke (offline, secret-free)", () => {
-  test("loads straight into the tab shell — no relay needed", async ({ page }) => {
+test.describe("nomnom-web feed-timeline UI smoke (offline, secret-free)", () => {
+  test("with no feeds and no relay, the warm empty pane is the right pane", async ({ page }) => {
     await seed(page, { withFeed: false });
     await page.goto("/");
 
-    await expect(page.getByRole("tab", { name: "feeds" })).toBeVisible();
-    await expect(page.getByRole("tab", { name: "send" })).toBeVisible();
-    await expect(page.getByRole("tab", { name: "receive" })).toBeVisible();
-    // Rail shows we can join but not open without a relay.
-    await expect(page.getByText("none (join-only)")).toBeVisible();
-    await expect(page.getByText("no feeds yet.")).toBeVisible();
+    await expect(page.getByRole("heading", { name: "a warm place to drop a file" })).toBeVisible();
+    await expect(page.getByText(/open a feed \(you host\)/)).toBeVisible();
+    // Without a relay, opening is gated.
     await expect(page.getByText(/opening a feed needs a relay/)).toBeVisible();
+    // Rail still offers join even without a relay.
+    await expect(page.getByRole("button", { name: "+ join" })).toBeEnabled();
+    await expect(page.getByRole("button", { name: "+ open" })).toBeDisabled();
   });
 
-  test("a seeded feed lists in the feeds tab with members", async ({ page }) => {
+  test("a seeded feed appears in the rail and opens into the timeline pane", async ({ page }) => {
     await seed(page);
     await page.goto("/");
 
-    await expect(page.getByText("home", { exact: true })).toBeVisible();
-    await expect(page.getByText("default", { exact: true })).toBeVisible();
-    await page.getByRole("button", { name: /members \(2\)/ }).click();
+    // Rail shows the feed; nothing selected yet → empty pane on the right.
+    const feedRow = page.getByRole("button", { name: /home/ });
+    await expect(feedRow).toBeVisible();
+    await expect(page.getByRole("heading", { name: "a warm place to drop a file" })).toBeVisible();
+
+    await feedRow.click();
+
+    // Feed view header + empty timeline state.
+    await expect(page.getByRole("heading", { name: "home" })).toBeVisible();
+    await expect(page.getByText("nothing here yet.")).toBeVisible();
+    // Other-members count rendered.
+    await expect(page.getByText("1 other")).toBeVisible();
+
+    // Members footer collapses by default; expanding lists members.
+    await page.getByText(/members \(2\)/).click();
     await expect(page.getByText("test-peer")).toBeVisible();
+    await expect(page.getByLabel(/auto-save files from this feed/)).not.toBeChecked();
   });
 
-  test("send tab targets the feed and rejects a file over the 100 MB cap", async ({ page }) => {
-    await seed(page);
+  test("the composer rejects a file over the 100 MB cap", async ({ page }) => {
+    await seed(page, { selectFeed: "home" });
     await page.goto("/");
-    await page.getByRole("tab", { name: "send" }).click();
 
-    // 1 other member should receive.
-    await expect(page.getByText(/1 other member will receive this/)).toBeVisible();
+    // Feed pre-selected via lastSelectedFeed.
+    await expect(page.getByRole("heading", { name: "home" })).toBeVisible();
+    const sendBtn = page.getByRole("button", { name: /serve it up/ });
+    await expect(sendBtn).toBeDisabled(); // nothing staged yet
 
-    // A sparse file just over the cap: the app reads only `file.size` on the
-    // reject path (never the bytes), so this costs no real I/O.
+    // A sparse file just over the cap — the dropzone reads only `file.size` on
+    // the reject path (no bytes touched), so this costs no real I/O.
     const dir = mkdtempSync(join(tmpdir(), "nomnom-e2e-"));
     const tooBig = join(dir, "too-big.bin");
     writeFileSync(tooBig, "");
@@ -103,19 +125,10 @@ test.describe("nomnom-web UI smoke (offline, secret-free)", () => {
     await page.locator('input[type="file"]').setInputFiles(tooBig);
 
     await expect(page.getByText(/too big/)).toBeVisible();
-    await expect(page.getByRole("button", { name: /serve it up/ })).toBeDisabled();
+    await expect(sendBtn).toBeDisabled();
   });
 
-  test("send/receive tabs show the empty state with no feeds", async ({ page }) => {
-    await seed(page, { withFeed: false });
-    await page.goto("/");
-    await page.getByRole("tab", { name: "send" }).click();
-    await expect(page.getByText(/open or join one in the Feeds tab/)).toBeVisible();
-    await page.getByRole("tab", { name: "receive" }).click();
-    await expect(page.getByText(/open or join a feed first/)).toBeVisible();
-  });
-
-  test("settings reset wipes feeds back to empty", async ({ page }) => {
+  test("factory reset wipes the seeded feed back to the empty pane", async ({ page }) => {
     await seed(page);
     await page.goto("/");
 
@@ -123,17 +136,16 @@ test.describe("nomnom-web UI smoke (offline, secret-free)", () => {
     await page.getByRole("button", { name: "reset this device" }).click();
     await page.getByRole("button", { name: "wipe everything" }).click();
 
-    // Still in the tab shell (no onboarding gate), but the feed is gone.
-    await expect(page.getByRole("tab", { name: "feeds" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "a warm place to drop a file" })).toBeVisible();
     await expect(page.getByText("no feeds yet.")).toBeVisible();
   });
 
-  test("feed state survives a reload", async ({ page }) => {
-    await seed(page);
+  test("lastSelectedFeed restores the feed view after a reload", async ({ page }) => {
+    await seed(page, { selectFeed: "home" });
     await page.goto("/");
-    await expect(page.getByText("home", { exact: true })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "home" })).toBeVisible();
 
     await page.reload();
-    await expect(page.getByText("home", { exact: true })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "home" })).toBeVisible();
   });
 });

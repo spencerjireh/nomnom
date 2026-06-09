@@ -14,14 +14,15 @@ const K = {
   feeds: "nomnom:feeds",
   peers: "nomnom:peers",
   schema: "nomnom:schema",
+  lastSelectedFeed: "nomnom:lastSelectedFeed",
 } as const;
 
 // Schema 2 = feeds v2 (Ed25519 identity). A schema-1 (legacy DH) identity is
-// incompatible and gets discarded on hydrate.
+// incompatible and gets discarded on hydrate. Adding per-feed `auto_save` is
+// not a schema bump — missing fields are filled with safe defaults on load.
 export const SCHEMA = 2;
 
 export interface FeedsConfig {
-  default: string | null;
   feeds: Feed[];
 }
 
@@ -53,8 +54,9 @@ function isFeedIdentity(id: unknown): id is Identity {
   );
 }
 
-/** True if the stored value has the shape of a feeds-v2 Feed record. */
-function isFeed(f: unknown): f is Feed {
+/** Tolerant feed shape check: requires the wire fields, leaves `auto_save`
+ * optional so legacy feeds (saved before the toggle existed) load cleanly. */
+function isFeed(f: unknown): f is Omit<Feed, "auto_save"> & { auto_save?: boolean } {
   if (!f || typeof f !== "object") return false;
   const x = f as Feed;
   return (
@@ -84,15 +86,31 @@ export const persistence = {
   saveRelay: (cfg: RelayConfig): void => write(K.relay, cfg),
 
   loadFeeds: (): FeedsConfig => {
-    const cfg = read<FeedsConfig>(K.feeds);
-    if (!cfg || !Array.isArray(cfg.feeds)) return { default: null, feeds: [] };
-    const feeds = cfg.feeds.filter(isFeed);
-    const def = typeof cfg.default === "string" && feeds.some((f) => f.name === cfg.default)
-      ? cfg.default
-      : null;
-    return { default: def, feeds };
+    // Tolerate both the new {feeds:[...]} shape and the legacy {default,feeds:[...]}
+    // shape — older installs are read straight through, with auto_save defaulted off.
+    const cfg = read<{ feeds?: unknown }>(K.feeds);
+    if (!cfg || !Array.isArray(cfg.feeds)) return { feeds: [] };
+    const feeds: Feed[] = [];
+    for (const raw of cfg.feeds) {
+      if (!isFeed(raw)) continue;
+      feeds.push({ ...(raw as Feed), auto_save: raw.auto_save === true });
+    }
+    return { feeds };
   },
   saveFeeds: (cfg: FeedsConfig): void => write(K.feeds, cfg),
+
+  loadLastSelectedFeed: (): string | null => read<string>(K.lastSelectedFeed),
+  saveLastSelectedFeed: (name: string | null): void => {
+    if (name === null) {
+      try {
+        localStorage.removeItem(K.lastSelectedFeed);
+      } catch {
+        // ignore
+      }
+    } else {
+      write(K.lastSelectedFeed, name);
+    }
+  },
 
   loadPeers: (): PeerStore => read<PeerStore>(K.peers) ?? {},
   savePeers: (peers: PeerStore): void => write(K.peers, peers),
