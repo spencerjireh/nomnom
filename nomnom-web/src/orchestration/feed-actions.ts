@@ -135,6 +135,7 @@ export async function openFeed(p: OpenFeedParams): Promise<Feed> {
       { ...memberCard(p.identity, memberId), joined_at: created },
     ],
     last_post_ts: 0,
+    auto_save: false,
   };
 }
 
@@ -166,6 +167,7 @@ export async function joinFeed(p: JoinFeedParams): Promise<Feed> {
     member_id: memberId,
     members_cache: roster,
     last_post_ts: 0,
+    auto_save: false,
   };
   // Prompt TOFU on the members already present.
   await refreshRoster(feedContext(feed, p.identity), p.hooks, p.signal);
