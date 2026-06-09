@@ -14,7 +14,6 @@ export function Shell() {
   const feeds = useStore((s) => s.feeds);
   const selectedFeed = useStore((s) => s.selectedFeed);
   const selectFeed = useStore((s) => s.selectFeed);
-  const relay = useStore((s) => s.relay);
   const { receive } = useTransfer();
 
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -22,17 +21,19 @@ export function Shell() {
 
   const feed = feeds.find((f) => f.name === selectedFeed) ?? null;
 
-  // Ambient watch: keep a receive loop running on the selected feed whenever
-  // a relay is configured. Switching cancels the previous loop via abort.
+  // Ambient watch: keep a receive loop running on the selected feed. Receiving
+  // needs only the joined feed (feed key + host come from its URL) — NOT the
+  // relay mint credential, which gates open() alone. So a join-only device
+  // (no relay configured) still receives. Switching feeds aborts the old loop.
   useEffect(() => {
-    if (!feed || !relay) return;
+    if (!feed) return;
     const abort = new AbortController();
     receive(feed, abort.signal);
     return () => abort.abort();
-    // We deliberately key only on feed name + relay url+secret: feed mutations
-    // like roster updates re-trigger receive otherwise.
+    // Key only on feed name: feed mutations (roster/last_post_ts) would
+    // otherwise restart the loop on every poll.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [feed?.name, relay?.url, relay?.secret]);
+  }, [feed?.name]);
 
   if (!identity) return null;
 
