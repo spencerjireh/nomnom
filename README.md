@@ -152,7 +152,7 @@ nomnom send report.txt               # broadcast to every other member of the de
 nomnom send report.txt --feed work   # target a specific joined feed
 ```
 
-`receive` stays open after each delivery, so you can leave a laptop listening and fire off `send` from another machine all afternoon. Pass `--once` to exit after the first file (handy for scripting).
+`receive` stays open after each delivery, so you can leave a laptop listening and fire off `send` from another machine all afternoon — new posts arrive in real time (the relay pushes them over Server-Sent Events, falling back to long-polling). Pass `--once` to exit after the first file (handy for scripting).
 
 Max transfer size is 256 MB (100 MB on Cloudflare's free tier — see [`relay-worker/README.md`](relay-worker/README.md)).
 

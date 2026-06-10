@@ -19,9 +19,14 @@ Deployed as a static-assets Cloudflare Worker at `nomnom.spencerjireh.com`.
 - **Web Worker** (`src/worker/`) runs `feed_seal` / `feed_open` — the stream
   cipher over big files (up to 100 MB) — off the main thread, reporting progress.
 - **Relay client** (`src/relay/`) implements the `/feeds/*` surface: mint
-  (HMAC-gated), member cards, roster long-poll, and slot put/get/list.
+  (HMAC-gated), member cards, roster long-poll, slot put/get/list, and an
+  `EventSource` subscription to `/feeds/:id/stream` for real-time new-slot push
+  (the feed-key MAC rides the `?auth=` query, since `EventSource` can't set
+  headers; it reconnects itself with a fresh signature).
 - **Orchestration** (`src/orchestration/`) implements open / join / send /
-  receive as framework-free state machines over the relay client.
+  receive as framework-free state machines over the relay client. Receive
+  subscribes to the SSE stream — falling back to the `/slots` long-poll if the
+  relay has no `/stream` — then fetches + decrypts each new slot.
 - **UI** (`src/components/`, zustand store in `src/state/`) is an editorial
   two-pane "diner-receipt" interface: a brand/status rail beside the receipt,
   with Send / Receive / Feeds tabs + Settings.
