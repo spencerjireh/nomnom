@@ -1,11 +1,14 @@
-// RECEIVE = watch a feed for new posts. Long-poll /slots?since=<last_post_ts> in
-// a loop; for each new slot, GET it, feed_open (verifies signature + content
-// hash), skip our own posts, then hand the file to onFile. Runs until the signal
-// aborts. Mirrors nomnom.py cmd_receive.
+// RECEIVE = watch a feed for new posts. Discover new slots over the SSE /stream
+// endpoint (real push from a Durable Object); for each, GET it, feed_open
+// (verifies signature + content hash), skip our own posts, then hand the file to
+// onFile. A separate loop keeps the roster fresh (TOFU). Runs until the signal
+// aborts. Falls back to the /slots long-poll if the relay has no /stream.
+// Mirrors nomnom.py cmd_receive.
 
 import { cryptoClient } from "../worker/cryptoClient";
 import { feedContext, refreshRoster, type TofuHooks } from "./feed-actions";
 import { RELAY_WAIT_MS } from "../config";
+import { StreamUnsupportedError } from "../relay/errors";
 import type { FeedHeader } from "../crypto/feeds";
 import type { Feed, Identity, Member, OnProgress } from "../types";
 
@@ -42,92 +45,147 @@ export async function runReceive(p: ReceiveParams): Promise<number> {
     }
   };
 
-  while (!p.signal.aborted) {
-    // Roster refresh + TOFU before each slot long-poll. Up to a 30s lag between a
-    // join and the prompt, but it keeps everything on one logical flow.
+  const refresh = async () => {
+    roster = await refreshRoster(
+      { ...ctx, feed: { ...ctx.feed, members_cache: roster } },
+      p.hooks,
+      p.signal,
+    );
+    p.onRoster?.(roster);
+  };
+
+  // Process one slot notification: fetch, open, verify, emit. Shared by the SSE
+  // and long-poll discovery paths. Idempotent: slots at/under the cursor (a
+  // backlog/live overlap on reconnect) are skipped.
+  const processSlot = async (slotId: string, createdAt: number): Promise<void> => {
+    if (!slotId || createdAt <= lastTs) return;
+
+    let raw: ArrayBuffer | null;
     try {
-      roster = await refreshRoster(
-        { ...ctx, feed: { ...ctx.feed, members_cache: roster } },
-        p.hooks,
-        p.signal,
-      );
-      p.onRoster?.(roster);
+      raw = await ctx.client.getSlot(ctx.feed.feed_id, ctx.feedKey, slotId, { signal: p.signal });
     } catch {
-      if (p.signal.aborted) break;
-      // non-fatal — fall through to the slot poll
+      if (p.signal.aborted) return;
+      advance(createdAt);
+      return;
+    }
+    if (raw === null) {
+      advance(createdAt);
+      return;
     }
 
-    p.onProgress("transferring", count ? `watching · ${count} received` : "watching feed", 0);
-    let slots;
+    let header: FeedHeader;
+    let body: ArrayBuffer;
     try {
-      slots = await ctx.client.listSlots(ctx.feed.feed_id, ctx.feedKey, {
-        sinceTs: lastTs,
-        waitMs: RELAY_WAIT_MS,
-        signal: p.signal,
+      const opened = await cryptoClient.feedOpen({
+        feedKeyHex: ctx.feedKeyHex,
+        feedId: ctx.feed.feed_id,
+        blob: raw,
       });
-    } catch (e) {
-      if (p.signal.aborted) break;
-      throw e;
+      header = opened.header;
+      body = opened.body;
+    } catch {
+      advance(createdAt); // drop bad/foreign post
+      return;
     }
 
-    for (const entry of slots) {
-      if (p.signal.aborted) break;
-      const slotId = entry.slot_id;
-      const createdAt = entry.created_at ?? 0;
-      if (!slotId) continue;
+    if (header.smid === ctx.feed.member_id) {
+      advance(createdAt); // our own broadcast comes back — don't re-download it
+      return;
+    }
 
-      let raw: ArrayBuffer | null;
+    // Resolve the sender from the roster. A post can beat the roster refresh, so
+    // if the sender is unknown, refresh once to name them (and run TOFU) first.
+    let found = roster.find((m) => m.member_id === header.smid);
+    if (!found) {
       try {
-        raw = await ctx.client.getSlot(ctx.feed.feed_id, ctx.feedKey, slotId, { signal: p.signal });
+        await refresh();
+        found = roster.find((m) => m.member_id === header.smid);
+      } catch {
+        if (p.signal.aborted) return;
+      }
+    }
+    let senderName = "(unknown)";
+    if (found) {
+      senderName = found.name || senderName;
+      // Drop if a cached identity key changed (spoof).
+      if (found.identity_pubkey && found.identity_pubkey !== header.sik) {
+        advance(createdAt);
+        return;
+      }
+    }
+
+    count++;
+    p.onFile({ name: header.fn, body, bytes: body.byteLength, peerName: senderName });
+    advance(createdAt);
+  };
+
+  // Keep the roster fresh for TOFU + sender names, decoupled from slot discovery.
+  const rosterLoop = async () => {
+    while (!p.signal.aborted) {
+      try {
+        await refresh();
       } catch {
         if (p.signal.aborted) break;
-        advance(createdAt);
-        continue;
+        // non-fatal — try again next tick
       }
-      if (raw === null) {
-        advance(createdAt);
-        continue;
-      }
-
-      let header: FeedHeader;
-      let body: ArrayBuffer;
-      try {
-        const opened = await cryptoClient.feedOpen({
-          feedKeyHex: ctx.feedKeyHex,
-          feedId: ctx.feed.feed_id,
-          blob: raw,
-        });
-        header = opened.header;
-        body = opened.body;
-      } catch {
-        advance(createdAt); // drop bad/foreign post
-        continue;
-      }
-
-      if (header.smid === ctx.feed.member_id) {
-        advance(createdAt); // our own broadcast comes back — don't re-download it
-        continue;
-      }
-
-      // Resolve sender name from the roster; drop if a cached identity key changed.
-      let senderName = "(unknown)";
-      let spoofed = false;
-      for (const m of roster) {
-        if (m.member_id === header.smid) {
-          senderName = m.name || senderName;
-          if (m.identity_pubkey && m.identity_pubkey !== header.sik) spoofed = true;
-          break;
-        }
-      }
-      if (spoofed) {
-        advance(createdAt);
-        continue;
-      }
-
-      count++;
-      p.onFile({ name: header.fn, body, bytes: body.byteLength, peerName: senderName });
-      advance(createdAt);
+      await sleep(RELAY_WAIT_MS, p.signal);
     }
-  }
+  };
+
+  // Long-poll fallback used when the relay has no /stream endpoint.
+  const longPollLoop = async () => {
+    while (!p.signal.aborted) {
+      let slots;
+      try {
+        slots = await ctx.client.listSlots(ctx.feed.feed_id, ctx.feedKey, {
+          sinceTs: lastTs,
+          waitMs: RELAY_WAIT_MS,
+          signal: p.signal,
+        });
+      } catch (e) {
+        if (p.signal.aborted) break;
+        throw e;
+      }
+      for (const entry of slots) {
+        if (p.signal.aborted) break;
+        await processSlot(entry.slot_id, entry.created_at ?? 0);
+      }
+    }
+  };
+
+  const slotLoop = async () => {
+    p.onProgress("transferring", "watching feed", 0);
+    try {
+      for await (const entry of ctx.client.streamSlotEvents(
+        ctx.feed.feed_id,
+        ctx.feedKey,
+        { getSince: () => lastTs, signal: p.signal },
+      )) {
+        await processSlot(entry.slot_id, entry.created_at ?? 0);
+      }
+    } catch (e) {
+      if (p.signal.aborted) return;
+      if (!(e instanceof StreamUnsupportedError)) throw e;
+      // Relay predates /stream — long-poll for the rest of the session.
+      await longPollLoop();
+    }
+  };
+
+  await Promise.all([rosterLoop(), slotLoop()]);
   return count;
+}
+
+function sleep(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal.aborted) return resolve();
+    const t = setTimeout(resolve, ms);
+    signal.addEventListener(
+      "abort",
+      () => {
+        clearTimeout(t);
+        resolve();
+      },
+      { once: true },
+    );
+  });
 }

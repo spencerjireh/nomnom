@@ -339,6 +339,8 @@ export async function putFeedSlot(
   feedId: string,
   slotId: string,
   req: Request,
+  notifier?: DurableObjectNamespace,
+  ctx?: ExecutionContext,
 ): Promise<Response> {
   const live = await ensureFeedLive(bucket, feedId);
   if (live.status !== 200) return live;
@@ -368,6 +370,22 @@ export async function putFeedSlot(
       created_at: String(now),
     },
   });
+
+  // Best-effort push: nudge the feed's notifier DO so any open SSE streams get
+  // the new slot immediately. Receivers also poll/replay, so a missed signal is
+  // a latency hit, not a correctness one — hence waitUntil + swallowed errors.
+  if (notifier && ctx) {
+    const stub = notifier.get(notifier.idFromName(feedId));
+    ctx.waitUntil(
+      stub
+        .fetch("https://feed-notifier/notify", {
+          method: "POST",
+          body: JSON.stringify({ slot_id: slotId, created_at: now }),
+        })
+        .then(() => undefined)
+        .catch(() => undefined),
+    );
+  }
   return new Response(null, { status: 204 });
 }
 

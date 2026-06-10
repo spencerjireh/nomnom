@@ -8,6 +8,9 @@ export default defineConfig({
       miniflare: {
         compatibilityDate: "2025-05-01",
         r2Buckets: ["BUCKET"],
+        durableObjects: {
+          FEED_NOTIFIER: "FeedNotifier",
+        },
         bindings: {
           NOMNOM_HMAC_SECRET: "test-secret-do-not-use-in-prod",
         },

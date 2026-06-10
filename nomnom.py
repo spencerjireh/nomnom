@@ -23,6 +23,7 @@ import json
 import ipaddress
 import locale
 import os
+import queue
 import re
 import secrets
 import shutil
@@ -4538,11 +4539,13 @@ def _relay_split_url(url: str) -> tuple[str, int, str, bool]:
     return parsed.hostname, port, parsed.path.rstrip("/"), is_https
 
 
-def _relay_open(relay: dict) -> http.client.HTTPConnection:
+def _relay_open(
+    relay: dict, *, timeout: float = _RELAY_REQUEST_TIMEOUT,
+) -> http.client.HTTPConnection:
     host, port, _, is_https = _relay_split_url(relay["url"])
     if is_https:
-        return http.client.HTTPSConnection(host, port, timeout=_RELAY_REQUEST_TIMEOUT)
-    return http.client.HTTPConnection(host, port, timeout=_RELAY_REQUEST_TIMEOUT)
+        return http.client.HTTPSConnection(host, port, timeout=timeout)
+    return http.client.HTTPConnection(host, port, timeout=timeout)
 
 
 def _relay_full_path(relay: dict, path: str) -> str:
@@ -4891,6 +4894,107 @@ def _relay_list_feed_slots(
     _raise_feed_error(status, data)
 
 
+# --- SSE slot stream (real-time push; stdlib-only streaming GET) ---
+
+_STREAM_SOCKET_TIMEOUT = 40.0   # > the relay's 20s SSE heartbeat; detects a dead link
+_STREAM_RECONNECT_S = 1.0       # backoff before reopening after a drop / the ~4min cap
+_STREAM_MAX_LINE = 64 * 1024    # cap a single SSE line (frames are tiny JSON)
+
+
+class _StreamUnsupported(Exception):
+    """The relay has no /stream endpoint (predates SSE). Caller long-polls."""
+
+
+def _feed_stream_lines(host: str, feed_key: bytes, path: str):
+    """Yield decoded SSE lines from one long-lived feed-key-signed GET.
+
+    Reads the response line by line (chunk-aware via HTTPResponse.readline) so
+    notifications surface as they arrive. Raises `_StreamUnsupported` on 404 (no
+    endpoint) and `NomnomError` on other non-200s or an initial connect failure.
+    A mid-stream read error or EOF (the relay's ~4min cap) ends the generator;
+    the caller reconnects.
+    """
+    relay = _feed_relay_dict(host)
+    full_path = _relay_full_path(relay, path)
+    headers = _feed_auth_headers(feed_key, "GET", full_path)
+    headers["Accept"] = "text/event-stream"
+    try:
+        conn = _relay_open(relay, timeout=_STREAM_SOCKET_TIMEOUT)
+    except (OSError, http.client.HTTPException) as e:
+        raise NomnomError(f"relay stream connect failed: {e}") from e
+    try:
+        try:
+            conn.request("GET", full_path, headers=headers)
+            resp = conn.getresponse()
+        except (OSError, http.client.HTTPException) as e:
+            raise NomnomError(f"relay stream request failed: {e}") from e
+        if resp.status == 404:
+            try:
+                resp.read()
+            except (OSError, http.client.HTTPException):
+                pass
+            raise _StreamUnsupported()
+        if resp.status != 200:
+            body = resp.read(_RELAY_MAX_BODY + 1)
+            _raise_feed_error(resp.status, body)
+        while True:
+            try:
+                line = resp.readline(_STREAM_MAX_LINE)
+            except (OSError, http.client.HTTPException):
+                return  # transient drop — caller reconnects
+            if not line:
+                return  # EOF: server closed (cap reached) — caller reconnects
+            yield line.decode("utf-8", errors="replace").rstrip("\r\n")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _relay_stream_feed_slots(
+    host: str, feed_id: str, feed_key: bytes,
+    *, since_fn, stop: "threading.Event | None" = None,
+):
+    """Yield `{slot_id, created_at}` as posts arrive, over SSE, reconnecting.
+
+    `since_fn()` is read at each (re)connect so replay resumes from the caller's
+    current cursor (the feed-key MAC is freshly signed each time, keeping its
+    timestamp inside the relay's skew window). Stops when `stop` is set.
+    Propagates `_StreamUnsupported` / `NomnomError`; a transient drop or the
+    server's ~4min cap reconnects after a short backoff.
+    """
+    while stop is None or not stop.is_set():
+        since = max(0, int(since_fn()))
+        path = f"/feeds/{feed_id}/stream{_qs(since=since)}"
+        for line in _feed_stream_lines(host, feed_key, path):
+            if stop is not None and stop.is_set():
+                return
+            if not line.startswith("data:"):
+                continue  # comment (": ping"/": ok"), id line, or blank
+            payload = line[len("data:"):].strip()
+            if not payload:
+                continue
+            try:
+                obj = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+            slot_id = obj.get("slot_id")
+            if not isinstance(slot_id, str):
+                continue
+            created_at = obj.get("created_at")
+            yield {
+                "slot_id": slot_id,
+                "created_at": int(created_at)
+                if isinstance(created_at, (int, float)) else 0,
+            }
+        # Stream ended (drop or cap). Back off, then reconnect from the cursor.
+        if stop is None:
+            time.sleep(_STREAM_RECONNECT_S)
+        elif stop.wait(_STREAM_RECONNECT_S):
+            return
+
+
 def _relay_health(relay: dict) -> bool:
     try:
         status, data = _relay_request(relay, "GET", "/health", signed=False)
@@ -5205,14 +5309,91 @@ def _receive_one_post(
     return (filename, len(body), sender_name, str(out))
 
 
+def _receive_refresh_roster(
+    feed: Feed, host: str, feed_key: bytes, trust_new: bool,
+) -> None:
+    """Refresh the roster (running TOFU prompts) and persist it onto `feed`."""
+    roster = _refresh_roster_with_tofu(feed, host, feed_key, trust_new=trust_new)
+    if roster is not None:
+        feed.members_cache = roster
+        cfg = _load_feeds_config()
+        existing = _find_feed(cfg, feed.name)
+        if existing is not None:
+            existing.members_cache = roster
+            _save_feeds_config(cfg)
+
+
+def _receive_persist_ts(feed: Feed, last_ts: int) -> None:
+    """Persist last_post_ts so a restart doesn't re-fetch already-seen posts."""
+    cfg = _load_feeds_config()
+    existing = _find_feed(cfg, feed.name)
+    if existing is not None and existing.last_post_ts != last_ts:
+        existing.last_post_ts = last_ts
+        _save_feeds_config(cfg)
+
+
+def _cmd_receive_stream(
+    target: Feed, host: str, feed_key: bytes, last_ts: int, trust_new: bool,
+) -> int:
+    """Watch via the SSE /stream endpoint (real-time push).
+
+    Reuses `_receive_one_post` for fetch/verify/write. Refreshes the roster (+
+    TOFU) before each post so new senders resolve. Raises `_StreamUnsupported`
+    if the relay has no /stream (caller falls back to long-poll); handles
+    Ctrl-C and relay errors internally.
+    """
+    received_any = False
+    try:
+        # Prime the roster so the very first post can name its sender.
+        _receive_refresh_roster(target, host, feed_key, trust_new)
+        for entry in _relay_stream_feed_slots(
+            host, target.feed_id, feed_key, since_fn=lambda: last_ts,
+        ):
+            slot_id = entry.get("slot_id")
+            created_at = int(entry.get("created_at") or 0)
+            if not slot_id or created_at <= last_ts:
+                if created_at > last_ts:
+                    last_ts = created_at
+                    _receive_persist_ts(target, last_ts)
+                continue
+            # Refresh before each post so a just-joined sender resolves + TOFUs.
+            _receive_refresh_roster(target, host, feed_key, trust_new)
+            try:
+                res = _receive_one_post(
+                    feed=target, host=host, feed_key=feed_key, slot_id=slot_id,
+                )
+            except NomnomError as e:
+                sys.stderr.write(f"warning: {e}\n")
+                res = None
+            if res is not None:
+                filename, nbytes, sender, out_path = res
+                sys.stderr.write(
+                    f"received {filename!r} ({nbytes} bytes) "
+                    f"from {sender} -> {out_path}\n",
+                )
+                sys.stderr.flush()
+                received_any = True
+            if created_at > last_ts:
+                last_ts = created_at
+            _receive_persist_ts(target, last_ts)
+    except KeyboardInterrupt:
+        sys.stderr.write("\n")
+        return 0 if received_any else 130
+    except NomnomError as e:
+        sys.stderr.write(f"error: {e}\n")
+        return 1
+    return 0
+
+
 def cmd_receive(
     *, feed: str | None = None, once: bool = False, trust_new: bool = False,
 ) -> int:
     """Watch a feed for new posts; write each to cwd.
 
-    Long-polls /feeds/:id/slots?since=<last_post_ts> in a loop. Each new
-    post is decrypted, signature-verified, and written to disk (collisions
-    auto-rename). Ctrl-C exits cleanly.
+    Continuous mode pushes via the SSE /stream endpoint (falling back to the
+    /slots long-poll if the relay has no /stream). `--once` uses the long-poll
+    directly. Each new post is decrypted, signature-verified, and written to
+    disk (collisions auto-rename). Ctrl-C exits cleanly.
     """
     target = _resolve_target_feed(feed)
     if target is None:
@@ -5228,6 +5409,15 @@ def cmd_receive(
         sys.stderr.flush()
 
     last_ts = target.last_post_ts
+    if not once:
+        try:
+            return _cmd_receive_stream(target, host, feed_key, last_ts, trust_new)
+        except _StreamUnsupported:
+            sys.stderr.write(
+                "note: relay has no /stream endpoint; using long-poll.\n",
+            )
+            sys.stderr.flush()
+            # fall through to the long-poll loop below
     while True:
         # Roster refresh + TOFU prompts before each slot long-poll. Up to a
         # 30s lag between a new member joining and the prompt firing, but
@@ -6248,10 +6438,12 @@ class PlaceholderScreen(Screen):
 class ReceiveScreen(Screen):
     """Watch the default feed for incoming posts, writing each to cwd.
 
-    Cooperative short-poll: `run_app` hands us idle ticks via `on_idle`,
-    where we run one bounded long-poll (`_POLL_MS`) and process any slots.
-    Keys stay responsive between polls. Esc/q stops. First-contact prompts
-    surface as a modal via `_tui_tofu`.
+    A background daemon thread streams new-slot notifications over SSE and
+    drops them on a queue; `on_idle` (the curses thread) drains the queue and
+    does the fetch/verify/write — keeping all curses + TOFU work on the main
+    thread. If the relay has no /stream, it falls back to the cooperative
+    long-poll. Keys stay responsive; Esc/q stops. First-contact prompts surface
+    as a modal via `_tui_tofu`.
     """
 
     title = "Receive"
@@ -6269,6 +6461,10 @@ class ReceiveScreen(Screen):
         self.host = ""
         self.feed_key = b""
         self.last_ts = 0
+        self._queue: "queue.Queue" = queue.Queue()
+        self._stop = threading.Event()
+        self._thread: "threading.Thread | None" = None
+        self._stream_failed = False  # relay lacks /stream → cooperative long-poll
         if self.feed is None:
             self.error = (
                 "no default feed. open one (`nomnom open`) or join one "
@@ -6332,18 +6528,63 @@ class ReceiveScreen(Screen):
         except curses.error:
             pass
 
-    def on_idle(self, stdscr) -> ScreenAction:  # pragma: no cover - curses I/O
-        if self.feed is None:
-            return ScreenAction.CONTINUE
-        # Redirect stderr: the feed helpers narrate to it, which would corrupt
-        # curses. The TOFU modal draws via curses directly, so it's unaffected.
+    def _stream_worker(self) -> None:  # pragma: no cover - background thread/IO
+        """Stream new-slot notifications onto the queue. Network I/O only — all
+        curses/TOFU/decrypt work stays on the main (curses) thread."""
+        try:
+            for entry in _relay_stream_feed_slots(
+                self.host, self.feed.feed_id, self.feed_key,
+                since_fn=lambda: self.last_ts, stop=self._stop,
+            ):
+                if self._stop.is_set():
+                    break
+                self._queue.put(("slot", entry))
+        except _StreamUnsupported:
+            self._queue.put(("unsupported", None))
+        except NomnomError as e:
+            self._queue.put(("error", str(e)))
+        except Exception as e:  # keep the TUI alive on unexpected stream faults
+            self._queue.put(("error", str(e)))
+
+    def _ensure_stream(self) -> None:  # pragma: no cover - curses I/O
+        if self._thread is None and not self._stop.is_set():
+            self._thread = threading.Thread(target=self._stream_worker, daemon=True)
+            self._thread.start()
+
+    def _handle_slot(self, slot_id: str) -> None:  # pragma: no cover - curses I/O
+        """Fetch/verify/write one slot. Caller wraps this in `_tui_tofu` +
+        redirect_stderr so prompts modal correctly and narration stays off-screen."""
+        roster = _refresh_roster_with_tofu(
+            self.feed, self.host, self.feed_key, trust_new=False,
+        )
+        if roster is not None:
+            self.feed.members_cache = roster
+        try:
+            res = _receive_one_post(
+                feed=self.feed, host=self.host,
+                feed_key=self.feed_key, slot_id=slot_id,
+            )
+        except (NomnomError, OSError) as e:
+            self.status = f"dropped a post: {e}"
+            return
+        if res is not None:
+            filename, nbytes, sender, out_path = res
+            self.received.append(
+                f"{filename} ({nbytes:,} bytes) from {sender} -> {out_path}",
+            )
+            self.status = f"received {filename!r}"
+
+    def _persist_ts(self) -> None:  # pragma: no cover - curses I/O
+        cfg_now = _load_feeds_config()
+        existing = _find_feed(cfg_now, self.feed.name)
+        if existing is not None and existing.last_post_ts != self.last_ts:
+            existing.last_post_ts = self.last_ts
+            _save_feeds_config(cfg_now)
+
+    def _poll_once(self, stdscr) -> ScreenAction:  # pragma: no cover - curses I/O
+        """Cooperative long-poll fallback when the relay has no /stream."""
         err_buf = io.StringIO()
         with _tui_tofu(stdscr), contextlib.redirect_stderr(err_buf):
-            roster = _refresh_roster_with_tofu(
-                self.feed, self.host, self.feed_key, trust_new=False,
-            )
-            if roster is not None:
-                self.feed.members_cache = roster
             try:
                 slots = _relay_list_feed_slots(
                     self.host, self.feed.feed_id, self.feed_key,
@@ -6356,32 +6597,52 @@ class ReceiveScreen(Screen):
                 slot_id = entry.get("slot_id")
                 created_at = int(entry.get("created_at") or 0)
                 if slot_id:
-                    try:
-                        res = _receive_one_post(
-                            feed=self.feed, host=self.host,
-                            feed_key=self.feed_key, slot_id=slot_id,
-                        )
-                    except (NomnomError, OSError) as e:
-                        self.status = f"dropped a post: {e}"
-                        res = None
-                    if res is not None:
-                        filename, nbytes, sender, out_path = res
-                        self.received.append(
-                            f"{filename} ({nbytes:,} bytes) from {sender} -> {out_path}",
-                        )
-                        self.status = f"received {filename!r}"
+                    self._handle_slot(slot_id)
                 if created_at > self.last_ts:
                     self.last_ts = created_at
-        # Persist last_post_ts so a restart doesn't re-fetch.
-        cfg_now = _load_feeds_config()
-        existing = _find_feed(cfg_now, self.feed.name)
-        if existing is not None and existing.last_post_ts != self.last_ts:
-            existing.last_post_ts = self.last_ts
-            _save_feeds_config(cfg_now)
+        self._persist_ts()
+        return ScreenAction.CONTINUE
+
+    def on_idle(self, stdscr) -> ScreenAction:  # pragma: no cover - curses I/O
+        if self.feed is None:
+            return ScreenAction.CONTINUE
+        if self._stream_failed:
+            return self._poll_once(stdscr)
+        self._ensure_stream()
+        # Drain whatever the stream thread queued since the last tick.
+        items = []
+        while True:
+            try:
+                items.append(self._queue.get_nowait())
+            except queue.Empty:
+                break
+        if not items:
+            return ScreenAction.CONTINUE
+        # Redirect stderr: the feed helpers narrate to it, which would corrupt
+        # curses. The TOFU modal draws via curses directly, so it's unaffected.
+        err_buf = io.StringIO()
+        with _tui_tofu(stdscr), contextlib.redirect_stderr(err_buf):
+            for kind, payload in items:
+                if kind == "unsupported":
+                    self._stream_failed = True
+                    self.status = "relay has no /stream; using long-poll"
+                    continue
+                if kind == "error":
+                    self.status = f"stream error: {payload}"
+                    continue
+                entry = payload
+                slot_id = entry.get("slot_id")
+                created_at = int(entry.get("created_at") or 0)
+                if slot_id and created_at > self.last_ts:
+                    self._handle_slot(slot_id)
+                if created_at > self.last_ts:
+                    self.last_ts = created_at
+        self._persist_ts()
         return ScreenAction.CONTINUE
 
     def handle_key(self, ch: int, stdscr=None):
         if ch in (ord("q"), 3, 27):
+            self._stop.set()  # wind the stream thread down (daemon; exits on next read)
             if stdscr is not None:
                 try:
                     stdscr.timeout(-1)

@@ -48,7 +48,16 @@ export async function verifyFeedKey(
   req: Request,
   feedId: string,
 ): Promise<AuthResult> {
-  const header = req.headers.get("Authorization") ?? "";
+  const url = new URL(req.url);
+  // EventSource (the SSE /stream endpoint) can't set an Authorization header,
+  // so accept the same `<ts>:<mac>` envelope from an `?auth=` query param as a
+  // fallback. The MAC signs the bare pathname (query excluded), so carrying it
+  // in the query doesn't change what's signed.
+  let header = req.headers.get("Authorization") ?? "";
+  if (!header.startsWith(AUTH_PREFIX)) {
+    const q = url.searchParams.get("auth");
+    if (q) header = AUTH_PREFIX + q;
+  }
   const parsed = parseSignedAuth(header, AUTH_PREFIX, {
     missing: "missing-feed-mac",
     bad: "bad-feed-mac",
@@ -62,7 +71,6 @@ export async function verifyFeedKey(
     return { ok: false, status: 403, reason: "bad-feed-id" };
   }
 
-  const url = new URL(req.url);
   const msg = `${req.method}\n${url.pathname}\n${parsed.tsStr}`;
   const expected = await hmacSha256Hex(feedKey, msg);
   if (!constantTimeEqualHex(expected, parsed.macHex)) {

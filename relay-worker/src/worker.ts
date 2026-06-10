@@ -12,6 +12,7 @@
 //   PUT    /feeds/:id/slots/:slot_id                 feed-key sig
 //   GET    /feeds/:id/slots/:slot_id?wait=           feed-key sig (long-poll, no delete-on-read)
 //   GET    /feeds/:id/slots?wait=&since=             feed-key sig (long-poll on new posts)
+//   GET    /feeds/:id/stream?since=&auth=            feed-key sig (SSE push of new slots; auth may ride the query)
 //   PUT    /slots/:slot_id                           relay HMAC (legacy, kept)
 //   GET    /slots/:slot_id?wait=                     relay HMAC (legacy, delete-on-read)
 //   DELETE /slots/:slot_id                           relay HMAC (legacy)
@@ -38,10 +39,14 @@ import {
   validateSlotId as validateFeedSlotId,
 } from "./feeds";
 import { deleteSlot, getSlot, putSlot, validateSlotId } from "./slots";
+import { FeedNotifier } from "./feed-notifier";
+
+export { FeedNotifier };
 
 interface Env {
   BUCKET: R2Bucket;
   NOMNOM_HMAC_SECRET: string;
+  FEED_NOTIFIER: DurableObjectNamespace;
 }
 
 const CORS_ORIGINS = new Set([
@@ -79,12 +84,15 @@ function parseSinceTs(url: URL): number {
 }
 
 async function routeFeed(
-  bucket: R2Bucket,
+  env: Env,
+  ctx: ExecutionContext,
   feedId: string,
   subpath: string,
   req: Request,
   url: URL,
 ): Promise<Response> {
+  const bucket = env.BUCKET;
+
   // /feeds/:id (no subpath) — DELETE = close
   if (subpath === "" || subpath === "/") {
     if (req.method === "DELETE") return await closeFeed(bucket, feedId);
@@ -132,6 +140,35 @@ async function routeFeed(
     return methodNotAllowed("PUT, DELETE, OPTIONS");
   }
 
+  // /feeds/:id/stream — SSE push of new-slot notifications (Durable Object)
+  if (subpath === "/stream") {
+    if (req.method === "GET") {
+      const stub = env.FEED_NOTIFIER.get(env.FEED_NOTIFIER.idFromName(feedId));
+      const since = url.searchParams.get("since") ?? "0";
+      const res = await stub.fetch(
+        `https://feed-notifier/connect?feed=${encodeURIComponent(feedId)}` +
+          `&since=${encodeURIComponent(since)}`,
+      );
+      if (res.status !== 200 || res.body === null) {
+        return new Response(res.body, { status: res.status });
+      }
+      // Pipe the DO stream through a local TransformStream so (a) the response
+      // headers are mutable for withCors, and (b) a client cancel is absorbed
+      // here instead of surfacing as an unhandled rejection from the DO proxy.
+      const { readable, writable } = new TransformStream();
+      res.body.pipeTo(writable).catch(() => undefined);
+      return new Response(readable, {
+        status: 200,
+        headers: {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache, no-transform",
+          Connection: "keep-alive",
+        },
+      });
+    }
+    return methodNotAllowed("GET, OPTIONS");
+  }
+
   // /feeds/:id/slots (list / long-poll)
   if (subpath === "/slots") {
     if (req.method === "GET") {
@@ -153,7 +190,14 @@ async function routeFeed(
       return errorResponse("bad-slot-id", 403);
     }
     if (req.method === "PUT") {
-      return await putFeedSlot(bucket, feedId, slotId, req);
+      return await putFeedSlot(
+        bucket,
+        feedId,
+        slotId,
+        req,
+        env.FEED_NOTIFIER,
+        ctx,
+      );
     }
     if (req.method === "GET") {
       return await getFeedSlot(bucket, feedId, slotId, parseWaitMs(url));
@@ -173,6 +217,7 @@ function methodNotAllowed(allow: string): Response {
 async function route(
   req: Request,
   env: Env,
+  ctx: ExecutionContext,
   url: URL,
   path: string,
 ): Promise<Response> {
@@ -208,7 +253,7 @@ async function route(
     if (!auth.ok) {
       return errorResponse(auth.reason, auth.status);
     }
-    return await routeFeed(env.BUCKET, feedId, subpath, req, url);
+    return await routeFeed(env, ctx, feedId, subpath, req, url);
   }
 
   // Legacy: /slots/:slot_id — relay HMAC required
@@ -234,11 +279,15 @@ async function route(
 }
 
 export default {
-  async fetch(req: Request, env: Env): Promise<Response> {
+  async fetch(
+    req: Request,
+    env: Env,
+    ctx: ExecutionContext,
+  ): Promise<Response> {
     const url = new URL(req.url);
     if (req.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: corsHeaders(req) });
     }
-    return withCors(await route(req, env, url, url.pathname), req);
+    return withCors(await route(req, env, ctx, url, url.pathname), req);
   },
 };

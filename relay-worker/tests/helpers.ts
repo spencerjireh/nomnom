@@ -64,6 +64,22 @@ export async function signedFeedRequest(
   });
 }
 
+// Build a /stream URL carrying the feed-key MAC in the `?auth=` query param
+// (the shape an EventSource must use, since it can't set headers). `tsOverride`
+// lets a test forge an out-of-window timestamp to exercise the clock-skew gate.
+export async function feedStreamUrl(
+  feedId: string,
+  sinceTs = 0,
+  opts: { tsOverride?: number; macOverride?: string } = {},
+): Promise<string> {
+  const path = `/feeds/${feedId}/stream`;
+  const ts = opts.tsOverride ?? Math.floor(Date.now() / 1000);
+  const feedKey = await deriveFeedKey(feedId);
+  const mac =
+    opts.macOverride ?? (await hmacSha256Hex(feedKey, `GET\n${path}\n${ts}`));
+  return `${BASE}${path}?since=${sinceTs}&auth=${ts}:${mac}`;
+}
+
 export function randomMemberId(): string {
   const bytes = new Uint8Array(16);
   crypto.getRandomValues(bytes);
