@@ -537,6 +537,14 @@ body {
   margin-bottom: 6px;
 }
 
+/* live character count beside the passphrase label — makes a truncated paste
+ * (11 chars vs the full 33) obvious without toggling reveal */
+.char-count {
+  text-transform: none;
+  letter-spacing: 0.04em;
+  opacity: 0.7;
+}
+
 .inline {
   display: flex;
   gap: 8px;

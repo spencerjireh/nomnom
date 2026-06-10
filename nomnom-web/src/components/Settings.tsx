@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useStore } from "../state/store";
-import { RelayClient } from "../relay/client";
+import { RelayClient, type AuthCheck } from "../relay/client";
 import { Fingerprint } from "./Fingerprint";
 import { DEFAULT_RELAY_URL } from "../config";
 
@@ -15,14 +15,20 @@ export function Settings({ onClose }: { onClose: () => void }) {
   const [url, setUrl] = useState(relay?.url ?? DEFAULT_RELAY_URL);
   const [secret, setSecret] = useState(relay?.secret ?? "");
   const [showSecret, setShowSecret] = useState(false);
-  const [health, setHealth] = useState<"idle" | "checking" | "ok" | "down">("idle");
+  const [check, setCheck] = useState<"idle" | "checking" | AuthCheck>("idle");
   const [savedRelay, setSavedRelay] = useState(false);
   const [confirmReset, setConfirmReset] = useState(false);
 
-  async function testRelay() {
-    setHealth("checking");
-    const ok = await new RelayClient({ url: url.trim().replace(/\/+$/, ""), secret }).health();
-    setHealth(ok ? "ok" : "down");
+  // Actually exercise the passphrase against the relay, rather than just pinging
+  // /health (which takes no auth and so can't tell a good secret from a bad one).
+  async function verify(): Promise<void> {
+    setCheck("checking");
+    const trimmed = secret.trim();
+    const result = await new RelayClient({
+      url: url.trim().replace(/\/+$/, ""),
+      secret: trimmed,
+    }).verifyAuth();
+    setCheck(result);
   }
 
   function saveRelay() {
@@ -30,6 +36,8 @@ export function Settings({ onClose }: { onClose: () => void }) {
     setRelay({ url: url.trim().replace(/\/+$/, ""), secret: secret.trim() });
     setSavedRelay(true);
     setTimeout(() => setSavedRelay(false), 1500);
+    // Auto-validate on save so a silently-wrong secret can't slip through.
+    void verify();
   }
 
   return (
@@ -71,7 +79,10 @@ export function Settings({ onClose }: { onClose: () => void }) {
           <input value={url} onChange={(e) => setUrl(e.target.value)} />
         </label>
         <label className="field">
-          <span className="field-label dim">passphrase</span>
+          <span className="field-label dim">
+            passphrase
+            {secret.length > 0 && <span className="char-count"> · {secret.length} chars</span>}
+          </span>
           <div className="inline">
             <input
               type={showSecret ? "text" : "password"}
@@ -85,14 +96,25 @@ export function Settings({ onClose }: { onClose: () => void }) {
           </div>
         </label>
         <div className="inline">
-          <button type="button" className="chip" onClick={testRelay}>
-            {health === "checking" ? "checking…" : "test"}
+          <button
+            type="button"
+            className="chip"
+            onClick={verify}
+            disabled={!secret.trim() || check === "checking"}
+          >
+            {check === "checking" ? "checking…" : "test"}
           </button>
           <button type="button" className="chip" onClick={saveRelay} disabled={!secret.trim()}>
             {savedRelay ? "saved!" : "save relay"}
           </button>
-          {health === "ok" && <span className="ok-inline">relay is up.</span>}
-          {health === "down" && <span className="err">relay unreachable.</span>}
+          {check === "ok" && <span className="ok-inline">passphrase accepted.</span>}
+          {check === "rejected" && (
+            <span className="err">relay rejected this passphrase — check it's the full secret.</span>
+          )}
+          {check === "skew" && (
+            <span className="err">passphrase ok, but this device's clock is off — fix the system time.</span>
+          )}
+          {check === "unreachable" && <span className="err">relay unreachable.</span>}
         </div>
 
         <hr className="dashed" />
