@@ -2,7 +2,7 @@
 
 A Cloudflare Worker that brokers encrypted file transfers for [nomnom](../README.md).
 
-The Worker is intentionally dumb: it stores opaque payloads at HMAC-authenticated slot ids, holds GETs open for long-polling, and deletes slots on read. All cryptography (identity keys, triple-DH session keys, AEAD ciphertext) happens client-side; the Worker only sees ciphertext + a per-pair rendezvous id.
+The Worker is intentionally dumb: it stores opaque payloads at HMAC-authenticated slot ids and holds GETs open for long-polling. For feeds, receivers can instead subscribe to a Server-Sent Events stream (`GET /feeds/:id/stream`) backed by a per-feed **Durable Object**, which pushes new-slot notifications in real time rather than long-polling R2 (the long-poll stays as a fallback). All cryptography (identity keys, feed/session keys, AEAD ciphertext) happens client-side; the Worker only sees ciphertext + opaque slot ids.
 
 ## Prerequisites
 
@@ -103,7 +103,10 @@ Two auth schemes:
      mac      = HMAC-SHA256(feed_key, method + "\n" + path + "\n" + unix_ts)
   ```
 
-Either way, `unix_ts` must be within ±300 seconds of the Worker's clock.
+Either way, `unix_ts` must be within ±300 seconds of the Worker's clock. The SSE
+`/feeds/:id/stream` endpoint also accepts the feed-key signature as an
+`?auth=<ts>:<mac>` query parameter (since `EventSource` can't set headers); the
+signed message is unchanged — the MAC still covers the bare pathname.
 
 | Method | Path | Auth | Notes |
 |---|---|---|---|
@@ -118,6 +121,7 @@ Either way, `unix_ts` must be within ±300 seconds of the Worker's clock.
 | `PUT` | `/feeds/:id/slots/:slot_id` | feed-key | Write a post. Slots live until feed TTL; broadcast (no delete-on-read). |
 | `GET` | `/feeds/:id/slots/:slot_id?wait=` | feed-key | Long-poll fetch. |
 | `GET` | `/feeds/:id/slots?wait=&since=` | feed-key | List new slot ids since `since`, long-poll on `wait`. |
+| `GET` | `/feeds/:id/stream?since=&auth=` | feed-key | Subscribe (SSE) to new-slot notifications since `since`, pushed live by a per-feed Durable Object. Replays the backlog on connect; self-closes at ~4 min so clients reconnect with a fresh signature. Auth may ride the `?auth=` query. |
 | `PUT` | `/slots/:slot_id` | relay HMAC | Legacy: single-shot slot, delete-on-read. |
 | `GET` | `/slots/:slot_id?wait=` | relay HMAC | Legacy: long-poll + delete-on-read. |
 | `DELETE` | `/slots/:slot_id` | relay HMAC | Legacy: idempotent cancel. |
@@ -144,6 +148,7 @@ Cloudflare free tier (as of 2025):
 
 - **Workers Free:** 100,000 requests/day, 30s wall-clock per request, **100 MB request body cap**. Long-polling does not count against CPU.
 - **R2 Free:** 10 GB storage, 1M class-A operations/month (writes + lists), 10M class-B operations/month (reads).
+- **Durable Objects:** one SQLite-backed instance per active feed, provisioned automatically by `wrangler deploy` (the `FeedNotifier` migration in `wrangler.toml`). An open SSE `/stream` connection keeps its feed's instance active while connected; for a handful of personal devices this is negligible.
 
 For personal use across two Macs, transferring under 100 MB per file, you will not approach any of these limits.
 
