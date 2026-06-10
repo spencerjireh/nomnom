@@ -93,12 +93,17 @@ export async function runReceive(p: ReceiveParams): Promise<number> {
       return;
     }
 
-    // Resolve the sender from the roster. A post can beat the roster refresh, so
-    // if the sender is unknown, refresh once to name them (and run TOFU) first.
+    // Resolve the sender from the roster. A post can beat the roster loop, so if
+    // the sender is unknown, do a plain (no-TOFU) roster fetch to name them.
+    // TOFU is advisory and runs on the roster loop — delivery never blocks on it
+    // (and a prompt here would race the roster loop's single modal).
     let found = roster.find((m) => m.member_id === header.smid);
     if (!found) {
       try {
-        await refresh();
+        roster = await ctx.client.listMembers(ctx.feed.feed_id, ctx.feedKey, {
+          signal: p.signal,
+        });
+        p.onRoster?.(roster);
         found = roster.find((m) => m.member_id === header.smid);
       } catch {
         if (p.signal.aborted) return;
