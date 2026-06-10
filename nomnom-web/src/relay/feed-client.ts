@@ -12,9 +12,11 @@
 // (the Worker signs over the bare pathname).
 
 import { feedAuthHeader } from "../crypto/feed-auth";
+import { feedRequestMac } from "../crypto/feeds";
 import { relayAuthHeader } from "../crypto/relay-auth";
+import { STREAM_RECONNECT_MS, STREAM_UNSUPPORTED_RETRIES } from "../config";
 import type { RelayConfig } from "../types";
-import { RelayError } from "./errors";
+import { RelayError, StreamUnsupportedError } from "./errors";
 
 export interface MemberCard {
   member_id: string;
@@ -202,6 +204,112 @@ export class FeedClient {
     }
     throw new RelayError(res.status, (await safeReason(res)) || "list-slots-failed");
   }
+
+  /**
+   * Push stream of new-slot notifications over SSE (the /stream endpoint backed
+   * by a Durable Object). Yields {slot_id, created_at} as posts arrive — the
+   * caller still GETs each slot body. Reconnects itself with a freshly signed
+   * URL (EventSource can't set an Authorization header, so the feed-key MAC
+   * rides the `?auth=` query; reopening keeps its timestamp inside the relay's
+   * skew window). `getSince` is read at each (re)connect so replay resumes from
+   * the caller's current cursor. Stops when `signal` aborts. Throws
+   * StreamUnsupportedError if /stream never opens (relay predates it).
+   */
+  async *streamSlotEvents(
+    feedId: string,
+    feedKey: Uint8Array,
+    opts: { getSince: () => number; signal: AbortSignal },
+  ): AsyncGenerator<SlotMeta> {
+    const { getSince, signal } = opts;
+    const barePath = `/feeds/${feedId}/stream`;
+    let failsBeforeOpen = 0;
+
+    while (!signal.aborted) {
+      const ts = Math.floor(Date.now() / 1000);
+      const mac = feedRequestMac(feedKey, "GET", barePath, ts);
+      const url =
+        this.url(barePath) + `?since=${getSince()}&auth=${ts}:${mac}`;
+      const es = new EventSource(url);
+
+      const queue: SlotMeta[] = [];
+      let opened = false;
+      let dead = false;
+      let wake: (() => void) | null = null;
+      const ping = () => {
+        if (wake) {
+          const w = wake;
+          wake = null;
+          w();
+        }
+      };
+      es.onopen = () => {
+        opened = true;
+        failsBeforeOpen = 0;
+      };
+      es.onmessage = (ev: MessageEvent) => {
+        try {
+          const d = JSON.parse(ev.data) as { slot_id?: unknown; created_at?: unknown };
+          if (typeof d.slot_id === "string") {
+            queue.push({
+              slot_id: d.slot_id,
+              created_at: typeof d.created_at === "number" ? d.created_at : 0,
+            });
+          }
+        } catch {
+          // skip a malformed frame
+        }
+        ping();
+      };
+      es.onerror = () => {
+        dead = true;
+        ping();
+      };
+      const onAbort = () => {
+        dead = true;
+        ping();
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+
+      try {
+        while (!signal.aborted && !dead) {
+          if (queue.length === 0) {
+            await new Promise<void>((r) => (wake = r));
+            continue;
+          }
+          yield queue.shift()!;
+        }
+      } finally {
+        es.close();
+        signal.removeEventListener("abort", onAbort);
+      }
+
+      if (signal.aborted) break;
+      // Errored. If it never opened, the endpoint is likely absent — give up
+      // after a few tries so the caller can fall back to long-poll.
+      if (!opened) {
+        failsBeforeOpen++;
+        if (failsBeforeOpen >= STREAM_UNSUPPORTED_RETRIES) {
+          throw new StreamUnsupportedError();
+        }
+      }
+      await sleep(STREAM_RECONNECT_MS, signal);
+    }
+  }
+}
+
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal?.aborted) return resolve();
+    const t = setTimeout(resolve, ms);
+    signal?.addEventListener(
+      "abort",
+      () => {
+        clearTimeout(t);
+        resolve();
+      },
+      { once: true },
+    );
+  });
 }
 
 async function safeReason(res: Response): Promise<string> {

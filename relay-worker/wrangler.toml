@@ -14,6 +14,19 @@ routes = [
 binding = "BUCKET"
 bucket_name = "nomnom-relay"
 
+# Per-feed SSE notifier. One Durable Object instance per feed (idFromName)
+# holds open text/event-stream connections and pushes new-slot notifications,
+# replacing the receivers' R2 long-poll with real push. No DO storage is used
+# (connections are in-memory, the backlog comes from R2), but SQLite-backed
+# classes are the supported default and work on every plan.
+[[durable_objects.bindings]]
+name = "FEED_NOTIFIER"
+class_name = "FeedNotifier"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["FeedNotifier"]
+
 # HMAC secret is set out-of-band. The fastest path is to let `nomnom relay init`
 # generate it for you — it prints the exact `wrangler secret put` and
 # `wrangler deploy` commands. Or generate one yourself, e.g.

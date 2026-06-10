@@ -11,6 +11,15 @@ export class RelayError extends Error {
   }
 }
 
+/** Thrown by the SSE stream when /stream never opens — the relay predates the
+ * push endpoint. The caller falls back to the long-poll loop. */
+export class StreamUnsupportedError extends Error {
+  constructor() {
+    super("relay does not support the SSE /stream endpoint");
+    this.name = "StreamUnsupportedError";
+  }
+}
+
 /** A friendlier message for the few statuses a user can actually act on. */
 export function friendlyRelayMessage(e: unknown): string {
   if (!(e instanceof RelayError)) return e instanceof Error ? e.message : String(e);

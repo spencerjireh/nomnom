@@ -4238,6 +4238,209 @@ class TestCmdReceiveFeed:
         assert "no transfer" in capsys.readouterr().err
 
 
+class _FakeStreamResp:
+    def __init__(self, status, chunks):
+        self.status = status
+        self._chunks = list(chunks)
+
+    def readline(self, *_a):
+        return self._chunks.pop(0) if self._chunks else b""
+
+    def read(self, *_a):
+        return b""
+
+
+class _FakeStreamConn:
+    def __init__(self, resp):
+        self._resp = resp
+        self.closed = False
+
+    def request(self, *_a, **_k):
+        pass
+
+    def getresponse(self):
+        return self._resp
+
+    def close(self):
+        self.closed = True
+
+
+class TestFeedStreamLines:
+    def _patch_conn(self, monkeypatch, resp):
+        conn = _FakeStreamConn(resp)
+        monkeypatch.setattr(
+            nomnom, "_relay_open", lambda relay, *, timeout=0: conn,
+        )
+        return conn
+
+    def test_yields_lines_until_eof(self, monkeypatch):
+        conn = self._patch_conn(
+            monkeypatch, _FakeStreamResp(200, [b"data: x\n", b": ping\r\n"]),
+        )
+        out = list(nomnom._feed_stream_lines("h", b"k", "/feeds/f/stream"))
+        assert out == ["data: x", ": ping"]
+        assert conn.closed  # connection always closed on exit
+
+    def test_404_raises_stream_unsupported(self, monkeypatch):
+        conn = self._patch_conn(monkeypatch, _FakeStreamResp(404, []))
+        with pytest.raises(nomnom._StreamUnsupported):
+            list(nomnom._feed_stream_lines("h", b"k", "/feeds/f/stream"))
+        assert conn.closed
+
+    def test_other_status_raises_nomnomerror(self, monkeypatch):
+        self._patch_conn(monkeypatch, _FakeStreamResp(410, []))
+        with pytest.raises(nomnom.NomnomError):
+            list(nomnom._feed_stream_lines("h", b"k", "/feeds/f/stream"))
+
+
+class TestRelayStreamFeedSlots:
+    def test_parses_data_frames_and_skips_noise(self, monkeypatch):
+        lines = [
+            ": ok",
+            "id: 5",
+            'data: {"slot_id": "a", "created_at": 5}',
+            "",
+            ": ping",
+            'data: {"slot_id": "b", "created_at": 6}',
+            "data: not-json{",            # malformed → skipped
+            'data: {"created_at": 7}',     # no slot_id → skipped
+        ]
+
+        def fake_lines(host, feed_key, path):
+            for ln in lines:
+                yield ln
+
+        monkeypatch.setattr(nomnom, "_feed_stream_lines", fake_lines)
+        stop = nomnom.threading.Event()
+        got = []
+        for item in nomnom._relay_stream_feed_slots(
+            "h", "fid", b"k", since_fn=lambda: 0, stop=stop,
+        ):
+            got.append(item)
+            if len(got) == 2:
+                stop.set()  # stop once we've collected both valid frames
+        assert got == [
+            {"slot_id": "a", "created_at": 5},
+            {"slot_id": "b", "created_at": 6},
+        ]
+
+    def test_stop_set_before_iteration_yields_nothing(self, monkeypatch):
+        monkeypatch.setattr(
+            nomnom, "_feed_stream_lines",
+            lambda *a, **k: iter(["data: {\"slot_id\": \"a\", \"created_at\": 1}"]),
+        )
+        stop = nomnom.threading.Event()
+        stop.set()
+        assert list(
+            nomnom._relay_stream_feed_slots(
+                "h", "fid", b"k", since_fn=lambda: 0, stop=stop,
+            )
+        ) == []
+
+
+class TestCmdReceiveStream:
+    @pytest.fixture
+    def env(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        alice_ident = nomnom._load_identity()
+        bob_seed, bob_pub = nomnom.ed25519_keypair()
+        bob_member = "b" * 32
+        alice_member = "a" * 32
+        token = nomnom.secrets.token_urlsafe(9)
+        feed = nomnom.Feed(
+            name="home", feed_id=token, feed_token=token,
+            url=f"https://relay.example.com/f/{token}",
+            expires_at=2_000_000_000, joined_at=1_700_000_000,
+            member_id=alice_member,
+            members_cache=[
+                {"member_id": alice_member, "identity_pubkey": alice_ident["sig_pub"], "name": "alice"},
+                {"member_id": bob_member, "identity_pubkey": bob_pub.hex(), "name": "bob"},
+            ],
+        )
+        cfg = nomnom._empty_feeds_config()
+        nomnom._add_or_replace_feed(cfg, feed)
+        nomnom._save_feeds_config(cfg)
+        feed_key = nomnom._feed_key_from_token(token)
+        bob_post = nomnom.feed_seal(
+            feed_key=feed_key, feed_id=token,
+            sender_member_id=bob_member,
+            sender_sig_priv_hex=bob_seed.hex(),
+            sender_sig_pub_hex=bob_pub.hex(),
+            filename="from-bob.txt", body=b"hello alice",
+        )
+        # Roster refresh is network; stub it out (the cache already has bob).
+        monkeypatch.setattr(nomnom, "_refresh_roster_with_tofu", lambda *a, **k: None)
+        monkeypatch.setattr(
+            nomnom, "_relay_get_feed_slot",
+            lambda host, fid, fkey, slot_id, *, wait_ms=0: bob_post,
+        )
+        return tmp_path, feed, bob_post
+
+    def test_stream_receives_post(self, env, monkeypatch, capsys):
+        tmp_path, feed, _bob_post = env
+        monkeypatch.chdir(tmp_path)
+
+        def fake_stream(host, fid, fkey, *, since_fn, stop=None):
+            yield {"slot_id": "slot-1", "created_at": 1}
+            raise KeyboardInterrupt  # simulate Ctrl-C after delivery
+
+        monkeypatch.setattr(nomnom, "_relay_stream_feed_slots", fake_stream)
+        rc = nomnom.cmd_receive()
+        assert rc == 0
+        err = capsys.readouterr().err
+        assert "from-bob.txt" in err and "from bob" in err
+        assert (tmp_path / "from-bob.txt").read_bytes() == b"hello alice"
+
+    def test_stream_dedups_already_seen(self, env, monkeypatch):
+        tmp_path, feed, _bob_post = env
+        monkeypatch.chdir(tmp_path)
+
+        # created_at <= cursor (last_post_ts starts at 0; feed cursor is 0, so
+        # advance it first via a real post, then re-emit the same ts).
+        def fake_stream(host, fid, fkey, *, since_fn, stop=None):
+            yield {"slot_id": "slot-1", "created_at": 1}
+            yield {"slot_id": "slot-1", "created_at": 1}  # duplicate → skipped
+            raise KeyboardInterrupt
+
+        writes = {"n": 0}
+        orig = nomnom._receive_one_post
+
+        def counting(*a, **k):
+            writes["n"] += 1
+            return orig(*a, **k)
+
+        monkeypatch.setattr(nomnom, "_receive_one_post", counting)
+        monkeypatch.setattr(nomnom, "_relay_stream_feed_slots", fake_stream)
+        rc = nomnom.cmd_receive()
+        assert rc == 0
+        assert writes["n"] == 1  # the duplicate did not re-fetch/write
+
+    def test_stream_unsupported_falls_back_to_longpoll(self, env, monkeypatch, capsys):
+        tmp_path, feed, _bob_post = env
+        monkeypatch.chdir(tmp_path)
+
+        def fake_stream(host, fid, fkey, *, since_fn, stop=None):
+            raise nomnom._StreamUnsupported()
+            yield  # pragma: no cover - marks this a generator
+
+        monkeypatch.setattr(nomnom, "_relay_stream_feed_slots", fake_stream)
+
+        calls = {"n": 0}
+
+        def fake_list(host, fid, fkey, *, since_ts=0, wait_ms=0):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return [{"slot_id": "slot-1", "created_at": 1}]
+            raise KeyboardInterrupt  # end the fallback loop after delivery
+
+        monkeypatch.setattr(nomnom, "_relay_list_feed_slots", fake_list)
+        rc = nomnom.cmd_receive()
+        assert rc == 0
+        err = capsys.readouterr().err
+        assert "no /stream" in err  # announced the fallback
+        assert (tmp_path / "from-bob.txt").read_bytes() == b"hello alice"
+
+
 class TestJoinToken:
     def test_format_then_parse_round_trip(self):
         host = "relay.spencerjireh.com"
