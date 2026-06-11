@@ -15,6 +15,12 @@
 import { pollSlot } from "./poll";
 import { errorResponse, jsonResponse, sleep } from "./http";
 import { urlsafeBase64Encode } from "./crypto-util";
+import {
+  LIST_BATCH_SIZE,
+  SLOT_HEAD_CONCURRENCY,
+  SlotIndex,
+  parseTs,
+} from "./slot-index";
 
 const FEED_ID_RE = /^[A-Za-z0-9_-]{8,32}$/;
 const MEMBER_ID_RE = /^[A-Za-z0-9_-]{8,64}$/;
@@ -34,11 +40,10 @@ const MAX_MEMBER_COUNT = 64; // bound roster size per feed
 const MEMBER_POLL_INTERVAL_MS = 1000;
 const SLOT_LIST_POLL_INTERVAL_MS = 1000;
 const MAX_BUDGET_MS = 30_000;
-const LIST_BATCH_SIZE = 1000;
-// Cap on concurrent R2 sub-requests within readSlotsSince. Workers free tier
-// allows 50 subrequests per invocation, paid 1000; 16 keeps us comfortable
-// even with the long-poll's surrounding reads.
-const SLOT_HEAD_CONCURRENCY = 16;
+
+function byteLength(s: string): number {
+  return new TextEncoder().encode(s).length;
+}
 
 export function validateFeedId(id: string): boolean {
   return FEED_ID_RE.test(id);
@@ -88,7 +93,7 @@ export async function mintFeed(
     return errorResponse("bad-member-card", 400);
   }
   const cardJson = JSON.stringify(card);
-  if (cardJson.length > MAX_MEMBER_CARD_BYTES) {
+  if (byteLength(cardJson) > MAX_MEMBER_CARD_BYTES) {
     return errorResponse("member-card-too-large", 413);
   }
 
@@ -205,10 +210,10 @@ export async function putMember(
   req: Request,
 ): Promise<Response> {
   const live = await ensureFeedLive(bucket, feedId);
-  if (live.status !== 200) return live;
+  if (!live.ok) return live.res;
 
   const text = await req.text();
-  if (text.length > MAX_MEMBER_CARD_BYTES) {
+  if (byteLength(text) > MAX_MEMBER_CARD_BYTES) {
     return errorResponse("member-card-too-large", 413);
   }
   let card: { member_id?: string; identity_pubkey?: string; name?: string };
@@ -239,11 +244,10 @@ export async function putMember(
     return errorResponse("feed-full", 409);
   }
 
-  const expiresAt = await readExpiresAt(bucket, feedId);
   const now = Math.floor(Date.now() / 1000);
   await bucket.put(`feeds/${feedId}/members/${memberId}`, text, {
     customMetadata: {
-      expires_at: String(expiresAt ?? now + DEFAULT_TTL_SEC),
+      expires_at: String(live.expiresAt ?? now + DEFAULT_TTL_SEC),
       created_at: String(now),
     },
     httpMetadata: { contentType: "application/json" },
@@ -264,6 +268,13 @@ export async function deleteMember(
 
 // ---------- GET /feeds/:id/members ----------
 
+interface MemberCard {
+  member_id: string;
+  identity_pubkey: string;
+  name: string;
+  joined_at: number;
+}
+
 export async function listMembers(
   bucket: R2Bucket,
   feedId: string,
@@ -271,7 +282,7 @@ export async function listMembers(
   sinceTs: number,
 ): Promise<Response> {
   const live = await ensureFeedLive(bucket, feedId);
-  if (live.status !== 200) return live;
+  if (!live.ok) return live.res;
 
   const deadline = Date.now() + Math.min(Math.max(waitMs, 0), MAX_BUDGET_MS);
   // Cache parsed cards across long-poll iterations keyed by R2 key.
@@ -328,13 +339,6 @@ export async function listMembers(
   }
 }
 
-interface MemberCard {
-  member_id: string;
-  identity_pubkey: string;
-  name: string;
-  joined_at: number;
-}
-
 // ---------- PUT /feeds/:id/slots/:slot_id ----------
 
 export async function putFeedSlot(
@@ -346,7 +350,7 @@ export async function putFeedSlot(
   ctx?: ExecutionContext,
 ): Promise<Response> {
   const live = await ensureFeedLive(bucket, feedId);
-  if (live.status !== 200) return live;
+  if (!live.ok) return live.res;
 
   const lenHdr = req.headers.get("Content-Length");
   if (lenHdr !== null) {
@@ -355,24 +359,24 @@ export async function putFeedSlot(
       return errorResponse("payload-too-large", 413);
     }
   }
-  const key = `feeds/${feedId}/slots/${slotId}`;
-  const existing = await bucket.head(key);
-  if (existing !== null) {
-    return errorResponse("slot-occupied", 409);
-  }
   if (req.body === null) {
     return errorResponse("empty-body", 400);
   }
-  const expiresAt =
-    (await readExpiresAt(bucket, feedId)) ??
-    Math.floor(Date.now() / 1000) + DEFAULT_TTL_SEC;
+  const key = `feeds/${feedId}/slots/${slotId}`;
   const now = Math.floor(Date.now() / 1000);
-  await bucket.put(key, req.body, {
+  const expiresAt = live.expiresAt ?? now + DEFAULT_TTL_SEC;
+  // Atomic create-if-absent: R2 returns null when the precondition fails, so a
+  // racing PUT to the same slot id gets 409 instead of silently clobbering.
+  const created = await bucket.put(key, req.body, {
+    onlyIf: { etagDoesNotMatch: "*" },
     customMetadata: {
       expires_at: String(expiresAt),
       created_at: String(now),
     },
   });
+  if (created === null) {
+    return errorResponse("slot-occupied", 409);
+  }
 
   // Best-effort push: nudge the feed's notifier DO so any open SSE streams get
   // the new slot immediately. Receivers also poll/replay, so a missed signal is
@@ -402,7 +406,7 @@ export async function getFeedSlot(
   waitMs: number,
 ): Promise<Response> {
   const live = await ensureFeedLive(bucket, feedId);
-  if (live.status !== 200) return live;
+  if (!live.ok) return live.res;
 
   const key = `feeds/${feedId}/slots/${slotId}`;
   const obj = await pollSlot(bucket, key, waitMs);
@@ -429,9 +433,13 @@ export async function listFeedSlots(
   sinceTs: number,
 ): Promise<Response> {
   const live = await ensureFeedLive(bucket, feedId);
-  if (live.status !== 200) return live;
+  if (!live.ok) return live.res;
 
   const prefix = `feeds/${feedId}/slots/`;
+  // Iterations are bounded by `deadline` (MAX_BUDGET_MS) over the poll interval,
+  // so the per-request subrequest count stays well under the free-tier cap. The
+  // liveness gate above is connect-time only; a feed closed mid-poll keeps
+  // serving until the deadline, which is acceptable for ~permanent channels.
   const deadline = Date.now() + Math.min(Math.max(waitMs, 0), MAX_BUDGET_MS);
   // Cache slot created_at across long-poll iterations keyed by R2 key. Slots
   // are immutable once written; bucket.head returns the same created_at on
@@ -477,11 +485,6 @@ export async function listFeedSlots(
   }
 }
 
-interface SlotIndex {
-  slot_id: string;
-  created_at: number;
-}
-
 // ---------- helpers ----------
 
 function generateFeedId(): string {
@@ -508,33 +511,25 @@ function isExpired(meta: Record<string, string> | undefined): boolean {
   return exp < Math.floor(Date.now() / 1000);
 }
 
-function parseTs(s: string | undefined): number | null {
-  if (s === undefined) return null;
-  const n = Number.parseInt(s, 10);
-  return Number.isFinite(n) ? n : null;
-}
+type FeedLive =
+  | { ok: true; expiresAt: number | null }
+  | { ok: false; res: Response };
 
-async function readExpiresAt(
-  bucket: R2Bucket,
-  feedId: string,
-): Promise<number | null> {
-  const head = await bucket.head(`feeds/${feedId}/meta`);
-  return parseTs(head?.customMetadata?.expires_at);
-}
-
+// Single meta `head` that both gates liveness and yields the feed's expiry, so
+// the write paths don't head the same object twice.
 async function ensureFeedLive(
   bucket: R2Bucket,
   feedId: string,
-): Promise<Response> {
+): Promise<FeedLive> {
   const head = await bucket.head(`feeds/${feedId}/meta`);
   if (head === null) {
-    return errorResponse("feed-not-found", 404);
+    return { ok: false, res: errorResponse("feed-not-found", 404) };
   }
   if (isExpired(head.customMetadata)) {
     await purgeFeed(bucket, feedId);
-    return errorResponse("feed-expired", 410);
+    return { ok: false, res: errorResponse("feed-expired", 410) };
   }
-  return new Response(null, { status: 200 });
+  return { ok: true, expiresAt: parseTs(head.customMetadata?.expires_at) };
 }
 
 async function purgeFeed(bucket: R2Bucket, feedId: string): Promise<void> {

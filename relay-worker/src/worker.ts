@@ -67,8 +67,17 @@ function corsHeaders(req: Request): Record<string, string> {
 }
 
 function withCors(res: Response, req: Request): Response {
-  for (const [k, v] of Object.entries(corsHeaders(req))) res.headers.set(k, v);
-  return res;
+  const cors = corsHeaders(req);
+  if (Object.keys(cors).length === 0) return res;
+  // Build a fresh Response rather than mutating res.headers, which throws if
+  // the response's headers are immutable.
+  const headers = new Headers(res.headers);
+  for (const [k, v] of Object.entries(cors)) headers.set(k, v);
+  return new Response(res.body, {
+    status: res.status,
+    statusText: res.statusText,
+    headers,
+  });
 }
 
 function parseWaitMs(url: URL): number {
@@ -83,6 +92,15 @@ function parseSinceTs(url: URL): number {
   return Number.isFinite(n) && n >= 0 ? n : 0;
 }
 
+// A matched /feeds/:id/* route. `guard` (optional) validates a path capture and
+// short-circuits with an error before any method handler runs. `Allow` for 405s
+// is derived from `methods`, so it can't drift from the registered handlers.
+interface FeedRoute {
+  re: RegExp;
+  guard?: (m: RegExpMatchArray) => Response | null;
+  methods: Record<string, (m: RegExpMatchArray) => Promise<Response>>;
+}
+
 async function routeFeed(
   env: Env,
   ctx: ExecutionContext,
@@ -92,120 +110,83 @@ async function routeFeed(
   url: URL,
 ): Promise<Response> {
   const bucket = env.BUCKET;
+  const routes: FeedRoute[] = [
+    { re: /^\/?$/, methods: { DELETE: () => closeFeed(bucket, feedId) } },
+    { re: /^\/meta$/, methods: { GET: () => getFeedMeta(bucket, feedId) } },
+    { re: /^\/extend$/, methods: { POST: () => extendFeed(bucket, feedId, req) } },
+    {
+      re: /^\/members$/,
+      methods: {
+        GET: () => listMembers(bucket, feedId, parseWaitMs(url), parseSinceTs(url)),
+      },
+    },
+    {
+      re: /^\/members\/([^/]+)$/,
+      guard: (m) =>
+        validateMemberId(m[1]) ? null : errorResponse("bad-member-id", 400),
+      methods: {
+        PUT: (m) => putMember(bucket, feedId, m[1], req),
+        DELETE: (m) => deleteMember(bucket, feedId, m[1]),
+      },
+    },
+    {
+      re: /^\/stream$/,
+      methods: { GET: () => streamFeed(env, feedId, url) },
+    },
+    {
+      re: /^\/slots$/,
+      methods: {
+        GET: () => listFeedSlots(bucket, feedId, parseWaitMs(url), parseSinceTs(url)),
+      },
+    },
+    {
+      re: /^\/slots\/([^/]+)$/,
+      guard: (m) =>
+        validateFeedSlotId(m[1]) ? null : errorResponse("bad-slot-id", 400),
+      methods: {
+        PUT: (m) => putFeedSlot(bucket, feedId, m[1], req, env.FEED_NOTIFIER, ctx),
+        GET: (m) => getFeedSlot(bucket, feedId, m[1], parseWaitMs(url)),
+      },
+    },
+  ];
 
-  // /feeds/:id (no subpath) — DELETE = close
-  if (subpath === "" || subpath === "/") {
-    if (req.method === "DELETE") return await closeFeed(bucket, feedId);
-    return methodNotAllowed("DELETE, OPTIONS");
+  for (const route of routes) {
+    const m = subpath.match(route.re);
+    if (m === null) continue;
+    const handler = route.methods[req.method];
+    if (handler === undefined) {
+      return methodNotAllowed([...Object.keys(route.methods), "OPTIONS"].join(", "));
+    }
+    const blocked = route.guard?.(m);
+    return blocked ?? (await handler(m));
   }
-
-  // /feeds/:id/meta
-  if (subpath === "/meta") {
-    if (req.method === "GET") return await getFeedMeta(bucket, feedId);
-    return methodNotAllowed("GET, OPTIONS");
-  }
-
-  // /feeds/:id/extend
-  if (subpath === "/extend") {
-    if (req.method === "POST") return await extendFeed(bucket, feedId, req);
-    return methodNotAllowed("POST, OPTIONS");
-  }
-
-  // /feeds/:id/members (list / long-poll)
-  if (subpath === "/members") {
-    if (req.method === "GET") {
-      return await listMembers(
-        bucket,
-        feedId,
-        parseWaitMs(url),
-        parseSinceTs(url),
-      );
-    }
-    return methodNotAllowed("GET, OPTIONS");
-  }
-
-  // /feeds/:id/members/:mid
-  const memberMatch = subpath.match(/^\/members\/([^/]+)$/);
-  if (memberMatch) {
-    const memberId = memberMatch[1];
-    if (!validateMemberId(memberId)) {
-      return errorResponse("bad-member-id", 403);
-    }
-    if (req.method === "PUT") {
-      return await putMember(bucket, feedId, memberId, req);
-    }
-    if (req.method === "DELETE") {
-      return await deleteMember(bucket, feedId, memberId);
-    }
-    return methodNotAllowed("PUT, DELETE, OPTIONS");
-  }
-
-  // /feeds/:id/stream — SSE push of new-slot notifications (Durable Object)
-  if (subpath === "/stream") {
-    if (req.method === "GET") {
-      const stub = env.FEED_NOTIFIER.get(env.FEED_NOTIFIER.idFromName(feedId));
-      const since = url.searchParams.get("since") ?? "0";
-      const res = await stub.fetch(
-        `https://feed-notifier/connect?feed=${encodeURIComponent(feedId)}` +
-          `&since=${encodeURIComponent(since)}`,
-      );
-      if (res.status !== 200 || res.body === null) {
-        return new Response(res.body, { status: res.status });
-      }
-      // Pipe the DO stream through a local TransformStream so (a) the response
-      // headers are mutable for withCors, and (b) a client cancel is absorbed
-      // here instead of surfacing as an unhandled rejection from the DO proxy.
-      const { readable, writable } = new TransformStream();
-      res.body.pipeTo(writable).catch(() => undefined);
-      return new Response(readable, {
-        status: 200,
-        headers: {
-          "Content-Type": "text/event-stream",
-          "Cache-Control": "no-cache, no-transform",
-          Connection: "keep-alive",
-        },
-      });
-    }
-    return methodNotAllowed("GET, OPTIONS");
-  }
-
-  // /feeds/:id/slots (list / long-poll)
-  if (subpath === "/slots") {
-    if (req.method === "GET") {
-      return await listFeedSlots(
-        bucket,
-        feedId,
-        parseWaitMs(url),
-        parseSinceTs(url),
-      );
-    }
-    return methodNotAllowed("GET, OPTIONS");
-  }
-
-  // /feeds/:id/slots/:slot_id
-  const slotMatch = subpath.match(/^\/slots\/([^/]+)$/);
-  if (slotMatch) {
-    const slotId = slotMatch[1];
-    if (!validateFeedSlotId(slotId)) {
-      return errorResponse("bad-slot-id", 403);
-    }
-    if (req.method === "PUT") {
-      return await putFeedSlot(
-        bucket,
-        feedId,
-        slotId,
-        req,
-        env.FEED_NOTIFIER,
-        ctx,
-      );
-    }
-    if (req.method === "GET") {
-      return await getFeedSlot(bucket, feedId, slotId, parseWaitMs(url));
-    }
-    return methodNotAllowed("PUT, GET, OPTIONS");
-  }
-
   return errorResponse("not-found", 404);
+}
+
+// GET /feeds/:id/stream — SSE push of new-slot notifications (Durable Object).
+async function streamFeed(env: Env, feedId: string, url: URL): Promise<Response> {
+  const stub = env.FEED_NOTIFIER.get(env.FEED_NOTIFIER.idFromName(feedId));
+  const since = url.searchParams.get("since") ?? "0";
+  const res = await stub.fetch(
+    `https://feed-notifier/connect?feed=${encodeURIComponent(feedId)}` +
+      `&since=${encodeURIComponent(since)}`,
+  );
+  if (res.status !== 200 || res.body === null) {
+    return new Response(res.body, { status: res.status });
+  }
+  // Pipe the DO stream through a local TransformStream so a client cancel is
+  // absorbed here instead of surfacing as an unhandled rejection from the DO
+  // proxy.
+  const { readable, writable } = new TransformStream();
+  res.body.pipeTo(writable).catch(() => undefined);
+  return new Response(readable, {
+    status: 200,
+    headers: {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache, no-transform",
+      Connection: "keep-alive",
+    },
+  });
 }
 
 function methodNotAllowed(allow: string): Response {

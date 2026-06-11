@@ -240,6 +240,25 @@ describe("slot lifecycle (multi-party broadcast)", () => {
     expect((await SELF.fetch(req2)).status).toBe(409);
   });
 
+  it("concurrent PUTs to one slot id yield exactly one 204 and one 409", async () => {
+    const m = await mintFeed(SELF);
+    const payload = new TextEncoder().encode("race");
+    const mk = () =>
+      signedFeedRequest("PUT", `/feeds/${m.feed_id}/slots/race`, m.feed_id, {
+        body: payload,
+        contentLength: payload.byteLength,
+      });
+    const [r1, r2] = await Promise.all([mk(), mk()]);
+    const statuses = (
+      await Promise.all([SELF.fetch(r1), SELF.fetch(r2)])
+    )
+      .map((r) => r.status)
+      .sort();
+    // The atomic create-if-absent put guarantees the loser gets 409, not a
+    // silent overwrite (which a read-then-write race could produce).
+    expect(statuses).toEqual([204, 409]);
+  });
+
   it("lists slots since timestamp", async () => {
     const m = await mintFeed(SELF);
     const t0 = Math.floor(Date.now() / 1000);
