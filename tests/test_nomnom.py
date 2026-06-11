@@ -1081,7 +1081,9 @@ class TestCommitScreen:
             s.handle_key(9)  # Tab
         assert s.field_cursor == 0
 
-    def test_d_cycles_destination(self):
+    def test_d_cycles_destination(self, tmp_path, monkeypatch):
+        # Isolate config so no channel exists → SEND is not in the cycle.
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
         s = nomnom.CommitScreen()
         s.handle_key(ord("d"))
         assert s.destination == nomnom.Destination.CLIPBOARD
@@ -3681,21 +3683,15 @@ class TestAtomicWrite:
 
 
 class TestCmdReceiveNoFeed:
-    """cmd_receive errors when no feeds are joined and no --feed specified."""
+    """cmd_receive errors when no channel is configured."""
 
-    def test_no_default_feed_errors(self, tmp_path, monkeypatch, capsys):
+    def test_no_channel_errors(self, tmp_path, monkeypatch, capsys):
         monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
         rc = nomnom.cmd_receive()
         assert rc == 1
         err = capsys.readouterr().err.lower()
-        assert "no default feed" in err
-        assert "nomnom open" in err
-
-    def test_named_feed_missing_errors(self, tmp_path, monkeypatch, capsys):
-        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
-        rc = nomnom.cmd_receive(feed="ghost")
-        assert rc == 1
-        assert "no feed named 'ghost'" in capsys.readouterr().err
+        assert "no channel yet" in err
+        assert "nomnom init" in err
 
 
 class TestRetiredVerbs:
@@ -3707,7 +3703,7 @@ class TestRetiredVerbs:
         assert rc == 2
         err = capsys.readouterr().err
         assert "pair" in err.lower()
-        assert "open" in err.lower()
+        assert "init" in err.lower()
         assert "join" in err.lower()
 
     def test_encrypt_is_retired(self, monkeypatch, capsys):
@@ -3724,9 +3720,18 @@ class TestRetiredVerbs:
 
     def test_pair_not_in_subcommands(self):
         assert "pair" not in nomnom.SUBCOMMANDS
-        assert "open" in nomnom.SUBCOMMANDS
-        assert "feeds" in nomnom.SUBCOMMANDS
+        # The multi-feed verbs were retired for the single-channel model.
+        assert "open" not in nomnom.SUBCOMMANDS
+        assert "feeds" not in nomnom.SUBCOMMANDS
+        assert "init" in nomnom.SUBCOMMANDS
+        assert "channel" in nomnom.SUBCOMMANDS
         assert "join" in nomnom.SUBCOMMANDS
+
+    def test_open_and_feeds_are_retired(self, monkeypatch, capsys):
+        for verb in ("open", "feeds"):
+            monkeypatch.setattr(sys, "argv", ["nomnom", verb])
+            assert nomnom.main() == 2
+            assert "retired" in capsys.readouterr().err.lower()
 
 
 class TestV2MigrationNotice:
@@ -3742,7 +3747,7 @@ class TestV2MigrationNotice:
         })
         nomnom._maybe_print_v2_migration_notice()
         err = capsys.readouterr().err
-        assert "v2 introduces feeds" in err
+        assert "pair is retired" in err
         assert "legacy pin" in err
 
     def test_no_notice_when_feeds_exist(
@@ -3919,30 +3924,14 @@ class TestCmdSendFeed:
         assert header["fn"] == "hello.txt"
         assert header["smid"] == feed.member_id
 
-    def test_send_warns_on_lonely_feed(self, env, capsys):
+    def test_send_warns_on_lonely_channel(self, env, capsys):
         tmp_path, feed, _ = env
         f = tmp_path / "ghost.txt"
         f.write_bytes(b"x")
         rc = nomnom.cmd_send(str(f))
         assert rc == 0
         err = capsys.readouterr().err
-        assert "no other members" in err
-
-    def test_send_explicit_feed(self, env, capsys):
-        tmp_path, feed, posts = env
-        f = tmp_path / "hi.txt"
-        f.write_bytes(b"x")
-        rc = nomnom.cmd_send(str(f), feed="home")
-        assert rc == 0
-        assert len(posts) == 1
-
-    def test_send_unknown_feed_errors(self, env, capsys):
-        tmp_path, _, _ = env
-        f = tmp_path / "a.txt"
-        f.write_bytes(b"x")
-        rc = nomnom.cmd_send(str(f), feed="missing")
-        assert rc == 1
-        assert "no feed named 'missing'" in capsys.readouterr().err
+        assert "no other devices" in err
 
     def test_send_nonexistent_file_errors(self, env, capsys):
         rc = nomnom.cmd_send("/nope/does/not/exist.txt")
@@ -4010,11 +3999,11 @@ class TestSendDestination:
     def test_has_send_target_true_with_default_feed(self, env):
         assert nomnom._has_send_target() is True
 
-    def test_emit_to_feed_no_default_feed(self, tmp_path, monkeypatch):
+    def test_emit_to_feed_no_channel(self, tmp_path, monkeypatch):
         monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
         rc, lines = nomnom._emit_to_feed(b"payload", "x.txt")
         assert rc == 1
-        assert any("no default feed" in line for line in lines)
+        assert any("no channel yet" in line for line in lines)
 
     def test_emit_to_feed_sends(self, env):
         _tmp, feed, posts = env
@@ -4055,7 +4044,7 @@ class TestSendDestination:
         assert len(posts) == 1
         assert "sent " in capsys.readouterr().err
 
-    def test_emit_bundle_send_without_feed_reports(self, tmp_path, monkeypatch):
+    def test_emit_bundle_send_without_channel_reports(self, tmp_path, monkeypatch):
         monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
         repo = tmp_path / "proj"
         make_repo(repo, {"a.py": "x\n"})
@@ -4064,7 +4053,7 @@ class TestSendDestination:
             repo.name, repo, ["a.py"], False, nomnom.Destination.SEND,
         )
         assert rc == 1
-        assert any("no default feed" in line for line in lines)
+        assert any("no channel yet" in line for line in lines)
 
 
 class TestTofuHandler:
@@ -5289,33 +5278,7 @@ class TestFeedsConfig:
         assert d.name == "home"
 
 
-class TestFeedNicknameValidation:
-    @pytest.mark.parametrize("name", ["home", "feed-1", "a", "abc-def-ghi"])
-    def test_accepts_valid(self, name):
-        nomnom._validate_feed_nickname(name)  # must not raise
-
-    @pytest.mark.parametrize(
-        "name",
-        ["", "Home", "feed_1", "-leading", "feed!", "ÜberFeed", "x" * 33],
-    )
-    def test_rejects_invalid(self, name):
-        with pytest.raises(nomnom.NomnomError):
-            nomnom._validate_feed_nickname(name)
-
-
-class TestAutogenFeedNickname:
-    def test_first_nickname_is_feed_1(self):
-        assert nomnom._autogen_feed_nickname([]) == "feed-1"
-
-    def test_skips_taken_names(self):
-        feeds = [
-            _make_feed(name="feed-1"),
-            _make_feed(name="feed-2", feed_id="aaaaaaaa1234"),
-        ]
-        assert nomnom._autogen_feed_nickname(feeds) == "feed-3"
-
-
-class TestCmdOpen:
+class TestCmdInit:
     @pytest.fixture
     def fake_relay_and_identity(self, tmp_path, monkeypatch):
         monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
@@ -5337,64 +5300,37 @@ class TestCmdOpen:
         monkeypatch.setattr(nomnom, "_relay_mint_feed", fake_mint)
         yield captured
 
-    def test_open_mints_feed_and_writes_config(
-        self, fake_relay_and_identity, tmp_path, capsys,
+    def test_init_creates_permanent_channel(
+        self, fake_relay_and_identity, capsys,
     ):
-        args = argparse.Namespace(name=None, ttl=3600, default=False)
-        rc = nomnom.cmd_open(args)
+        rc = nomnom.cmd_init(argparse.Namespace(allow_private=True))
         assert rc == 0
         cfg = nomnom._load_feeds_config()
         assert len(cfg["feeds"]) == 1
         feed = cfg["feeds"][0]
+        assert feed.name == nomnom._CHANNEL_NAME
         assert feed.feed_id == "abcDEF12_-xy"
         assert feed.url == "https://relay.example.com/f/abcDEF12_-xy"
-        assert cfg["default"] == feed.name  # first feed auto-defaults
-        out = capsys.readouterr()
-        assert "https://relay.example.com/f/abcDEF12_-xy" in out.out
-        # Member card contains the identity sig pubkey, not the DH key.
-        ident = nomnom._load_identity()
-        assert fake_relay_and_identity["card"]["identity_pubkey"] == ident["sig_pub"]
+        assert cfg["default"] == nomnom._CHANNEL_NAME
+        # Minted with the permanent (multi-year) TTL.
+        assert fake_relay_and_identity["ttl"] == nomnom._PERMANENT_TTL_SEC
+        # Prints the channel secret to stdout for pasting elsewhere.
+        assert "https://relay.example.com/f/abcDEF12_-xy" in capsys.readouterr().out
 
-    def test_open_respects_explicit_name(
+    def test_init_refuses_when_channel_exists(
         self, fake_relay_and_identity, capsys,
     ):
-        args = argparse.Namespace(name="standup", ttl=3600, default=False)
-        rc = nomnom.cmd_open(args)
-        assert rc == 0
-        cfg = nomnom._load_feeds_config()
-        assert cfg["feeds"][0].name == "standup"
-
-    def test_open_rejects_duplicate_name(
-        self, fake_relay_and_identity, capsys,
-    ):
-        nomnom.cmd_open(argparse.Namespace(name="alpha", ttl=3600, default=False))
-        rc = nomnom.cmd_open(
-            argparse.Namespace(name="alpha", ttl=3600, default=False),
-        )
+        assert nomnom.cmd_init(argparse.Namespace(allow_private=True)) == 0
+        rc = nomnom.cmd_init(argparse.Namespace(allow_private=True))
         assert rc == 1
         assert "already exists" in capsys.readouterr().err
 
-    def test_open_default_flag(self, fake_relay_and_identity, capsys):
-        nomnom.cmd_open(argparse.Namespace(name="first", ttl=3600, default=False))
-        # Need a new fake feed_id for the second mint.
-        nomnom._relay_mint_feed = lambda relay, *, ttl_seconds, member_card: {  # type: ignore
-            "feed_id": "ZZZ987654321",
-            "expires_at": 1_700_000_000 + ttl_seconds,
-            "created_at": 1_700_000_000,
-        }
-        nomnom.cmd_open(
-            argparse.Namespace(name="second", ttl=3600, default=True),
-        )
-        cfg = nomnom._load_feeds_config()
-        assert cfg["default"] == "second"
-
-    def test_open_aborts_when_no_relay(self, tmp_path, monkeypatch, capsys):
+    def test_init_aborts_when_no_relay(self, tmp_path, monkeypatch, capsys):
         monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
-        # Refuse the interactive prompt: simulate no TTY.
+        # No relay.json and no TTY → can't prompt, so init bails.
         monkeypatch.setattr("sys.stdin.isatty", lambda: False)
-        rc = nomnom.cmd_open(
-            argparse.Namespace(name=None, ttl=3600, default=False),
-        )
+        monkeypatch.setattr("sys.stderr.isatty", lambda: False)
+        rc = nomnom.cmd_init(argparse.Namespace(allow_private=False))
         assert rc == 1
 
 
@@ -5418,133 +5354,64 @@ class TestCmdJoin:
         monkeypatch.setattr(nomnom, "_relay_list_members", fake_list_members)
         return roster
 
-    def test_join_saves_feed_with_member_card(
-        self, fake_feed_endpoints, capsys,
-    ):
-        url = "https://relay.example.com/f/abcDEF12_-xy"
-        rc = nomnom.cmd_join(argparse.Namespace(url=url, name=None, default=False))
+    def test_join_saves_single_channel(self, fake_feed_endpoints, capsys):
+        secret = "https://relay.example.com/f/abcDEF12_-xy"
+        rc = nomnom.cmd_join(argparse.Namespace(secret=secret))
         assert rc == 0
         cfg = nomnom._load_feeds_config()
         assert len(cfg["feeds"]) == 1
         feed = cfg["feeds"][0]
-        assert feed.url == url
+        assert feed.name == nomnom._CHANNEL_NAME
+        assert feed.url == secret
         assert feed.feed_id == "abcDEF12_-xy"
         assert feed.member_id  # was published
-        assert len(feed.members_cache) == 1
+        assert cfg["default"] == nomnom._CHANNEL_NAME
 
-    def test_join_rejects_malformed_url(self, fake_feed_endpoints, capsys):
-        rc = nomnom.cmd_join(
-            argparse.Namespace(url="not-a-url", name=None, default=False),
-        )
+    def test_join_replaces_existing_channel(self, fake_feed_endpoints, capsys):
+        nomnom.cmd_join(argparse.Namespace(
+            secret="https://relay.example.com/f/abcDEF12_-xy",
+        ))
+        # Re-pairing to a different channel replaces the old one.
+        nomnom.cmd_join(argparse.Namespace(
+            secret="https://relay.example.com/f/ZZZ987654321",
+        ))
+        cfg = nomnom._load_feeds_config()
+        assert len(cfg["feeds"]) == 1
+        assert cfg["feeds"][0].feed_id == "ZZZ987654321"
+
+    def test_join_rejects_malformed_secret(self, fake_feed_endpoints, capsys):
+        rc = nomnom.cmd_join(argparse.Namespace(secret="not-a-url"))
         assert rc == 1
 
 
-class TestCmdFeedsList:
-    def test_lists_default_marker(self, tmp_path, monkeypatch, capsys):
-        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
-        cfg = nomnom._empty_feeds_config()
-        nomnom._add_or_replace_feed(cfg, _make_feed(name="home"))
-        nomnom._add_or_replace_feed(
-            cfg, _make_feed(name="work", feed_id="abcDEF99_-zy"),
-        )
-        nomnom._save_feeds_config(cfg)
-        rc = nomnom.cmd_feeds(argparse.Namespace(action="list"))
-        assert rc == 0
-        out = capsys.readouterr().out
-        # default marker on the first feed
-        assert " * home" in out
-        assert "   work" in out
-
-    def test_empty_message(self, tmp_path, monkeypatch, capsys):
-        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
-        rc = nomnom.cmd_feeds(argparse.Namespace(action="list"))
-        assert rc == 0
-        assert "no feeds" in capsys.readouterr().err
-
-
-class TestCmdFeedsActions:
+class TestCmdChannel:
     @pytest.fixture
-    def feed_config(self, tmp_path, monkeypatch):
+    def channel(self, tmp_path, monkeypatch):
         monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
         cfg = nomnom._empty_feeds_config()
-        nomnom._add_or_replace_feed(cfg, _make_feed(name="home"))
+        cfg["feeds"] = [_make_feed(name=nomnom._CHANNEL_NAME)]
+        cfg["default"] = nomnom._CHANNEL_NAME
         nomnom._save_feeds_config(cfg)
         return tmp_path
 
-    def test_url_prints_feed_url(self, feed_config, capsys):
-        rc = nomnom.cmd_feeds(argparse.Namespace(action="url", name="home"))
-        assert rc == 0
-        assert "https://relay.example.com/f/" in capsys.readouterr().out
-
-    def test_url_missing_feed(self, feed_config, capsys):
-        rc = nomnom.cmd_feeds(argparse.Namespace(action="url", name="missing"))
-        assert rc == 1
-
-    def test_default_updates_default(self, feed_config, capsys):
-        # Add a second feed first.
-        cfg = nomnom._load_feeds_config()
-        nomnom._add_or_replace_feed(
-            cfg, _make_feed(name="work", feed_id="abcDEF99_-zy"),
-        )
-        nomnom._save_feeds_config(cfg)
-        rc = nomnom.cmd_feeds(argparse.Namespace(action="default", name="work"))
-        assert rc == 0
-        assert nomnom._load_feeds_config()["default"] == "work"
-
-    def test_rename_updates_name(self, feed_config, capsys):
-        rc = nomnom.cmd_feeds(argparse.Namespace(
-            action="rename", name="home", new_name="house",
-        ))
-        assert rc == 0
-        cfg = nomnom._load_feeds_config()
-        assert cfg["feeds"][0].name == "house"
-        assert cfg["default"] == "house"  # default tracked the rename
-
-    def test_rename_rejects_existing_target(self, feed_config, capsys):
-        cfg = nomnom._load_feeds_config()
-        nomnom._add_or_replace_feed(
-            cfg, _make_feed(name="work", feed_id="abcDEF99_-zy"),
-        )
-        nomnom._save_feeds_config(cfg)
-        rc = nomnom.cmd_feeds(argparse.Namespace(
-            action="rename", name="home", new_name="work",
-        ))
-        assert rc == 1
-
-    def test_leave_removes_feed_and_calls_relay(
-        self, feed_config, monkeypatch, capsys,
-    ):
-        called = {}
+    def test_channel_prints_secret_and_devices(self, channel, monkeypatch, capsys):
         monkeypatch.setattr(
-            nomnom, "_relay_delete_member",
-            lambda host, fid, fkey, mid: called.setdefault("ok", True),
+            nomnom, "_relay_list_members",
+            lambda *a, **k: {"members": [
+                {"member_id": "m1", "identity_pubkey": "aa" * 32, "name": "laptop"},
+            ]},
         )
-        rc = nomnom.cmd_feeds(argparse.Namespace(action="leave", name="home"))
+        rc = nomnom.cmd_channel(argparse.Namespace())
         assert rc == 0
-        cfg = nomnom._load_feeds_config()
-        assert cfg["feeds"] == []
-        assert cfg["default"] is None
-        assert called.get("ok") is True
+        out = capsys.readouterr()
+        assert "https://relay.example.com/f/" in out.out  # secret on stdout
+        assert "laptop" in out.err  # roster on stderr
 
-    def test_extend_calls_relay_and_updates_local(
-        self, feed_config, monkeypatch, capsys,
-    ):
-        monkeypatch.setattr(
-            nomnom, "_relay_extend_feed",
-            lambda host, fid, fkey, ttl: {"expires_at": 3_000_000_000},
-        )
-        rc = nomnom.cmd_feeds(argparse.Namespace(
-            action="extend", name="home", ttl=7200,
-        ))
-        assert rc == 0
-        cfg = nomnom._load_feeds_config()
-        assert cfg["feeds"][0].expires_at == 3_000_000_000
-
-    def test_extend_rejects_short_ttl(self, feed_config, capsys):
-        rc = nomnom.cmd_feeds(argparse.Namespace(
-            action="extend", name="home", ttl=30,
-        ))
+    def test_channel_errors_without_channel(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        rc = nomnom.cmd_channel(argparse.Namespace())
         assert rc == 1
+        assert "no channel yet" in capsys.readouterr().err
 
 
 class TestFeedUrl:
