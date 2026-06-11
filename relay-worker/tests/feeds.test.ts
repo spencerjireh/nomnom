@@ -53,13 +53,19 @@ describe("POST /feeds (mint)", () => {
   it("clamps absurdly long TTL", async () => {
     const minted = await mintFeed(SELF, { ttlSeconds: 10 ** 12 });
     expect(minted.expires_at - minted.created_at).toBeLessThanOrEqual(
-      90 * 86_400,
+      3650 * 86_400,
     );
   });
 
   it("clamps absurdly short TTL", async () => {
     const minted = await mintFeed(SELF, { ttlSeconds: 0 });
     expect(minted.expires_at - minted.created_at).toBeGreaterThanOrEqual(60);
+  });
+
+  it("honors a multi-year channel TTL", async () => {
+    const fiveYears = 5 * 365 * 86_400;
+    const minted = await mintFeed(SELF, { ttlSeconds: fiveYears });
+    expect(minted.expires_at - minted.created_at).toBe(fiveYears);
   });
 });
 
