@@ -21,7 +21,10 @@ const MEMBER_ID_RE = /^[A-Za-z0-9_-]{8,64}$/;
 const SLOT_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
 
 const DEFAULT_TTL_SEC = 86_400; // 1 day
-const MAX_TTL_SEC = 90 * 86_400; // 90 days
+// A "channel" is one permanent feed shared across a user's own devices, so the
+// cap is effectively forever (10 years). `nomnom init` mints with a multi-year
+// TTL; this keeps the channel alive even when every device is idle for months.
+const MAX_TTL_SEC = 3650 * 86_400; // ~10 years
 const MIN_TTL_SEC = 60; // 1 minute (sanity floor)
 const MAX_MEMBER_CARD_BYTES = 4096;
 const MAX_MEMBER_NAME_LEN = 128;
