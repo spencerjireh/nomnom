@@ -23,27 +23,28 @@ Deployed as a static-assets Cloudflare Worker at `nomnom.spencerjireh.com`.
   `EventSource` subscription to `/feeds/:id/stream` for real-time new-slot push
   (the feed-key MAC rides the `?auth=` query, since `EventSource` can't set
   headers; it reconnects itself with a fresh signature).
-- **Orchestration** (`src/orchestration/`) implements open / join / send /
+- **Orchestration** (`src/orchestration/`) implements create / join / send /
   receive as framework-free state machines over the relay client. Receive
   subscribes to the SSE stream — falling back to the `/slots` long-poll if the
   relay has no `/stream` — then fetches + decrypts each new slot.
 - **UI** (`src/components/`, zustand store in `src/state/`) is an editorial
   two-pane "diner-receipt" interface: a brand/status rail beside the receipt,
-  with Send / Receive / Feeds tabs + Settings.
+  showing the one channel's timeline + Settings. nomnom has a single permanent
+  **channel** shared across your devices, not a list of feeds.
 
-A feed is one-to-many: every member derives the same symmetric key from the
-shared URL token, posts are encrypted under it, and each post carries an Ed25519
+A channel is one-to-many: every device derives the same symmetric key from the
+shared secret, posts are encrypted under it, and each post carries an Ed25519
 signature so senders are authenticated even though the key is shared.
 
-Identity, joined feeds, TOFU pins, and the relay passphrase live in
-`localStorage`, shapes matching the CLI's `identity.json` / `feeds.json` /
+Identity, the channel, TOFU pins, and the relay passphrase live in
+`localStorage`, with shapes matching the CLI's `identity.json` / feed record /
 `known_peers.json`. **Accepted tradeoff:** the Ed25519 seed (`sig_priv`) and the
 relay secret are readable by any script on this origin — the same trust model as
 the CLI's `~/.config/nomnom` files. The site ships a strict CSP
 (`public/_headers`) and no third-party scripts to keep the origin clean.
 
-A relay passphrase is only needed to **open** (mint) a feed; **joining** a feed
-by URL needs nothing but the URL, so the app is usable on first load — relay
+A relay passphrase is only needed to **create** a channel; **joining** by pasting
+the channel secret needs nothing else, so the app is usable on first load — relay
 setup lives in Settings.
 
 ## Develop
@@ -70,13 +71,13 @@ Three layers, each proving a different thing:
   derivation, `feed_seal` (reseals to identical bytes) and `feed_open` (decrypts
   a Python-sealed post), and the request MAC.
 - **`npm run test:e2e`** — Playwright UI smoke (`e2e/`). Drives the built app
-  through `vite preview`, fully **offline and secret-free**: feed state is seeded
+  through `vite preview`, fully **offline and secret-free**: channel state is seeded
   from `localStorage` and no relay is touched, so it guards the UI + state wiring.
   First run needs `npx playwright install chromium`.
 - **Manual CLI↔browser round-trip** — the real interop proof, run by hand against
-  the live relay: `nomnom open` a feed, join it in the browser (or vice-versa),
-  send a file each way, and checksum-compare. Not in CI (it needs the relay
-  passphrase + a running CLI).
+  the live relay: create a channel with `nomnom init`, join it in the browser by
+  pasting the secret (or vice-versa), send a file each way, and checksum-compare.
+  Not in CI (it needs the relay passphrase + a running CLI).
 
 ## Crypto interop fixtures
 

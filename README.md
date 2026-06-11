@@ -25,7 +25,7 @@ nomnom .
 
 Opens a picker for the current directory. Pick files, hit `Enter`, get `./<repo>-<timestamp>.txt`. `.gitignore`, junk dirs (`.git`, `node_modules`, …), binaries, symlinks, and obvious secrets are skipped before the picker loads.
 
-Run bare `nomnom` on a TTY to open a launcher with tiles for Bundle, Send, Receive, Feeds, Commit, PR, Item, Rebuild, and Extensions. Inside the picker, `v` cycles bundle / `commit` / `pr` / `item` when run from inside a git repo.
+Run bare `nomnom` on a TTY to open a launcher with tiles for Bundle, Send, Receive, Channel, Commit, PR, Item, Rebuild, and Extensions. Inside the picker, `v` cycles bundle / `commit` / `pr` / `item` when run from inside a git repo.
 
 Output mirrors [repomix](https://github.com/yamadashy/repomix)'s shape:
 
@@ -122,34 +122,34 @@ Never overwrites. Path-escape attempts (absolute paths, `..` segments) are refus
 
 ## Send between machines
 
-Move a bundle (or any file) between your own devices over an end-to-end encrypted channel. No accounts and no shared third-party server — traffic flows through a small Cloudflare Worker you run yourself, and it only ever sees ciphertext.
+Move a bundle (or any file) between your own devices over an end-to-end encrypted **channel**. No accounts and no shared third-party server — traffic flows through a small Cloudflare Worker you run yourself, and it only ever sees ciphertext.
 
-Think of a **feed** as a shared channel, a bit like a group chat for files: one device opens it and gets a short URL; any device that pastes the URL joins. Anything you `send` reaches every other member. The URL is the password — but even a leaked URL can't impersonate a sender (see [Trust on first use](#trust) below).
+Your **channel** is one permanent, shared space across all of your own devices. You set it up once on the device that owns the relay; every other device joins it once by pasting a short secret and stays in forever. Anything you `send` reaches every other device. The secret is the password — but even a leaked secret can't impersonate a sender (see [Trust on first use](#trust) below).
 
-Four verbs: `open` · `join` · `send` · `receive`.
+Five verbs: `init` · `join` · `channel` · `send` · `receive`.
 
-### Open a channel and invite a device
+### Create your channel and add a device
 
 ```sh
-# device 1 (relay already configured — see setup below)
-nomnom open --name home --default
-# opened feed 'home' (TTL 86400s, expires at 1717459200).
-# share this URL with the other device:
+# device 1 (the one that owns the relay) — first-time setup, run once
+nomnom init
+# (prompts for the Worker URL + HMAC secret if the relay isn't set up yet,
+#  then creates your channel and prints the secret to paste elsewhere:)
+# channel created. paste this secret on your other devices (`nomnom join <secret>`):
 # https://relay.your-subdomain.workers.dev/f/k4n2pX9qLm3T
 
-# device 2 (nothing to set up on this side — the URL is the credential)
+# device 2 (nothing to set up on this side — the secret is the credential)
 nomnom join 'https://relay.your-subdomain.workers.dev/f/k4n2pX9qLm3T'
-# joined feed 'feed-1' with 2 member(s).
+# joined the channel (2 device(s)).
 ```
 
-Open as many feeds as you like (`home`, `work`, …); `nomnom feeds default <name>` picks which one `send`/`receive` use by default.
+Re-display the secret (to add a third device) anytime with `nomnom channel`.
 
 ### Send and receive
 
 ```sh
-nomnom receive                       # watch the default feed; one line per received file
-nomnom send report.txt               # broadcast to every other member of the default feed
-nomnom send report.txt --feed work   # target a specific joined feed
+nomnom receive          # watch your channel; one line per received file
+nomnom send report.txt  # send to every other device on your channel
 ```
 
 `receive` stays open after each delivery, so you can leave a laptop listening and fire off `send` from another machine all afternoon — new posts arrive in real time (the relay pushes them over Server-Sent Events, falling back to long-polling). Pass `--once` to exit after the first file (handy for scripting).
@@ -158,47 +158,39 @@ Max transfer size is 256 MB (100 MB on Cloudflare's free tier — see [`relay-wo
 
 ### From a browser
 
-[`nomnom-web/`](nomnom-web/README.md) is a browser client (Vite + React) that joins the same feeds as the CLI — its crypto is a byte-for-byte TypeScript port of `nomnom.py`. It's deployed to Cloudflare Pages, and the relay Worker allowlists its origin for CORS.
+[`nomnom-web/`](nomnom-web/README.md) is a browser client (Vite + React) that joins the same channel as the CLI — its crypto is a byte-for-byte TypeScript port of `nomnom.py`. It's deployed to Cloudflare Pages, and the relay Worker allowlists its origin for CORS.
 
 <details>
 <summary><b>First-time setup: deploy your relay</b></summary>
 
-`send`/`receive` need a relay — a small Cloudflare Worker you deploy once to your own account. It only ever sees ciphertext and opaque slot ids.
+Creating a channel needs a relay — a small Cloudflare Worker you deploy once to your own account. It only ever sees ciphertext and opaque slot ids.
 
 1. Deploy the Worker — see [`relay-worker/README.md`](relay-worker/README.md).
-2. On the device that will own the relay:
+2. On the device that will own the relay, run `nomnom init`. If the relay isn't configured yet it prompts for the Worker URL, generates the HMAC secret, and prints the `wrangler` commands to push the secret and deploy — then it creates your channel.
 
-   ```sh
-   nomnom relay init    # prompts for the Worker URL, generates the HMAC secret
-                        # used to mint feeds, and prints the wrangler commands
-                        # to push the secret and deploy.
-   ```
-
-Other devices don't need any of this — they just `join` a feed URL. To let another device mint its own feeds on your relay, copy the token from `nomnom relay show --token` over to it.
+Other devices don't need any of this — they just `join` the channel secret. To let another *owner* device create channels on the same relay, copy the token from `nomnom relay show --token` over to it.
 
 </details>
 
 <details>
-<summary><b>Managing feeds</b></summary>
+<summary><b>Your channel</b></summary>
+
+There's one channel, shared across your devices. Inspect it anytime:
 
 ```sh
-nomnom feeds list                                  # joined feeds + default marker + TTL
-nomnom feeds members home                          # fetch and display the live roster
-nomnom feeds url home                              # print the shareable URL
-nomnom feeds default work                          # switch the default
-nomnom feeds rename home house                     # rename a feed locally
-nomnom feeds extend home --ttl 604800              # bump expiry to a week from now
-nomnom feeds leave home                            # delete this device's member card, drop locally
+nomnom channel   # print the channel secret (to add another device) + the device roster
 ```
+
+To leave on a device, `nomnom reset` wipes that device's local state; re-join later with the secret. Re-pair a device by running `nomnom join <secret>` again (it replaces whatever channel that device had).
 
 </details>
 
 <details>
 <summary><b><a name="trust"></a>Trust on first use</b></summary>
 
-Every post is encrypted with the feed key derived from the URL token and signed by the sender's Ed25519 identity. Receivers verify the signature against the sender's pinned identity, so a hostile relay (or a leaked URL) can't impersonate a member without their private key.
+Every post is encrypted with the channel key derived from the secret's URL token and signed by the sender's Ed25519 identity. Receivers verify the signature against the sender's pinned identity, so a hostile relay (or a leaked secret) can't impersonate a device without its private key.
 
-Each machine mints a long-term Ed25519 identity in `~/.config/nomnom/identity.json` on first run. The first time you see a member's identity across all feeds, nomnom prompts:
+Each machine mints a long-term Ed25519 identity in `~/.config/nomnom/identity.json` on first run. The first time you see a device's identity on your channel, nomnom prompts:
 
 ```text
   first contact with 'bob-laptop'.
@@ -207,7 +199,7 @@ Each machine mints a long-term Ed25519 identity in `~/.config/nomnom/identity.js
   trust and pin this device? [y/N]:
 ```
 
-Once pinned, that identity is trusted in every feed it appears in — joining another feed where the same person already participates is silent. Possessing a feed URL grants access to that one feed, but never impersonates anyone: the signature is the trust anchor, not the URL.
+Once pinned, that identity is trusted wherever it appears — re-pairing the same device is silent. Possessing the channel secret grants access to the channel, but never impersonates anyone: the signature is the trust anchor, not the secret.
 
 ```sh
 nomnom peers list                    # show pinned identities + fingerprints
@@ -230,7 +222,7 @@ nomnom peers forget alice-mac        # drop a pin (TOFU fires fresh on next sigh
 - `POST /feeds` (mint) is gated by the per-deployment HMAC secret. Only people with your relay HMAC can create feeds on your Worker.
 - `/feeds/:id/*` (member roster, slots, extend, close) is gated by a per-request signature derived from the feed key via HKDF. Anyone with the URL can talk to the Worker about that feed; nothing else on the relay is reachable.
 
-This split means a feed URL can be safely shared cross-account: the recipient gets access to that one feed without seeing or holding your relay credential. Each slot lives until feed TTL (default 1 day); the R2 bucket lifecycle collects orphans after 1 day.
+This split means the channel secret can be safely shared cross-account: the recipient gets access to that one channel without seeing or holding your relay credential. Slots live until the channel's TTL (a channel is minted with a multi-year TTL, so it's effectively permanent); the R2 bucket lifecycle collects orphans after 1 day. (The wire protocol still calls a channel a "feed" — `/feeds/:id/*` — for back-compat with the original feeds-v2 transport.)
 
 </details>
 
@@ -239,15 +231,14 @@ This split means a feed URL can be safely shared cross-account: the recipient ge
 
 | Command | Effect |
 | --- | --- |
-| `nomnom relay init` | Prompt URL, generate HMAC secret, save to `relay.json`, print the `wrangler secret put` + `wrangler deploy` commands. |
-| `nomnom relay show [--token]` | Print URL (secret redacted). `--token` prints the `host#secret` token used to give another device permission to mint feeds on your relay. |
+| `nomnom init` | First-device setup: configure the relay if needed (prompts URL, generates the HMAC secret, prints the `wrangler` commands), then create your one permanent channel and print its secret. |
+| `nomnom join <secret>` | Add this device to your channel by pasting its secret; replaces any channel already on this device. |
+| `nomnom channel` | Print the channel secret (to add a device) and the device roster. |
+| `nomnom send <path>` | Send a file to every other device on your channel. |
+| `nomnom receive [--once]` | Watch your channel for incoming files. |
+| `nomnom relay show [--token]` | Print URL (secret redacted). `--token` prints the `host#secret` token, which lets another *owner* device run `nomnom init` against the same relay. |
 | `nomnom relay test` | Round-trip: HMAC self-check via `/health` + `/slots`. |
 | `nomnom relay clear` | Delete `~/.config/nomnom/relay.json`. |
-| `nomnom open [--name N] [--ttl S] [--default]` | Mint a feed on the configured relay. |
-| `nomnom join <url> [--name N] [--default]` | Join a feed; auto-publishes a member card. |
-| `nomnom feeds list / members / url / default / rename / leave / extend` | Local + remote feed management. |
-| `nomnom send <path> [--feed N]` | Broadcast a file to a feed. |
-| `nomnom receive [--feed N] [--once]` | Watch a feed for incoming posts. |
 | `nomnom peers list / fingerprint / forget` | Global identity pin management. |
 
 </details>
@@ -255,7 +246,7 @@ This split means a feed URL can be safely shared cross-account: the recipient ge
 <details>
 <summary><b>Reset all state</b></summary>
 
-`nomnom reset` wipes `~/.config/nomnom/` after a y/N prompt — identity, pinned identities, joined feeds, and relay config in one shot. Refuses on a non-tty stdin so a piped invocation can't accidentally blow it away.
+`nomnom reset` wipes `~/.config/nomnom/` after a y/N prompt — identity, pinned identities, the channel, and relay config in one shot. Refuses on a non-tty stdin so a piped invocation can't accidentally blow it away.
 
 ```sh
 nomnom reset
@@ -265,7 +256,7 @@ nomnom reset
 # proceed? [y/N]: y
 ```
 
-After reset the next `nomnom relay init` (or `nomnom open` / `nomnom join`) regenerates a fresh identity. Other devices that previously had this identity pinned will see a TOFU prompt on the next feed-shared post.
+After reset the next `nomnom init` (or `nomnom join <secret>`) regenerates a fresh identity. Other devices that previously had this identity pinned will see a TOFU prompt on its next post to the channel.
 
 </details>
 
