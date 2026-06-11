@@ -2,6 +2,10 @@
 // ticks are high-frequency (selectors re-render only the panel that cares), the
 // slices are read across components, and the orchestration layer runs OUTSIDE
 // React and needs imperative get()/set().
+//
+// nomnom has exactly one "channel" — a single permanent feed shared across the
+// user's own devices — so the store holds a `channel` singleton and one flat
+// session `timeline`, not a list of feeds.
 
 import { create } from "zustand";
 import { persistence } from "./persistence";
@@ -44,27 +48,22 @@ const IDLE_TRANSFER: TransferSlice = {
 interface Store {
   identity: Identity | null;
   relay: RelayConfig | null;
-  feeds: Feed[];
-  selectedFeed: string | null;
+  channel: Feed | null;
   peers: PeerStore;
   transfer: TransferSlice;
-  /** Per-feed session timeline. In-memory only — never persisted. */
-  timelines: Record<string, TimelineEntry[]>;
-  /** Per-feed "last viewed at" (epoch ms). Drives the activity dot on the rail. */
-  viewedAt: Record<string, number>;
+  /** The channel's session timeline. In-memory only — never persisted. */
+  timeline: TimelineEntry[];
   tofu: { request: TofuRequest; resolve: (ok: boolean) => void } | null;
 
   hydrate: () => void;
   setName: (name: string) => void;
   setRelay: (cfg: RelayConfig) => void;
 
-  // feeds
-  upsertFeed: (feed: Feed) => void;
-  removeFeed: (name: string) => void;
-  renameFeed: (oldName: string, newName: string) => boolean;
-  patchFeed: (name: string, patch: Partial<Feed>) => void;
-  setFeedAutoSave: (name: string, autoSave: boolean) => void;
-  selectFeed: (name: string | null) => void;
+  // channel
+  setChannel: (feed: Feed) => void;
+  patchChannel: (patch: Partial<Feed>) => void;
+  setAutoSave: (autoSave: boolean) => void;
+  leaveChannel: () => void;
 
   // TOFU pins (keyed by Ed25519 sig_pub)
   isPinned: (sigPub: string) => boolean;
@@ -79,9 +78,8 @@ interface Store {
   resetTransfer: () => void;
 
   // timeline
-  appendTimeline: (feedName: string, entry: TimelineEntry) => void;
-  patchTimelineEntry: (feedName: string, id: string, patch: Partial<TimelineEntry>) => void;
-  markFeedViewed: (feedName: string) => void;
+  appendTimeline: (entry: TimelineEntry) => void;
+  patchTimelineEntry: (id: string, patch: Partial<TimelineEntry>) => void;
 
   requestTofu: (request: TofuRequest) => Promise<boolean>;
   resolveTofu: (ok: boolean) => void;
@@ -90,18 +88,15 @@ interface Store {
 }
 
 export const useStore = create<Store>((set, get) => {
-  const persistFeeds = () => persistence.saveFeeds({ feeds: get().feeds });
-  const persistSelected = () => persistence.saveLastSelectedFeed(get().selectedFeed);
+  const persistChannel = () => persistence.saveChannel(get().channel);
 
   return {
     identity: null,
     relay: null,
-    feeds: [],
-    selectedFeed: null,
+    channel: null,
     peers: {},
     transfer: IDLE_TRANSFER,
-    timelines: {},
-    viewedAt: {},
+    timeline: [],
     tofu: null,
 
     hydrate: () => {
@@ -110,16 +105,10 @@ export const useStore = create<Store>((set, get) => {
         identity = generateIdentity();
         persistence.saveIdentity(identity);
       }
-      const { feeds } = persistence.loadFeeds();
-      const lastSelected = persistence.loadLastSelectedFeed();
-      const selectedFeed = lastSelected && feeds.some((f) => f.name === lastSelected)
-        ? lastSelected
-        : null;
       set({
         identity,
         relay: persistence.loadRelay(),
-        feeds,
-        selectedFeed,
+        channel: persistence.loadChannel(),
         peers: persistence.loadPeers(),
       });
     },
@@ -137,63 +126,27 @@ export const useStore = create<Store>((set, get) => {
       set({ relay: cfg });
     },
 
-    // --- feeds ---
+    // --- channel ---
 
-    upsertFeed: (feed) => {
-      const feeds = get().feeds.filter((f) => f.name !== feed.name);
-      feeds.push(feed);
-      set({ feeds });
-      persistFeeds();
+    setChannel: (feed) => {
+      // Re-pairing to a different channel clears the previous timeline.
+      const replacing = get().channel?.feed_id !== feed.feed_id;
+      set({ channel: feed, timeline: replacing ? [] : get().timeline });
+      persistChannel();
     },
 
-    removeFeed: (name) => {
-      const feeds = get().feeds.filter((f) => f.name !== name);
-      const { timelines, viewedAt } = get();
-      const { [name]: _t, ...timelinesRest } = timelines;
-      const { [name]: _v, ...viewedAtRest } = viewedAt;
-      let selectedFeed = get().selectedFeed;
-      if (selectedFeed === name) selectedFeed = null;
-      set({ feeds, selectedFeed, timelines: timelinesRest, viewedAt: viewedAtRest });
-      persistFeeds();
-      persistSelected();
+    patchChannel: (patch) => {
+      const cur = get().channel;
+      if (!cur) return;
+      set({ channel: { ...cur, ...patch } });
+      persistChannel();
     },
 
-    renameFeed: (oldName, newName) => {
-      const feeds = get().feeds;
-      if (feeds.some((f) => f.name === newName)) return false;
-      const next = feeds.map((f) => (f.name === oldName ? { ...f, name: newName } : f));
-      const { timelines, viewedAt, selectedFeed } = get();
-      const nextTimelines = { ...timelines };
-      if (oldName in nextTimelines) {
-        nextTimelines[newName] = nextTimelines[oldName];
-        delete nextTimelines[oldName];
-      }
-      const nextViewedAt = { ...viewedAt };
-      if (oldName in nextViewedAt) {
-        nextViewedAt[newName] = nextViewedAt[oldName];
-        delete nextViewedAt[oldName];
-      }
-      const nextSelected = selectedFeed === oldName ? newName : selectedFeed;
-      set({ feeds: next, timelines: nextTimelines, viewedAt: nextViewedAt, selectedFeed: nextSelected });
-      persistFeeds();
-      if (nextSelected !== selectedFeed) persistSelected();
-      return true;
-    },
+    setAutoSave: (autoSave) => get().patchChannel({ auto_save: autoSave }),
 
-    patchFeed: (name, patch) => {
-      const next = get().feeds.map((f) => (f.name === name ? { ...f, ...patch } : f));
-      set({ feeds: next });
-      persistFeeds();
-    },
-
-    setFeedAutoSave: (name, autoSave) => {
-      get().patchFeed(name, { auto_save: autoSave });
-    },
-
-    selectFeed: (name) => {
-      if (get().selectedFeed === name) return;
-      set({ selectedFeed: name });
-      persistSelected();
+    leaveChannel: () => {
+      set({ channel: null, timeline: [] });
+      persistChannel();
     },
 
     // --- TOFU pins ---
@@ -253,26 +206,13 @@ export const useStore = create<Store>((set, get) => {
 
     // --- timeline ---
 
-    appendTimeline: (feedName, entry) =>
-      set((s) => {
-        const rows = s.timelines[feedName] ?? [];
-        return { timelines: { ...s.timelines, [feedName]: [entry, ...rows] } };
-      }),
+    appendTimeline: (entry) =>
+      set((s) => ({ timeline: [entry, ...s.timeline] })),
 
-    patchTimelineEntry: (feedName, id, patch) =>
-      set((s) => {
-        const rows = s.timelines[feedName];
-        if (!rows) return {};
-        return {
-          timelines: {
-            ...s.timelines,
-            [feedName]: rows.map((r) => (r.id === id ? { ...r, ...patch } : r)),
-          },
-        };
-      }),
-
-    markFeedViewed: (feedName) =>
-      set((s) => ({ viewedAt: { ...s.viewedAt, [feedName]: Date.now() } })),
+    patchTimelineEntry: (id, patch) =>
+      set((s) => ({
+        timeline: s.timeline.map((r) => (r.id === id ? { ...r, ...patch } : r)),
+      })),
 
     requestTofu: (request) =>
       new Promise<boolean>((resolve) => {
@@ -303,12 +243,10 @@ export const useStore = create<Store>((set, get) => {
       set({
         identity,
         relay: null,
-        feeds: [],
-        selectedFeed: null,
+        channel: null,
         peers: {},
         transfer: IDLE_TRANSFER,
-        timelines: {},
-        viewedAt: {},
+        timeline: [],
         tofu: null,
       });
     },

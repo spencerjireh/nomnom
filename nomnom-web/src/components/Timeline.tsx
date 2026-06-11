@@ -12,13 +12,13 @@ function clock(at: number): string {
   return `${h}:${m}`;
 }
 
-/** Per-feed session timeline. In-flight sends show an inline progress bar;
+/** The channel's session timeline. In-flight sends show an inline progress bar;
  * held receives show [save] / [discard]; everything else is a static row. */
-export function Timeline({ feedName }: { feedName: string }) {
-  const rows = useStore((s) => s.timelines[feedName]);
+export function Timeline() {
+  const rows = useStore((s) => s.timeline);
   const { saveHeld, discardHeld } = useTransfer();
 
-  if (!rows || rows.length === 0) {
+  if (rows.length === 0) {
     return (
       <div className="timeline-empty dim">
         <p>nothing here yet.</p>
@@ -31,7 +31,7 @@ export function Timeline({ feedName }: { feedName: string }) {
     <ol className="timeline" role="list">
       {rows.map((row) => (
         <li key={row.id} className={`timeline-row row-${row.status}`}>
-          <Row row={row} feedName={feedName} onSave={saveHeld} onDiscard={discardHeld} />
+          <Row row={row} onSave={saveHeld} onDiscard={discardHeld} />
         </li>
       ))}
     </ol>
@@ -40,14 +40,12 @@ export function Timeline({ feedName }: { feedName: string }) {
 
 function Row({
   row,
-  feedName,
   onSave,
   onDiscard,
 }: {
   row: TimelineEntry;
-  feedName: string;
-  onSave: (feedName: string, id: string) => void;
-  onDiscard: (feedName: string, id: string) => void;
+  onSave: (id: string) => void;
+  onDiscard: (id: string) => void;
 }) {
   const [expanded, setExpanded] = useState(false);
   const [copied, setCopied] = useState<"idle" | "ok" | "err">("idle");
@@ -75,8 +73,8 @@ function Row({
     row.kind === "receive"
       ? row.peerName ?? "(unknown)"
       : row.recipients != null
-      ? `${row.recipients} other${row.recipients === 1 ? "" : "s"}`
-      : "feed";
+      ? `${row.recipients} device${row.recipients === 1 ? "" : "s"}`
+      : "channel";
 
   return (
     <>
@@ -147,13 +145,13 @@ function Row({
               {copied === "ok" ? "copied ✓" : copied === "err" ? "copy failed" : "copy text"}
             </button>
           )}
-          <button type="button" className="chip" onClick={() => onSave(feedName, row.id)}>
+          <button type="button" className="chip" onClick={() => onSave(row.id)}>
             save to downloads
           </button>
           <button
             type="button"
             className="chip danger"
-            onClick={() => onDiscard(feedName, row.id)}
+            onClick={() => onDiscard(row.id)}
           >
             discard
           </button>

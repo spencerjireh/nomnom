@@ -7,47 +7,41 @@ import { EmptyPane } from "./EmptyPane";
 import { Settings } from "./Settings";
 import { TofuModal } from "./TofuModal";
 
-/** Two-pane shell. Left: feed list. Right: selected feed timeline or
- * (when nothing's selected) the warm open/join empty state. */
+/** Two-pane shell. Left: brand + settings. Right: the channel timeline, or
+ * (when there's no channel yet) the paste-a-secret / create-a-channel pane. */
 export function Shell() {
   const identity = useStore((s) => s.identity);
-  const feeds = useStore((s) => s.feeds);
-  const selectedFeed = useStore((s) => s.selectedFeed);
-  const selectFeed = useStore((s) => s.selectFeed);
+  const channel = useStore((s) => s.channel);
   const { receive } = useTransfer();
 
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [nicknameBannerDismissed, setNicknameBannerDismissed] = useState(false);
 
-  const feed = feeds.find((f) => f.name === selectedFeed) ?? null;
-
-  // Ambient watch: keep a receive loop running on the selected feed. Receiving
-  // needs only the joined feed (feed key + host come from its URL) — NOT the
-  // relay mint credential, which gates open() alone. So a join-only device
-  // (no relay configured) still receives. Switching feeds aborts the old loop.
+  // Ambient watch: keep a receive loop running on the channel. Receiving needs
+  // only the channel secret (feed key + host come from its URL) — NOT the relay
+  // mint credential, which gates create() alone. So a join-only device (no relay
+  // configured) still receives. Re-pairing aborts the old loop.
   useEffect(() => {
-    if (!feed) return;
+    if (!channel) return;
     const abort = new AbortController();
-    receive(feed, abort.signal);
+    receive(channel, abort.signal);
     return () => abort.abort();
-    // Key only on feed name: feed mutations (roster/last_post_ts) would
-    // otherwise restart the loop on every poll.
+    // Key only on feed_id: roster/last_post_ts mutations would otherwise restart
+    // the loop on every poll.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [feed?.name]);
+  }, [channel?.feed_id]);
 
   if (!identity) return null;
 
   const showNicknameBanner =
-    !!feed &&
-    identity.name === "web-guest" &&
-    !nicknameBannerDismissed;
+    !!channel && identity.name === "web-guest" && !nicknameBannerDismissed;
 
   return (
-    <main className={selectedFeed ? "shell has-selection" : "shell"}>
+    <main className={channel ? "shell has-selection" : "shell"}>
       <FeedRail onOpenSettings={() => setSettingsOpen(true)} />
 
       <div className="shell-pane">
-        {feed ? (
+        {channel ? (
           <>
             {showNicknameBanner && (
               <div className="nick-banner small">
@@ -73,7 +67,7 @@ export function Shell() {
                 </button>
               </div>
             )}
-            <FeedView feed={feed} onBack={() => selectFeed(null)} />
+            <FeedView feed={channel} />
           </>
         ) : (
           <EmptyPane onNeedRelay={() => setSettingsOpen(true)} />

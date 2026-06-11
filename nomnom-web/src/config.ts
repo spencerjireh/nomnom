@@ -20,3 +20,9 @@ export const STREAM_UNSUPPORTED_RETRIES = 3;
 
 // 100 MB practical cap (free-tier edge limit; Worker accepts up to 256 MiB).
 export const MAX_PAYLOAD_BYTES = 100 * 1024 * 1024;
+
+// nomnom has exactly one "channel": a single permanent feed shared across a
+// user's own devices. It's stored under this fixed local name; creating one
+// mints with a multi-year TTL to match the relay Worker's raised cap.
+export const CHANNEL_NAME = "channel";
+export const PERMANENT_TTL_SECONDS = 3650 * 86_400; // ~10 years

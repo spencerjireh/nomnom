@@ -11,10 +11,12 @@ import type { Feed, Identity, PeerStore, RelayConfig } from "../types";
 const K = {
   identity: "nomnom:identity",
   relay: "nomnom:relay",
+  channel: "nomnom:channel",
+  // Legacy multi-feed keys; read once for migration, cleared on reset.
   feeds: "nomnom:feeds",
+  lastSelectedFeed: "nomnom:lastSelectedFeed",
   peers: "nomnom:peers",
   schema: "nomnom:schema",
-  lastSelectedFeed: "nomnom:lastSelectedFeed",
 } as const;
 
 // Schema 2 = feeds v2 (Ed25519 identity). A schema-1 (legacy DH) identity is
@@ -22,8 +24,8 @@ const K = {
 // not a schema bump — missing fields are filled with safe defaults on load.
 export const SCHEMA = 2;
 
-export interface FeedsConfig {
-  feeds: Feed[];
+function withAutoSave(raw: Omit<Feed, "auto_save"> & { auto_save?: boolean }): Feed {
+  return { ...(raw as Feed), auto_save: raw.auto_save === true };
 }
 
 function read<T>(key: string): T | null {
@@ -85,30 +87,29 @@ export const persistence = {
   loadRelay: (): RelayConfig | null => read<RelayConfig>(K.relay),
   saveRelay: (cfg: RelayConfig): void => write(K.relay, cfg),
 
-  loadFeeds: (): FeedsConfig => {
-    // Tolerate both the new {feeds:[...]} shape and the legacy {default,feeds:[...]}
-    // shape — older installs are read straight through, with auto_save defaulted off.
-    const cfg = read<{ feeds?: unknown }>(K.feeds);
-    if (!cfg || !Array.isArray(cfg.feeds)) return { feeds: [] };
-    const feeds: Feed[] = [];
-    for (const raw of cfg.feeds) {
-      if (!isFeed(raw)) continue;
-      feeds.push({ ...(raw as Feed), auto_save: raw.auto_save === true });
+  // The single channel = one stored Feed. New installs use `nomnom:channel`;
+  // older multi-feed installs are migrated by taking the first valid feed out
+  // of the legacy `nomnom:feeds` array.
+  loadChannel: (): Feed | null => {
+    const direct = read<unknown>(K.channel);
+    if (isFeed(direct)) return withAutoSave(direct);
+    const legacy = read<{ feeds?: unknown }>(K.feeds);
+    if (legacy && Array.isArray(legacy.feeds)) {
+      for (const raw of legacy.feeds) {
+        if (isFeed(raw)) return withAutoSave(raw);
+      }
     }
-    return { feeds };
+    return null;
   },
-  saveFeeds: (cfg: FeedsConfig): void => write(K.feeds, cfg),
-
-  loadLastSelectedFeed: (): string | null => read<string>(K.lastSelectedFeed),
-  saveLastSelectedFeed: (name: string | null): void => {
-    if (name === null) {
+  saveChannel: (feed: Feed | null): void => {
+    if (feed === null) {
       try {
-        localStorage.removeItem(K.lastSelectedFeed);
+        localStorage.removeItem(K.channel);
       } catch {
         // ignore
       }
     } else {
-      write(K.lastSelectedFeed, name);
+      write(K.channel, feed);
     }
   },
 

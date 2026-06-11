@@ -3,37 +3,25 @@ import { useStore } from "../state/store";
 import { useTransfer } from "../hooks/useTransfer";
 import { friendlyRelayMessage } from "../relay/errors";
 
-function autoFeedName(taken: Set<string>): string {
-  for (let i = 1; i < 10_000; i++) {
-    const candidate = `feed-${i}`;
-    if (!taken.has(candidate)) return candidate;
-  }
-  return `feed-${Date.now()}`;
-}
-
-/** Warm right-pane state shown when no feed is selected: brand prompt + open/join forms. */
+/** Bootstrap pane shown when this device has no channel yet: paste a secret to
+ * add this device (the common path), or — if this device owns a relay — create
+ * the channel. */
 export function EmptyPane({ onNeedRelay }: { onNeedRelay: () => void }) {
-  const feeds = useStore((s) => s.feeds);
   const relay = useStore((s) => s.relay);
-  const selectFeed = useStore((s) => s.selectFeed);
   const { open, join, sending } = useTransfer();
 
-  const [openName, setOpenName] = useState("");
-  const [joinUrl, setJoinUrl] = useState("");
-  const [joinName, setJoinName] = useState("");
+  const [secret, setSecret] = useState("");
   const [working, setWorking] = useState<null | "open" | "join">(null);
   const [error, setError] = useState<string | null>(null);
 
-  const taken = new Set(feeds.map((f) => f.name));
   const blocked = sending || working !== null;
 
-  async function doOpen() {
+  async function doJoin() {
     setError(null);
-    setWorking("open");
+    setWorking("join");
     try {
-      const feed = await open(openName.trim() || autoFeedName(taken));
-      setOpenName("");
-      selectFeed(feed.name);
+      await join(secret.trim());
+      setSecret("");
     } catch (e) {
       setError(friendlyRelayMessage(e));
     } finally {
@@ -41,14 +29,11 @@ export function EmptyPane({ onNeedRelay }: { onNeedRelay: () => void }) {
     }
   }
 
-  async function doJoin() {
+  async function doOpen() {
     setError(null);
-    setWorking("join");
+    setWorking("open");
     try {
-      const feed = await join(joinUrl.trim(), joinName.trim() || autoFeedName(taken));
-      setJoinUrl("");
-      setJoinName("");
-      selectFeed(feed.name);
+      await open();
     } catch (e) {
       setError(friendlyRelayMessage(e));
     } finally {
@@ -59,62 +44,45 @@ export function EmptyPane({ onNeedRelay }: { onNeedRelay: () => void }) {
   return (
     <div className="empty-pane">
       <header className="empty-head">
-        <h1 className="empty-title">a warm place to drop a file</h1>
+        <h1 className="empty-title">add this device to your channel</h1>
         <p className="empty-sub dim">
-          {feeds.length === 0
-            ? "open a feed (you host) or join one from a shared URL."
-            : "pick a feed on the left, or start a new one here."}
+          paste the channel secret from another device (run <code>nomnom channel</code>,
+          or copy it from the channel here).
         </p>
       </header>
 
       <section className="empty-form">
-        <span className="field-label">open a new feed</span>
-        {relay ? (
-          <div className="inline">
-            <input
-              placeholder="nickname (optional)"
-              value={openName}
-              onChange={(e) => setOpenName(e.target.value)}
-              disabled={blocked}
-            />
-            <button type="button" className="btn primary" onClick={doOpen} disabled={blocked}>
-              {working === "open" ? "opening…" : "open"}
-            </button>
-          </div>
-        ) : (
-          <p className="dim small">
-            opening a feed needs a relay.{" "}
-            <button type="button" className="linklike" onClick={onNeedRelay}>
-              configure one →
-            </button>
-          </p>
-        )}
+        <span className="field-label">channel secret</span>
+        <input
+          placeholder="https://relay…/f/<token>"
+          value={secret}
+          onChange={(e) => setSecret(e.target.value)}
+          disabled={blocked}
+        />
+        <button
+          type="button"
+          className="btn primary"
+          onClick={doJoin}
+          disabled={blocked || !secret.trim()}
+        >
+          {working === "join" ? "joining…" : "join"}
+        </button>
       </section>
 
       <section className="empty-form">
-        <span className="field-label">join by url</span>
-        <input
-          placeholder="https://relay…/f/<token>"
-          value={joinUrl}
-          onChange={(e) => setJoinUrl(e.target.value)}
-          disabled={blocked}
-        />
-        <div className="inline">
-          <input
-            placeholder="nickname (optional)"
-            value={joinName}
-            onChange={(e) => setJoinName(e.target.value)}
-            disabled={blocked}
-          />
-          <button
-            type="button"
-            className="btn primary"
-            onClick={doJoin}
-            disabled={blocked || !joinUrl.trim()}
-          >
-            {working === "join" ? "joining…" : "join"}
+        <span className="field-label">no channel yet?</span>
+        {relay ? (
+          <button type="button" className="btn" onClick={doOpen} disabled={blocked}>
+            {working === "open" ? "creating…" : "create a channel (you host)"}
           </button>
-        </div>
+        ) : (
+          <p className="dim small">
+            creating a channel needs a relay.{" "}
+            <button type="button" className="linklike" onClick={onNeedRelay}>
+              set one up →
+            </button>
+          </p>
+        )}
       </section>
 
       {error && <p className="err">{error}</p>}

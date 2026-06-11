@@ -13,11 +13,11 @@ function expiry(unix: number): string {
   return `${Math.floor(secs / 86_400)}d left`;
 }
 
-/** Collapsible footer under the timeline: members list, per-feed auto-save
- * toggle, copy URL, leave. Pure feed metadata — kept out of the timeline
+/** Collapsible footer under the timeline: device list, auto-save toggle, copy
+ * the channel secret, leave. Pure channel metadata — kept out of the timeline
  * so transfers stay the visual focus. */
 export function MembersFooter({ feed }: { feed: Feed }) {
-  const setFeedAutoSave = useStore((s) => s.setFeedAutoSave);
+  const setAutoSave = useStore((s) => s.setAutoSave);
   const { leave, sending } = useTransfer();
   const [copied, setCopied] = useState(false);
   const [confirmLeave, setConfirmLeave] = useState(false);
@@ -37,7 +37,7 @@ export function MembersFooter({ feed }: { feed: Feed }) {
   return (
     <details className="members-footer">
       <summary>
-        members ({members.length}){" "}
+        devices ({members.length}){" "}
         <span className="dim small">· {expiry(feed.expires_at)}</span>
       </summary>
 
@@ -56,9 +56,9 @@ export function MembersFooter({ feed }: { feed: Feed }) {
           <input
             type="checkbox"
             checked={feed.auto_save}
-            onChange={(e) => setFeedAutoSave(feed.name, e.target.checked)}
+            onChange={(e) => setAutoSave(e.target.checked)}
           />
-          <span>auto-save files from this feed</span>
+          <span>auto-save files from this channel</span>
           <span className="dim small">
             off: every incoming file holds for [save] / [discard]. on: files write
             straight to Downloads.
@@ -68,20 +68,20 @@ export function MembersFooter({ feed }: { feed: Feed }) {
         <div className="member-url">
           <code className="feed-url">{feed.url}</code>
           <button type="button" className="chip" onClick={copyUrl}>
-            {copied ? "copied!" : "copy url"}
+            {copied ? "copied!" : "copy secret"}
           </button>
         </div>
 
         {confirmLeave ? (
           <div className="member-leave">
-            <span className="err small">leave this feed on this device?</span>
+            <span className="err small">leave the channel on this device?</span>
             <button type="button" className="chip" onClick={() => setConfirmLeave(false)}>
               keep it
             </button>
             <button
               type="button"
               className="chip danger"
-              onClick={() => leave(feed)}
+              onClick={() => leave()}
               disabled={sending}
             >
               leave
@@ -94,7 +94,7 @@ export function MembersFooter({ feed }: { feed: Feed }) {
             onClick={() => setConfirmLeave(true)}
             disabled={sending}
           >
-            leave feed
+            leave channel
           </button>
         )}
       </div>
