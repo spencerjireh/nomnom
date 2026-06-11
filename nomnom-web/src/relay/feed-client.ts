@@ -39,16 +39,17 @@ export interface SlotMeta {
 /**
  * `?wait=..&since=..` — drop only `undefined`. `wait=0` is dropped because the
  * Worker treats absent and 0 identically (no long-poll). `since=0` is a real
- * "from the beginning" cursor that the Worker accepts (>= 0). Kwargs order
- * matches nomnom `_qs`.
+ * "from the beginning" cursor that the Worker accepts (>= 0). Order is built
+ * explicitly (wait, then since); the Worker strips the query before signing, so
+ * order is cosmetic, not load-bearing.
  */
 function qs(params: { wait?: number; since?: number }): string {
   const parts: string[] = [];
-  for (const [k, v] of Object.entries(params)) {
-    if (v === undefined) continue;
-    if (k === "wait" && v <= 0) continue;
-    if (v < 0) continue;
-    parts.push(`${k}=${Math.floor(v)}`);
+  if (params.wait !== undefined && params.wait > 0) {
+    parts.push(`wait=${Math.floor(params.wait)}`);
+  }
+  if (params.since !== undefined && params.since >= 0) {
+    parts.push(`since=${Math.floor(params.since)}`);
   }
   return parts.length ? "?" + parts.join("&") : "";
 }
@@ -271,6 +272,10 @@ export class FeedClient {
       signal.addEventListener("abort", onAbort, { once: true });
 
       try {
+        // Invariant: every state change (new queue item, error, abort) calls
+        // ping(), and the loop re-checks queue.length / dead / aborted at the
+        // top before awaiting again. So a ping() that fires while `wake` is null
+        // (consumer mid-yield) is benign — the next iteration observes the change.
         while (!signal.aborted && !dead) {
           if (queue.length === 0) {
             await new Promise<void>((r) => (wake = r));

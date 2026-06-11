@@ -145,6 +145,9 @@ export const useStore = create<Store>((set, get) => {
     setAutoSave: (autoSave) => get().patchChannel({ auto_save: autoSave }),
 
     leaveChannel: () => {
+      // Resolve any open first-contact prompt so an awaiting roster refresh
+      // doesn't hang forever once its channel is gone.
+      get().tofu?.resolve(false);
       set({ channel: null, timeline: [] });
       persistChannel();
     },
@@ -236,6 +239,9 @@ export const useStore = create<Store>((set, get) => {
       // Tear down any in-flight transfer first so its abort controller and
       // worker thread don't leak past the reset.
       get().transfer.abort?.abort();
+      // Resolve a pending TOFU prompt so a receive-side roster refresh awaiting
+      // it doesn't dangle (the transfer slice doesn't cover receive-side TOFU).
+      get().tofu?.resolve(false);
       cryptoClient.cancel();
       persistence.reset();
       const identity = generateIdentity();

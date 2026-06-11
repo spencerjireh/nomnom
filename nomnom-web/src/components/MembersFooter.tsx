@@ -2,16 +2,8 @@ import { useState } from "react";
 import { useStore } from "../state/store";
 import { useTransfer } from "../hooks/useTransfer";
 import { Fingerprint } from "./Fingerprint";
+import { expiry } from "../util/format";
 import type { Feed } from "../types";
-
-function expiry(unix: number): string {
-  if (!unix) return "unknown";
-  const secs = unix - Math.floor(Date.now() / 1000);
-  if (secs <= 0) return "expired";
-  if (secs < 3600) return `${Math.floor(secs / 60)}m left`;
-  if (secs < 86_400) return `${Math.floor(secs / 3600)}h left`;
-  return `${Math.floor(secs / 86_400)}d left`;
-}
 
 /** Collapsible footer under the timeline: device list, auto-save toggle, copy
  * the channel secret, leave. Pure channel metadata — kept out of the timeline

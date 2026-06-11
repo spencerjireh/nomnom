@@ -2,7 +2,8 @@
 // members), seal the post, PUT it to a random slot. Mirrors nomnom.py cmd_send.
 
 import { cryptoClient } from "../worker/cryptoClient";
-import { feedContext, refreshRoster, randomToken, type TofuHooks } from "./feed-actions";
+import { feedContext, refreshRoster, type TofuHooks } from "./feed-actions";
+import { randomToken } from "../util/ids";
 import { MAX_PAYLOAD_BYTES } from "../config";
 import type { Feed, Identity, Member, OnProgress, TransferResult } from "../types";
 
@@ -18,6 +19,12 @@ export interface SendParams {
 
 export async function runSend(p: SendParams): Promise<TransferResult> {
   const byteLength = p.payload.data.byteLength; // capture before the buffer transfers
+  if (byteLength === 0) {
+    // A transferred/detached ArrayBuffer reads as length 0 on the main thread
+    // (so does a genuinely empty file); the relay rejects an empty body either
+    // way, so fail fast with a clear message instead of broadcasting nothing.
+    throw new Error("payload is empty or its buffer was already consumed; re-read the file");
+  }
   if (byteLength > MAX_PAYLOAD_BYTES) {
     throw new Error(`payload too large for relay (${byteLength} bytes; limit ${MAX_PAYLOAD_BYTES})`);
   }

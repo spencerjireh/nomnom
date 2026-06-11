@@ -70,7 +70,14 @@ class CryptoClient {
         onProgress: opts.onProgress,
       });
       const msg: RequestMessage<Op> = { id, op, payload };
-      worker.postMessage(msg, opts.transfer ?? []);
+      try {
+        worker.postMessage(msg, opts.transfer ?? []);
+      } catch (err) {
+        // A terminated worker or un-cloneable payload must not leave an orphan
+        // pending entry that never resolves — drop it and reject.
+        this.pending.delete(id);
+        reject(err instanceof Error ? err : new Error(String(err)));
+      }
     });
   }
 

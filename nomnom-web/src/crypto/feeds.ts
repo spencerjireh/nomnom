@@ -238,6 +238,8 @@ export async function feedOpen(p: FeedOpenParams): Promise<{ header: FeedHeader;
   await streamXorInPlace(encKey, nonce, ciphertext, p.onProgress);
   const { header: raw, body } = feedUnpackHeader(ciphertext);
   const h = raw as Record<string, unknown>;
+  const v = h.v;
+  const fid = h.fid;
   const smid = h.smid;
   const sik = h.sik;
   const fn = h.fn;
@@ -246,6 +248,8 @@ export async function feedOpen(p: FeedOpenParams): Promise<{ header: FeedHeader;
   const pa = h.pa;
   const sigHex = h.sig;
   if (
+    typeof v !== "number" ||
+    typeof fid !== "string" ||
     typeof smid !== "string" ||
     typeof sik !== "string" ||
     typeof fn !== "string" ||
@@ -285,7 +289,10 @@ export async function feedOpen(p: FeedOpenParams): Promise<{ header: FeedHeader;
   if (!ed25519Verify(transcript, hexToBytes(sigHex), hexToBytes(sik))) {
     throw new Error("feed sender signature failed");
   }
-  return { header: h as unknown as FeedHeader, body };
+  // Build from validated fields rather than casting `h`, so the returned type
+  // can't claim fields the runtime never checked.
+  const header: FeedHeader = { v, fid, smid, sik, fn, fs, ch, pa, sig: sigHex };
+  return { header, body };
 }
 
 function randomBytes(n: number): Uint8Array {

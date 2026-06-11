@@ -32,7 +32,9 @@ function read<T>(key: string): T | null {
   try {
     const raw = localStorage.getItem(key);
     return raw ? (JSON.parse(raw) as T) : null;
-  } catch {
+  } catch (e) {
+    // Corrupt JSON means the identity/channel silently vanishes — leave a trace.
+    console.warn(`nomnom: ignoring unreadable ${key} in localStorage`, e);
     return null;
   }
 }

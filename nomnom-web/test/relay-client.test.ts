@@ -39,9 +39,14 @@ describe("RelayClient.verifyAuth", () => {
     expect(await client().verifyAuth()).toBe("skew");
   });
 
-  it("treats any non-401 (404 missing slot) as 'ok' — the passphrase signed fine", async () => {
+  it("treats 404 (missing slot) as 'ok' — the passphrase signed fine", async () => {
     fetchMock.mockResolvedValue(jsonResponse(404, { error: "not-found" }));
     expect(await client().verifyAuth()).toBe("ok");
+  });
+
+  it("fails closed on an unexpected status (e.g. 500) — not 'ok'", async () => {
+    fetchMock.mockResolvedValue(jsonResponse(500, { error: "relay-misconfigured" }));
+    expect(await client().verifyAuth()).toBe("unreachable");
   });
 
   it("maps a network/CORS failure to 'unreachable'", async () => {
