@@ -5741,27 +5741,18 @@ def cmd_channel(_args) -> int:
     return 0
 
 
-def cmd_join(args) -> int:
-    """Add this device to your channel by pasting its secret.
+def _join_channel(secret: str) -> "Feed":
+    """Add this device to the channel named by `secret` (a feed URL).
 
-    Doesn't require relay.json — the channel secret (the feed URL) is the
-    credential for /feeds/:id/* endpoints. Replaces any channel already
-    configured on this device, so re-pairing is just running this again.
+    Performs the relay handshake, replaces any channel already stored on this
+    device, persists feeds.json, and returns the stored Feed. Raises
+    NomnomError on a malformed secret or a relay failure. Shared by `cmd_join`
+    (CLI) and the TUI ChannelScreen so both behave identically.
     """
-    try:
-        host, feed_id = _parse_feed_url(args.secret)
-    except NomnomError as e:
-        sys.stderr.write(f"error: {e}\n")
-        return 1
-
+    host, feed_id = _parse_feed_url(secret)
     feed_key = _feed_key_from_token(feed_id)
     # Probe the channel exists + the secret is correct before publishing.
-    try:
-        meta = _relay_get_feed_meta(host, feed_id, feed_key)
-    except NomnomError as e:
-        sys.stderr.write(f"error: {e}\nnot joined.\n")
-        return 1
-
+    meta = _relay_get_feed_meta(host, feed_id, feed_key)
     ident = _load_identity()
     member_id = secrets.token_hex(16)
     card = {
@@ -5769,13 +5760,8 @@ def cmd_join(args) -> int:
         "identity_pubkey": ident["sig_pub"],
         "name": ident["name"],
     }
-    try:
-        _relay_put_member(host, feed_id, feed_key, member_id, card)
-        roster = _relay_list_members(host, feed_id, feed_key)
-    except NomnomError as e:
-        sys.stderr.write(f"error: {e}\n")
-        return 1
-
+    _relay_put_member(host, feed_id, feed_key, member_id, card)
+    roster = _relay_list_members(host, feed_id, feed_key)
     feed = Feed(
         name=_CHANNEL_NAME,
         feed_id=feed_id,
@@ -5790,6 +5776,21 @@ def cmd_join(args) -> int:
     cfg["feeds"] = [feed]
     cfg["default"] = _CHANNEL_NAME
     _save_feeds_config(cfg)
+    return feed
+
+
+def cmd_join(args) -> int:
+    """Add this device to your channel by pasting its secret.
+
+    Doesn't require relay.json — the channel secret (the feed URL) is the
+    credential for /feeds/:id/* endpoints. Replaces any channel already
+    configured on this device, so re-pairing is just running this again.
+    """
+    try:
+        feed = _join_channel(args.secret)
+    except NomnomError as e:
+        sys.stderr.write(f"error: {e}\n")
+        return 1
     sys.stderr.write(
         f"joined the channel ({len(feed.members_cache)} device(s)).\n",
     )
@@ -6170,9 +6171,9 @@ class LauncherScreen(Screen):
         self.cursor = 0
         self.tiles: list[tuple[str, str]] = [
             ("Bundle",     "Pick files and write a bundle .txt"),
-            ("Send",       "Pick files (or v: commit/pr/item), send to a feed"),
-            ("Receive",    "Watch the default feed for incoming files"),
-            ("Feeds",      "List, leave, and inspect joined feeds"),
+            ("Send",       "Pick files (or v: commit/pr/item), send to your channel"),
+            ("Receive",    "Watch your channel for incoming files"),
+            ("Channel",    "Show the channel secret + devices; add this device"),
             ("Commit",     "Bundle staged/unstaged diffs + recent commits"),
             ("PR",         "Bundle commits since base + diff for an LLM"),
             ("Item",       "Bundle a github item (pr/issue/commit/release/run/job)"),
@@ -6225,8 +6226,8 @@ def _launcher_open(verb: str):
     """Map a launcher tile label to a Screen to push."""
     if verb == "Extensions":
         return ExtensionsScreen()
-    if verb == "Feeds":
-        return FeedsScreen()
+    if verb == "Channel":
+        return ChannelScreen()
     if verb == "Rebuild":
         return RebuildScreen()
     if verb == "Bundle":
@@ -6285,7 +6286,7 @@ class PlaceholderScreen(Screen):
 
 
 class ReceiveScreen(Screen):
-    """Watch the default feed for incoming posts, writing each to cwd.
+    """Watch your channel for incoming posts, writing each to cwd.
 
     A background daemon thread streams new-slot notifications over SSE and
     drops them on a queue; `on_idle` (the curses thread) drains the queue and
@@ -6297,7 +6298,7 @@ class ReceiveScreen(Screen):
 
     title = "Receive"
     help_lines = [
-        "watching the default feed; files land in the current directory",
+        "watching your channel; files land in the current directory",
         "esc / q     stop and return to the launcher",
     ]
     _POLL_MS = 700
@@ -6306,7 +6307,7 @@ class ReceiveScreen(Screen):
         self.received: list[str] = []
         self.status = ""
         self.error = ""
-        self.feed = _default_feed(_load_feeds_config())
+        self.feed = _the_channel()
         self.host = ""
         self.feed_key = b""
         self.last_ts = 0
@@ -6328,7 +6329,7 @@ class ReceiveScreen(Screen):
             self.feed = None
             return
         self.last_ts = self.feed.last_post_ts
-        self.status = f"watching {self.feed.name!r}..."
+        self.status = "watching your channel..."
 
     def render(self, stdscr) -> None:  # pragma: no cover - curses I/O
         theme = _setup_theme()
@@ -6894,35 +6895,35 @@ class ExtensionsScreen(Screen):
         return ScreenAction.CONTINUE
 
 
-class FeedsScreen(Screen):
-    """List joined feeds, mark default, drop the cursored entry."""
+class ChannelScreen(Screen):
+    """Show the channel secret + devices, and pair this device from the TUI.
 
-    title = "feeds"
+    Closes the old bootstrap gap: when no channel exists, the screen opens
+    straight into 'join' mode so a freshly-installed device can paste its
+    secret without dropping to the shell. With a channel configured it shows
+    the secret to copy, the device roster, and a re-pair / leave action.
+    """
+
+    title = "Channel"
     help_lines = [
-        "j/k or ↑/↓   move",
-        "Enter / m    show members of the cursored feed",
-        "d            set cursored feed as default",
-        "l            leave cursored feed (confirms)",
+        "c            copy the channel secret",
+        "r            refresh the device list from the relay",
+        "j            paste a secret to add (re-pair) this device",
+        "l            leave the channel on this device",
         "esc / q      back to launcher",
     ]
 
     def __init__(self) -> None:
-        self.cursor = 0
-        self.message = ""
+        self.feed = _the_channel()
         self.error = ""
-        self.viewing_members: list[dict] | None = None
-        self.viewing_feed_name: str | None = None
-        self.feeds = self._load_feeds()
-
-    @staticmethod
-    def _load_feeds() -> list[tuple["Feed", bool]]:
-        cfg = _load_feeds_config()
-        default = cfg.get("default")
-        out: list[tuple[Feed, bool]] = []
-        for f in cfg["feeds"]:
-            out.append((f, f.name == default))
-        out.sort(key=lambda r: r[0].name)
-        return out
+        self.message = ""
+        self.buf = ""
+        # No channel yet → go straight to paste-a-secret so the TUI can
+        # bootstrap a new device on its own.
+        self.mode = "view" if self.feed is not None else "join"
+        self.devices: list[dict] = (
+            list(self.feed.members_cache) if self.feed else []
+        )
 
     def render(self, stdscr) -> None:  # pragma: no cover - curses I/O
         theme = _setup_theme()
@@ -6933,10 +6934,10 @@ class FeedsScreen(Screen):
             )
         except curses.error:
             pass
-        if self.viewing_members is not None:
-            self._render_members(stdscr, theme, h, w)
+        if self.mode == "join":
+            self._render_join(stdscr, theme, h, w)
         else:
-            self._render_list(stdscr, theme, h, w)
+            self._render_view(stdscr, theme, h, w)
         if self.error:
             try:
                 stdscr.addstr(
@@ -6953,114 +6954,125 @@ class FeedsScreen(Screen):
             except curses.error:
                 pass
         footer = (
-            "esc/q:back"
-            if self.viewing_members is not None
-            else "j/k:move  enter:members  d:default  l:leave  esc/q:back"
+            "enter:add  esc:cancel"
+            if self.mode == "join"
+            else "c:copy  r:refresh  j:re-pair  l:leave  esc/q:back"
         )
         try:
             stdscr.addstr(h - 1, 0, footer[: max(1, w - 1)], theme["dim"])
         except curses.error:
             pass
 
-    def _render_list(self, stdscr, theme, h, w):  # pragma: no cover
-        if not self.feeds:
-            try:
-                stdscr.addstr(
-                    2, 2,
-                    "(no channel yet — run `nomnom init` or `nomnom join <secret>`)",
-                    theme["dim"],
-                )
-            except curses.error:
-                pass
-            return
-        now = int(time.time())
-        for i, (feed, is_default) in enumerate(self.feeds):
-            row = 2 + i
-            if row >= h - 3:
-                break
-            attr = theme["cursor"] if i == self.cursor else 0
-            marker = "*" if is_default else " "
-            ttl = max(0, feed.expires_at - now)
-            members = len(feed.members_cache)
-            status = "expired" if ttl == 0 else f"{ttl}s"
-            line = f" {marker} {feed.name:<24}  {members:>2} members  {status}"
-            try:
-                stdscr.addstr(row, 0, line[: max(1, w - 1)], attr)
-            except curses.error:
-                pass
-
-    def _render_members(self, stdscr, theme, h, w):  # pragma: no cover
+    def _render_join(self, stdscr, theme, h, w):  # pragma: no cover
+        prompt = "paste your channel secret, then Enter:"
         try:
-            stdscr.addstr(
-                2, 2,
-                f"members of '{self.viewing_feed_name}':"[: max(1, w - 4)], 0,
-            )
+            stdscr.addstr(2, 2, prompt[: max(1, w - 4)], theme["dim"])
+            stdscr.addstr(4, 2, self.buf[-(w - 4):][: max(1, w - 4)], 0)
         except curses.error:
             pass
-        for i, m in enumerate(self.viewing_members or []):
-            row = 4 + i
+
+    def _render_view(self, stdscr, theme, h, w):  # pragma: no cover
+        try:
+            stdscr.addstr(2, 2, "secret (paste on another device):"[: w - 4],
+                          theme["dim"])
+            stdscr.addstr(3, 2, (self.feed.url if self.feed else "")[: w - 4], 0)
+            stdscr.addstr(5, 2, f"devices ({len(self.devices)}):"[: w - 4], 0)
+        except curses.error:
+            pass
+        for i, m in enumerate(self.devices):
+            row = 6 + i
             if row >= h - 3:
                 break
             name = m.get("name", "?")
             sig_pub = m.get("identity_pubkey", "")
             fp = _ik_fingerprint(sig_pub) if sig_pub else "?"
-            mid = (m.get("member_id") or "")[:12]
-            line = f"  {name:<24}  {fp}  ({mid}...)"
+            mine = " (you)" if (
+                self.feed and m.get("member_id") == self.feed.member_id
+            ) else ""
+            line = f"  {name:<22}  {fp}{mine}"
             try:
                 stdscr.addstr(row, 0, line[: max(1, w - 1)], 0)
             except curses.error:
                 pass
 
-    def handle_key(self, ch: int, stdscr=None):
-        if self.viewing_members is not None:
-            if ch in (ord("q"), 3, 27):
-                self.viewing_members = None
-                self.viewing_feed_name = None
-            return ScreenAction.CONTINUE
-        if ch in (ord("q"), 3, 27):
+    def _handle_join_key(self, ch: int):
+        if ch in (3, 27):  # Esc / Ctrl-C cancels
+            self.buf = ""
+            if self.feed is not None:
+                self.mode = "view"
+                return ScreenAction.CONTINUE
             return ScreenAction.BACK
-        if not self.feeds:
-            return ScreenAction.CONTINUE
-        if ch in (curses.KEY_DOWN, ord("j")):
-            self.cursor = (self.cursor + 1) % len(self.feeds)
-        elif ch in (curses.KEY_UP, ord("k")):
-            self.cursor = (self.cursor - 1) % len(self.feeds)
-        elif ch in (10, 13, ord("m")):
-            feed, _ = self.feeds[self.cursor]
+        if ch in (10, 13):  # Enter submits
+            secret = self.buf.strip()
+            self.buf = ""
+            if not secret:
+                return ScreenAction.CONTINUE
             try:
-                feed_key = _feed_key_from_token(feed.feed_token)
-                host, _ = _parse_feed_url(feed.url)
-                roster = _relay_list_members(host, feed.feed_id, feed_key)
-                self.viewing_members = roster.get("members") or []
-                self.viewing_feed_name = feed.name
-                self.error = ""
+                self.feed = _join_channel(secret)
             except NomnomError as e:
                 self.error = str(e)
-        elif ch == ord("d"):
-            feed, _ = self.feeds[self.cursor]
-            cfg = _load_feeds_config()
-            cfg["default"] = feed.name
-            _save_feeds_config(cfg)
-            self.feeds = self._load_feeds()
-            self.message = f"default → {feed.name}"
-        elif ch == ord("l"):
-            feed, _ = self.feeds[self.cursor]
+                return ScreenAction.CONTINUE
+            self.devices = list(self.feed.members_cache)
+            self.error = ""
+            self.message = f"joined ({len(self.devices)} device(s))"
+            self.mode = "view"
+            return ScreenAction.CONTINUE
+        if ch in (curses.KEY_BACKSPACE, 127, 8):
+            self.buf = self.buf[:-1]
+            return ScreenAction.CONTINUE
+        if 32 <= ch <= 126:
+            self.buf += chr(ch)
+        return ScreenAction.CONTINUE
+
+    def handle_key(self, ch: int, stdscr=None):
+        if self.mode == "join":
+            return self._handle_join_key(ch)
+        if ch in (ord("q"), 3, 27):
+            return ScreenAction.BACK
+        if ch == ord("j"):
+            self.mode = "join"
+            self.buf = ""
+            self.message = ""
+            self.error = ""
+        elif ch == ord("c") and self.feed is not None:
+            if copy_to_clipboard(self.feed.url):
+                self.message = "secret copied to clipboard"
+            else:
+                self.message = "no clipboard tool (pbcopy/wl-copy/xclip)"
+        elif ch == ord("r") and self.feed is not None:
             try:
-                feed_key = _feed_key_from_token(feed.feed_token)
-                host, _ = _parse_feed_url(feed.url)
-                _relay_delete_member(host, feed.feed_id, feed_key, feed.member_id)
+                feed_key = _feed_key_from_token(self.feed.feed_token)
+                host, _ = _parse_feed_url(self.feed.url)
+                roster = _relay_list_members(host, self.feed.feed_id, feed_key)
+                self.devices = roster.get("members") or []
+                self.feed.members_cache = self.devices
+                cfg = _load_feeds_config()
+                existing = _find_feed(cfg, self.feed.name)
+                if existing is not None:
+                    existing.members_cache = self.devices
+                    _save_feeds_config(cfg)
+                self.error = ""
+                self.message = f"{len(self.devices)} device(s)"
+            except NomnomError as e:
+                self.error = str(e)
+        elif ch == ord("l") and self.feed is not None:
+            try:
+                feed_key = _feed_key_from_token(self.feed.feed_token)
+                host, _ = _parse_feed_url(self.feed.url)
+                _relay_delete_member(
+                    host, self.feed.feed_id, feed_key, self.feed.member_id,
+                )
             except NomnomError as e:
                 self.error = str(e)
                 return ScreenAction.CONTINUE
             cfg = _load_feeds_config()
-            cfg["feeds"] = [f for f in cfg["feeds"] if f.name != feed.name]
-            if cfg.get("default") == feed.name:
-                cfg["default"] = cfg["feeds"][0].name if cfg["feeds"] else None
+            cfg["feeds"] = []
+            cfg["default"] = None
             _save_feeds_config(cfg)
-            self.feeds = self._load_feeds()
-            if self.cursor >= len(self.feeds) and self.feeds:
-                self.cursor = len(self.feeds) - 1
-            self.message = f"left {feed.name}"
+            self.feed = None
+            self.devices = []
+            self.message = "left the channel; paste a secret to re-pair"
+            self.mode = "join"
         return ScreenAction.CONTINUE
 
 
