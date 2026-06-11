@@ -37,7 +37,7 @@ import urllib.parse
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import NamedTuple, NoReturn, Tuple
+from typing import NamedTuple, NoReturn, Tuple, TypeVar
 
 try:
     locale.setlocale(locale.LC_ALL, "")
@@ -301,6 +301,36 @@ class GitignoreMatcher:
         return ignored
 
 
+def _parse_ignore_line(
+    raw: str, base: str, *, dir_only_semantics: bool,
+) -> GitignoreRule | None:
+    """Parse one gitignore-style line into a GitignoreRule, or None to skip.
+
+    Shared by `.gitignore` parsing and CLI --include/--exclude so the glob
+    grammar stays in lock-step. `dir_only_semantics=False` (CLI filtering a
+    flat list) strips a trailing slash but never marks the rule dir-only,
+    since there's no walker to stop from descending."""
+    line = raw.strip()
+    if not line or line.startswith("#"):
+        return None
+    negated = line.startswith("!")
+    if negated:
+        line = line[1:]
+    dir_only = line.endswith("/")
+    if dir_only:
+        line = line[:-1]
+    anchored = "/" in line
+    if line.startswith("/"):
+        line = line[1:]
+    if not line:
+        return None
+    try:
+        regex = _glob_to_regex(line, anchored)
+    except re.error:
+        return None
+    return GitignoreRule(line, negated, dir_only and dir_only_semantics, base, regex)
+
+
 def _build_pattern_matcher(patterns: list[str]) -> GitignoreMatcher:
     """Build a GitignoreMatcher from CLI --include / --exclude patterns.
 
@@ -308,26 +338,11 @@ def _build_pattern_matcher(patterns: list[str]) -> GitignoreMatcher:
     under that directory (unlike .gitignore's dir-only semantics, since a
     walker would never descend; here we're filtering a flat list). A
     leading `!` negates."""
-    rules: list[GitignoreRule] = []
-    for raw in patterns:
-        line = raw.strip()
-        if not line:
-            continue
-        negated = line.startswith("!")
-        if negated:
-            line = line[1:]
-        if line.endswith("/"):
-            line = line[:-1]
-        anchored = "/" in line
-        if line.startswith("/"):
-            line = line[1:]
-        if not line:
-            continue
-        try:
-            regex = _glob_to_regex(line, anchored)
-        except re.error:
-            continue
-        rules.append(GitignoreRule(line, negated, False, "", regex))
+    rules = [
+        rule for raw in patterns
+        if (rule := _parse_ignore_line(raw, "", dir_only_semantics=False))
+        is not None
+    ]
     return GitignoreMatcher(rules)
 
 
@@ -350,25 +365,9 @@ def load_gitignore(root: Path) -> GitignoreMatcher:
         if rel_base == ".":
             rel_base = ""
         for raw in text.splitlines():
-            line = raw.strip()
-            if not line or line.startswith("#"):
-                continue
-            negated = line.startswith("!")
-            if negated:
-                line = line[1:]
-            dir_only = line.endswith("/")
-            if dir_only:
-                line = line[:-1]
-            anchored = "/" in line
-            if line.startswith("/"):
-                line = line[1:]
-            if not line:
-                continue
-            try:
-                regex = _glob_to_regex(line, anchored)
-            except re.error:
-                continue
-            rules.append(GitignoreRule(line, negated, dir_only, rel_base, regex))
+            rule = _parse_ignore_line(raw, rel_base, dir_only_semantics=True)
+            if rule is not None:
+                rules.append(rule)
     return GitignoreMatcher(rules)
 
 
@@ -384,16 +383,16 @@ def _fmt_count(n: int) -> str:
     """999 / 1.0K / 12K / 1.2M / 12M (decimal, one decimal under 10)."""
     if n < 1000:
         return str(n)
+    value = float(n)
     for unit in ("K", "M", "G", "T"):
-        n_unit = n / 1000
-        if n_unit < 1000 or unit == "T":
-            return f"{n_unit:.1f}{unit}" if n_unit < 10 else f"{n_unit:.0f}{unit}"
-        n = int(n_unit)
-    return str(n)
+        value /= 1000
+        if value < 1000 or unit == "T":
+            return f"{value:.1f}{unit}" if value < 10 else f"{value:.0f}{unit}"
+    raise AssertionError("unreachable")  # the "T" iteration always returns
 
 
 def _fmt_size(n: int) -> str:
-    return _fmt_count(n)
+    return _fmt_count(n) + "B"
 
 
 def _fmt_loc(n: int) -> str:
@@ -736,20 +735,28 @@ _DESTINATION_LABELS = {
 }
 
 
+_E = TypeVar("_E", bound=enum.IntEnum)
+
+
+def _cycle(value: _E, members: type[_E], allowed: tuple[_E, ...] | None) -> _E:
+    """Advance `value` to the next member, restricted to `allowed` if given.
+
+    If `value` isn't in `allowed`, snap to the first allowed entry."""
+    if allowed is None:
+        return members((int(value) + 1) % len(members))
+    if value not in allowed:
+        return allowed[0]
+    return allowed[(allowed.index(value) + 1) % len(allowed)]
+
+
 def cycle_destination(
     d: Destination, allowed: tuple[Destination, ...] | None = None,
 ) -> Destination:
     """Advance `d` to the next destination.
 
     `allowed` restricts the cycle to a subset (used inside the TUI to hide
-    STDOUT, which is meaningless when curses owns the terminal). If `d`
-    isn't in `allowed`, snap to the first allowed entry."""
-    if allowed is None:
-        return Destination((int(d) + 1) % len(Destination))
-    if d not in allowed:
-        return allowed[0]
-    i = allowed.index(d)
-    return allowed[(i + 1) % len(allowed)]
+    STDOUT, which is meaningless when curses owns the terminal)."""
+    return _cycle(d, Destination, allowed)
 
 
 class Verb(enum.IntEnum):
@@ -770,14 +777,8 @@ _VERB_LABELS = {
 def cycle_verb(v: Verb, allowed: tuple[Verb, ...] | None = None) -> Verb:
     """Advance `v` to the next verb, restricted to `allowed` if given.
 
-    Mirrors `cycle_destination`. Non-git directories pass
-    `allowed=(Verb.BUNDLE,)` so cycling becomes a no-op."""
-    if allowed is None:
-        return Verb((int(v) + 1) % len(Verb))
-    if v not in allowed:
-        return allowed[0]
-    i = allowed.index(v)
-    return allowed[(i + 1) % len(allowed)]
+    Non-git directories pass `allowed=(Verb.BUNDLE,)` so cycling is a no-op."""
+    return _cycle(v, Verb, allowed)
 
 
 def compute_summary(nodes: list[Node]) -> tuple[int, int, int]:
@@ -1228,15 +1229,15 @@ def pick(
     """
     if not nodes:
         return PickResult(set(), initial_destination, initial_include_tree)
-    result: list = []
+    # curses.wrapper passes *args/**kwds through and returns the callable's
+    # value (and restores the terminal on exception), so no accumulator needed.
     try:
-        curses.wrapper(lambda stdscr: result.append(_picker_ui(
-            stdscr, nodes, root, initial_destination, initial_include_tree,
+        return curses.wrapper(
+            _picker_ui, nodes, root, initial_destination, initial_include_tree,
             allow_stdout=True, allow_git_verbs=allow_git_verbs,
-        )))
+        )
     except KeyboardInterrupt:
         return None
-    return result[0] if result else None
 
 
 # ---------- output ----------
@@ -1979,25 +1980,34 @@ query($owner: String!, $repo: String!, $number: Int!) {
 """
 
 
+def _kv_block(pairs: list[tuple[str, str]]) -> str:
+    """Render aligned `key: value` lines.
+
+    The value column is computed from the longest key, so adding a field can't
+    silently misalign the block the way the old hand-counted padding could."""
+    width = max((len(k) for k, _ in pairs), default=0)
+    return "\n".join(f"{k + ':':<{width + 1}} {v}" for k, v in pairs)
+
+
 def _format_pr_meta(pr: dict) -> str:
     author = ((pr.get("author") or {}).get("login")) or "?"
     labels = ", ".join(
         l.get("name", "") for l in (pr.get("labels") or []) if l
     ) or "(none)"
     milestone = ((pr.get("milestone") or {}).get("title")) or "(none)"
-    return "\n".join([
-        f"number:    #{pr.get('number', '?')}",
-        f"title:     {pr.get('title', '')}",
-        f"url:       {pr.get('url', '')}",
-        f"author:    @{author}",
-        f"state:     {pr.get('state', '?')}",
-        f"draft:     {'true' if pr.get('isDraft') else 'false'}",
-        f"head:      {pr.get('headRefName', '')}",
-        f"base:      {pr.get('baseRefName', '')}",
-        f"labels:    {labels}",
-        f"milestone: {milestone}",
-        f"created:   {pr.get('createdAt', '')}",
-        f"updated:   {pr.get('updatedAt', '')}",
+    return _kv_block([
+        ("number", f"#{pr.get('number', '?')}"),
+        ("title", pr.get("title", "")),
+        ("url", pr.get("url", "")),
+        ("author", f"@{author}"),
+        ("state", pr.get("state", "?")),
+        ("draft", "true" if pr.get("isDraft") else "false"),
+        ("head", pr.get("headRefName", "")),
+        ("base", pr.get("baseRefName", "")),
+        ("labels", labels),
+        ("milestone", milestone),
+        ("created", pr.get("createdAt", "")),
+        ("updated", pr.get("updatedAt", "")),
     ])
 
 
@@ -2048,31 +2058,32 @@ def _format_diff_summary(files: list) -> str:
     return "\n".join(lines)
 
 
-def _format_reviews(reviews: list) -> str:
-    if not reviews:
+def _format_comment_blocks(items: list, head_fn) -> str:
+    """Render `## <header>\\n<body-or-(no body)>` blocks joined by blank lines.
+
+    Shared by the review/issue-comment/commit-comment formatters, which differ
+    only in how each block's header line is built (passed as `head_fn`)."""
+    if not items:
         return ""
     parts: list[str] = []
-    for r in reviews:
-        login = ((r.get("user") or {}).get("login")) or "?"
-        state = r.get("state") or ""
-        when = r.get("submitted_at") or ""
-        body = (r.get("body") or "").rstrip()
-        head = f"## @{login} [{state}] {when}".rstrip()
-        parts.append(head + "\n" + (body if body else "(no body)"))
+    for c in items:
+        body = (c.get("body") or "").rstrip()
+        parts.append(head_fn(c) + "\n" + (body or "(no body)"))
     return "\n\n".join(parts)
+
+
+def _format_reviews(reviews: list) -> str:
+    def head(r: dict) -> str:
+        login = ((r.get("user") or {}).get("login")) or "?"
+        return f"## @{login} [{r.get('state') or ''}] {r.get('submitted_at') or ''}".rstrip()
+    return _format_comment_blocks(reviews, head)
 
 
 def _format_issue_comments(comments: list) -> str:
-    if not comments:
-        return ""
-    parts: list[str] = []
-    for c in comments:
+    def head(c: dict) -> str:
         login = ((c.get("user") or {}).get("login")) or "?"
-        when = c.get("created_at") or ""
-        body = (c.get("body") or "").rstrip()
-        head = f"## @{login} {when}".rstrip()
-        parts.append(head + "\n" + (body if body else "(no body)"))
-    return "\n\n".join(parts)
+        return f"## @{login} {c.get('created_at') or ''}".rstrip()
+    return _format_comment_blocks(comments, head)
 
 
 def _format_review_threads(graphql_result: dict) -> str:
@@ -2228,21 +2239,9 @@ def cmd_item_pr(
                 f"gh pr view returned non-numeric: {view_out.strip()!r}"
             ) from e
 
-    if pr_number <= 0:
-        raise NomnomError(f"pr number must be positive, got {pr_number}")
+    _require_positive("pr number", pr_number)
 
-    rc, owner_repo, err = _run(
-        ["gh", "repo", "view", "--json", "nameWithOwner",
-         "-q", ".nameWithOwner"],
-        root,
-    )
-    owner_repo = owner_repo.strip()
-    if rc != 0 or "/" not in owner_repo:
-        raise NomnomError(
-            f"could not resolve gh repo: "
-            f"{err.strip() or owner_repo or 'unknown error'}"
-        )
-    owner, name = owner_repo.split("/", 1)
+    owner, name = _resolve_owner_repo(root)
 
     fields = (
         "number,url,title,body,author,state,headRefName,baseRefName,"
@@ -2262,35 +2261,19 @@ def cmd_item_pr(
     except json.JSONDecodeError as e:
         raise NomnomError(f"gh pr view returned invalid json: {e}") from e
 
-    def _api_json(args: list[str]) -> object:
-        rc, out, err = _run(args, root)
-        if rc != 0:
-            msg = err.strip() or out.strip() or "(no error message)"
-            print(
-                f"warn: {' '.join(args[:3])} … exited {rc}: {msg}",
-                file=sys.stderr,
-            )
-            return None
-        if not out.strip():
-            return None
-        try:
-            return json.loads(out)
-        except json.JSONDecodeError:
-            return None
-
-    issue_comments = _api_json([
+    issue_comments = _gh_api_json(root, [
         "gh", "api",
         f"repos/{owner}/{name}/issues/{pr_number}/comments",
         "--paginate",
     ]) or []
 
-    reviews = _api_json([
+    reviews = _gh_api_json(root, [
         "gh", "api",
         f"repos/{owner}/{name}/pulls/{pr_number}/reviews",
         "--paginate",
     ]) or []
 
-    threads_result = _api_json([
+    threads_result = _gh_api_json(root, [
         "gh", "api", "graphql",
         "-F", f"owner={owner}",
         "-F", f"repo={name}",
@@ -2298,7 +2281,7 @@ def cmd_item_pr(
         "-f", f"query={_PR_REVIEW_THREADS_QUERY}",
     ]) or {}
 
-    timeline = _api_json([
+    timeline = _gh_api_json(root, [
         "gh", "api",
         f"repos/{owner}/{name}/issues/{pr_number}/timeline",
         "--paginate",
@@ -2355,6 +2338,12 @@ def cmd_item_pr(
 
 
 # ---------- item: shared helpers ----------
+
+
+def _require_positive(label: str, n: int) -> None:
+    """Guard an item id; `label` names the kind (e.g. 'pr number', 'run id')."""
+    if n <= 0:
+        raise NomnomError(f"{label} must be positive, got {n}")
 
 
 def _resolve_owner_repo(root: Path) -> tuple[str, str]:
@@ -2417,17 +2406,17 @@ def _format_issue_meta(issue: dict) -> str:
         for a in (issue.get("assignees") or [])
     ) or "(none)"
     milestone = ((issue.get("milestone") or {}).get("title")) or "(none)"
-    return "\n".join([
-        f"number:    #{issue.get('number', '?')}",
-        f"title:     {issue.get('title', '')}",
-        f"url:       {issue.get('html_url', '')}",
-        f"author:    @{user}",
-        f"state:     {issue.get('state', '?')}",
-        f"labels:    {labels}",
-        f"milestone: {milestone}",
-        f"assignees: {assignees}",
-        f"created:   {issue.get('created_at', '')}",
-        f"updated:   {issue.get('updated_at', '')}",
+    return _kv_block([
+        ("number", f"#{issue.get('number', '?')}"),
+        ("title", issue.get("title", "")),
+        ("url", issue.get("html_url", "")),
+        ("author", f"@{user}"),
+        ("state", issue.get("state", "?")),
+        ("labels", labels),
+        ("milestone", milestone),
+        ("assignees", assignees),
+        ("created", issue.get("created_at", "")),
+        ("updated", issue.get("updated_at", "")),
     ])
 
 
@@ -2438,10 +2427,7 @@ def cmd_item_issue(
     _require_gh()
     root, repo_name = _resolve_git_repo(repo)
 
-    if issue_number <= 0:
-        raise NomnomError(
-            f"issue number must be positive, got {issue_number}"
-        )
+    _require_positive("issue number", issue_number)
 
     owner, name = _resolve_owner_repo(root)
 
@@ -2545,15 +2531,15 @@ def _format_discussion_meta(d: dict) -> str:
         n.get("name") or ""
         for n in ((d.get("labels") or {}).get("nodes") or [])
     ) or "(none)"
-    return "\n".join([
-        f"number:   #{d.get('number', '?')}",
-        f"title:    {d.get('title', '')}",
-        f"url:      {d.get('url', '')}",
-        f"author:   @{author}",
-        f"category: {category}",
-        f"labels:   {labels}",
-        f"created:  {d.get('createdAt', '')}",
-        f"updated:  {d.get('updatedAt', '')}",
+    return _kv_block([
+        ("number", f"#{d.get('number', '?')}"),
+        ("title", d.get("title", "")),
+        ("url", d.get("url", "")),
+        ("author", f"@{author}"),
+        ("category", category),
+        ("labels", labels),
+        ("created", d.get("createdAt", "")),
+        ("updated", d.get("updatedAt", "")),
     ])
 
 
@@ -2600,10 +2586,7 @@ def cmd_item_discussion(
     _require_gh()
     root, repo_name = _resolve_git_repo(repo)
 
-    if discussion_number <= 0:
-        raise NomnomError(
-            f"discussion number must be positive, got {discussion_number}"
-        )
+    _require_positive("discussion number", discussion_number)
 
     owner, name = _resolve_owner_repo(root)
 
@@ -2653,39 +2636,33 @@ def _format_commit_meta(commit: dict) -> str:
         (p.get("sha", "") or "")[:7] for p in (commit.get("parents") or [])
     ) or "(none)"
     stats = commit.get("stats") or {}
-    return "\n".join([
-        f"sha:        {sha}",
-        f"short:      {sha[:7] if sha != '?' else '?'}",
-        f"url:        {commit.get('html_url', '')}",
-        f"author:     {author.get('name', '?')} <{author.get('email', '')}>",
-        f"authored:   {author.get('date', '')}",
-        f"committer:  {committer.get('name', '?')} <{committer.get('email', '')}>",
-        f"committed:  {committer.get('date', '')}",
-        f"parents:    {parents}",
-        f"stats:      +{stats.get('additions', 0)} -{stats.get('deletions', 0)} "
-        f"({stats.get('total', 0)})",
+    return _kv_block([
+        ("sha", sha),
+        ("short", sha[:7] if sha != "?" else "?"),
+        ("url", commit.get("html_url", "")),
+        ("author", f"{author.get('name', '?')} <{author.get('email', '')}>"),
+        ("authored", author.get("date", "")),
+        ("committer", f"{committer.get('name', '?')} <{committer.get('email', '')}>"),
+        ("committed", committer.get("date", "")),
+        ("parents", parents),
+        ("stats", f"+{stats.get('additions', 0)} -{stats.get('deletions', 0)} "
+                  f"({stats.get('total', 0)})"),
     ])
 
 
 def _format_commit_comments(comments: list) -> str:
-    if not comments:
-        return ""
-    parts: list[str] = []
-    for c in comments:
+    def head(c: dict) -> str:
         login = ((c.get("user") or {}).get("login")) or "?"
         when = c.get("created_at") or ""
         path = c.get("path") or ""
         line = c.get("line") or c.get("position")
         if path:
-            head = (
+            return (
                 f"## {path}:{line if line is not None else '?'}  "
                 f"@{login} {when}".rstrip()
             )
-        else:
-            head = f"## @{login} {when}".rstrip()
-        body = (c.get("body") or "").rstrip()
-        parts.append(head + "\n" + (body or "(no body)"))
-    return "\n\n".join(parts)
+        return f"## @{login} {when}".rstrip()
+    return _format_comment_blocks(comments, head)
 
 
 def _commit_diff(root: Path, owner: str, name: str, sha: str) -> str:
@@ -2771,16 +2748,16 @@ def cmd_item_commit(
 
 def _format_release_meta(rel: dict) -> str:
     author = ((rel.get("author") or {}).get("login")) or "?"
-    return "\n".join([
-        f"tag:           {rel.get('tag_name', '?')}",
-        f"name:          {rel.get('name', '') or '(none)'}",
-        f"url:           {rel.get('html_url', '')}",
-        f"author:        @{author}",
-        f"target:        {rel.get('target_commitish', '')}",
-        f"published:     {rel.get('published_at', '')}",
-        f"created:       {rel.get('created_at', '')}",
-        f"draft:         {'true' if rel.get('draft') else 'false'}",
-        f"prerelease:    {'true' if rel.get('prerelease') else 'false'}",
+    return _kv_block([
+        ("tag", rel.get("tag_name", "?")),
+        ("name", rel.get("name", "") or "(none)"),
+        ("url", rel.get("html_url", "")),
+        ("author", f"@{author}"),
+        ("target", rel.get("target_commitish", "")),
+        ("published", rel.get("published_at", "")),
+        ("created", rel.get("created_at", "")),
+        ("draft", "true" if rel.get("draft") else "false"),
+        ("prerelease", "true" if rel.get("prerelease") else "false"),
     ])
 
 
@@ -2842,20 +2819,20 @@ def cmd_item_release(
 
 def _format_run_meta(run: dict) -> str:
     sha = (run.get("headSha") or "")[:7]
-    return "\n".join([
-        f"id:         {run.get('databaseId') or run.get('id', '?')}",
-        f"number:     {run.get('number', '?')}",
-        f"workflow:   {run.get('workflowName', '')}",
-        f"title:      {run.get('displayTitle', '')}",
-        f"url:        {run.get('url', '')}",
-        f"branch:     {run.get('headBranch', '')}",
-        f"sha:        {sha}",
-        f"event:      {run.get('event', '')}",
-        f"status:     {run.get('status', '')}",
-        f"conclusion: {run.get('conclusion', '')}",
-        f"attempt:    {run.get('attempt', '?')}",
-        f"created:    {run.get('createdAt', '')}",
-        f"updated:    {run.get('updatedAt', '')}",
+    return _kv_block([
+        ("id", f"{run.get('databaseId') or run.get('id', '?')}"),
+        ("number", f"{run.get('number', '?')}"),
+        ("workflow", run.get("workflowName", "")),
+        ("title", run.get("displayTitle", "")),
+        ("url", run.get("url", "")),
+        ("branch", run.get("headBranch", "")),
+        ("sha", sha),
+        ("event", run.get("event", "")),
+        ("status", run.get("status", "")),
+        ("conclusion", run.get("conclusion", "")),
+        ("attempt", f"{run.get('attempt', '?')}"),
+        ("created", run.get("createdAt", "")),
+        ("updated", run.get("updatedAt", "")),
     ])
 
 
@@ -2879,18 +2856,18 @@ def _format_run_jobs(jobs: list) -> str:
 
 
 def _format_job_meta(job: dict) -> str:
-    return "\n".join([
-        f"id:         {job.get('id', '?')}",
-        f"name:       {job.get('name', '')}",
-        f"run_id:     {job.get('run_id', '?')}",
-        f"run_url:    {job.get('run_url', '')}",
-        f"url:        {job.get('html_url', '')}",
-        f"workflow:   {job.get('workflow_name', '')}",
-        f"status:     {job.get('status', '')}",
-        f"conclusion: {job.get('conclusion', '')}",
-        f"started:    {job.get('started_at', '')}",
-        f"completed:  {job.get('completed_at', '')}",
-        f"runner:     {job.get('runner_name', '')}",
+    return _kv_block([
+        ("id", f"{job.get('id', '?')}"),
+        ("name", job.get("name", "")),
+        ("run_id", f"{job.get('run_id', '?')}"),
+        ("run_url", job.get("run_url", "")),
+        ("url", job.get("html_url", "")),
+        ("workflow", job.get("workflow_name", "")),
+        ("status", job.get("status", "")),
+        ("conclusion", job.get("conclusion", "")),
+        ("started", job.get("started_at", "")),
+        ("completed", job.get("completed_at", "")),
+        ("runner", job.get("runner_name", "")),
     ])
 
 
@@ -2945,8 +2922,7 @@ def cmd_item_run(
 ) -> int:
     _require_gh()
     root, repo_name = _resolve_git_repo(repo)
-    if run_id <= 0:
-        raise NomnomError(f"run id must be positive, got {run_id}")
+    _require_positive("run id", run_id)
 
     fields = (
         "databaseId,number,attempt,status,conclusion,event,workflowName,"
@@ -2990,8 +2966,7 @@ def cmd_item_job(
 ) -> int:
     _require_gh()
     root, repo_name = _resolve_git_repo(repo)
-    if job_id <= 0:
-        raise NomnomError(f"job id must be positive, got {job_id}")
+    _require_positive("job id", job_id)
 
     owner, name = _resolve_owner_repo(root)
 
@@ -3295,8 +3270,12 @@ def _derive_keys(passphrase: str, salt: bytes) -> tuple[bytes, bytes]:
 
 
 def _stream_xor(enc_key: bytes, nonce: bytes, data: bytes) -> bytes:
-    out = bytearray(len(data))
     block_size = 32  # HMAC-SHA256 output
+    if len(data) > block_size * (2 ** 32):
+        # The block counter is a 32-bit BE value; past 2**32 blocks it would
+        # wrap and reuse keystream. Unreachable for real payloads, but guard it.
+        raise ValueError("stream_xor: input too large for 32-bit block counter")
+    out = bytearray(len(data))
     counter = 0
     for off in range(0, len(data), block_size):
         ks = hmac.new(
@@ -3305,8 +3284,10 @@ def _stream_xor(enc_key: bytes, nonce: bytes, data: bytes) -> bytes:
             hashlib.sha256,
         ).digest()
         chunk = data[off:off + block_size]
-        for i, b in enumerate(chunk):
-            out[off + i] = b ^ ks[i]
+        # XOR the whole block at once at C speed rather than byte-by-byte; the
+        # fixed width preserves leading zero bytes.
+        xored = int.from_bytes(chunk, "big") ^ int.from_bytes(ks[:len(chunk)], "big")
+        out[off:off + len(chunk)] = xored.to_bytes(len(chunk), "big")
         counter += 1
     return bytes(out)
 
@@ -3701,15 +3682,26 @@ def _load_known_peers() -> dict:
     return _migrate_known_peers_v2(data)
 
 
+def _peer_matches(pid: str, rec: object, needle: str) -> bool:
+    """True if non-empty `needle` matches a peer's device id, name, or nickname."""
+    if not needle:
+        return False
+    if needle == pid:
+        return True
+    if not isinstance(rec, dict):
+        return False
+    return needle in (rec.get("name", ""), rec.get("nickname", ""))
+
+
 def _forget_peer(needle: str) -> list:
     """Drop pins matching `needle` (a device id, name, or nickname). Returns dropped names."""
     peers = _load_known_peers()
     dropped = []
     for dev_id in list(peers.keys()):
         rec = peers[dev_id]
-        name = rec.get("name", "") if isinstance(rec, dict) else ""
-        nickname = rec.get("nickname", "") if isinstance(rec, dict) else ""
-        if needle in (dev_id, name, nickname) and needle:
+        if _peer_matches(dev_id, rec, needle):
+            name = rec.get("name", "") if isinstance(rec, dict) else ""
+            nickname = rec.get("nickname", "") if isinstance(rec, dict) else ""
             dropped.append(nickname or name or dev_id)
             del peers[dev_id]
     if dropped:
@@ -3727,12 +3719,7 @@ def _resolve_peer(needle: str) -> list:
     for pid, rec in _load_known_peers().items():
         if not isinstance(rec, dict):
             continue
-        if needle == pid:
-            matches.append((pid, rec))
-            continue
-        name = rec.get("name", "")
-        nickname = rec.get("nickname", "")
-        if needle and (needle == name or needle == nickname):
+        if _peer_matches(pid, rec, needle):
             matches.append((pid, rec))
     return matches
 
@@ -3744,7 +3731,7 @@ def _set_peer_nickname(needle: str, nickname: str | None) -> tuple[str, str] | N
     for pid, rec in peers.items():
         if not isinstance(rec, dict):
             continue
-        if needle in (pid, rec.get("name", ""), rec.get("nickname", "")) and needle:
+        if _peer_matches(pid, rec, needle):
             target = pid
             break
     if target is None:
@@ -4582,22 +4569,21 @@ def _relay_full_path(relay: dict, path: str) -> str:
     return f"{base}{path}" if base else path
 
 
-def _relay_request(
-    relay: dict, method: str, path: str,
-    *, body: bytes | None = None,
-    extra_headers: dict[str, str] | None = None,
-    signed: bool = True,
+def _http_send(
+    relay: dict, method: str, full_path: str,
+    *, body: bytes | None, headers: dict[str, str],
+    content_type: str = "application/octet-stream",
 ) -> tuple[int, bytes]:
-    """One-shot relay request. Returns (status, body). Raises NomnomError on network errors."""
-    full_path = _relay_full_path(relay, path)
-    headers: dict[str, str] = {}
-    if signed:
-        headers.update(_relay_hmac_headers(relay["secret"], method, full_path))
+    """Open a connection, send one request, return (status, body).
+
+    Shared core for the HMAC (`_relay_request`) and feed-key (`_feed_request`)
+    schemes — they differ only in which auth headers they build. Enforces the
+    response-size ceiling (declared Content-Length and actual bytes) and maps
+    network errors to NomnomError. `_relay_open` is the injection seam for
+    tests (monkeypatch it to feed canned responses without a live socket)."""
     if body is not None:
-        headers["Content-Length"] = str(len(body))
-        headers["Content-Type"] = "application/octet-stream"
-    if extra_headers:
-        headers.update(extra_headers)
+        headers.setdefault("Content-Length", str(len(body)))
+        headers.setdefault("Content-Type", content_type)
     conn = _relay_open(relay)
     try:
         try:
@@ -4630,6 +4616,22 @@ def _relay_request(
             conn.close()
         except Exception:
             pass
+
+
+def _relay_request(
+    relay: dict, method: str, path: str,
+    *, body: bytes | None = None,
+    extra_headers: dict[str, str] | None = None,
+    signed: bool = True,
+) -> tuple[int, bytes]:
+    """One-shot HMAC-signed relay request. Returns (status, body)."""
+    full_path = _relay_full_path(relay, path)
+    headers: dict[str, str] = {}
+    if signed:
+        headers.update(_relay_hmac_headers(relay["secret"], method, full_path))
+    if extra_headers:
+        headers.update(extra_headers)
+    return _http_send(relay, method, full_path, body=body, headers=headers)
 
 
 def _qs(**params: int) -> str:
@@ -4723,27 +4725,10 @@ def _feed_request(
     relay = _feed_relay_dict(host)
     full_path = _relay_full_path(relay, path)
     headers = _feed_auth_headers(feed_key, method, full_path)
-    if body is not None:
-        headers["Content-Length"] = str(len(body))
-        headers["Content-Type"] = content_type
-    conn = _relay_open(relay)
-    try:
-        try:
-            conn.request(method, full_path, body=body, headers=headers)
-            resp = conn.getresponse()
-            data = resp.read(_RELAY_MAX_BODY + 1)
-            if len(data) > _RELAY_MAX_BODY:
-                raise NomnomError(
-                    f"relay returned oversized body (> {_RELAY_MAX_BODY} bytes)",
-                )
-            return resp.status, data
-        except (OSError, http.client.HTTPException) as e:
-            raise NomnomError(f"relay request failed: {e}") from e
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
+    return _http_send(
+        relay, method, full_path,
+        body=body, headers=headers, content_type=content_type,
+    )
 
 
 def _decode_relay_reason(body: bytes) -> str:
@@ -4804,16 +4789,27 @@ def _relay_mint_feed(
     _raise_relay_error(status, data)
 
 
-def _relay_get_feed_meta(host: str, feed_id: str, feed_key: bytes) -> dict:
+def _feed_json(
+    host: str, feed_key: bytes, method: str, path: str,
+    *, ok: int = 200, body: bytes | None = None,
+    content_type: str = "application/octet-stream",
+) -> dict:
+    """Feed-key request that returns parsed JSON on `ok`, else raises.
+
+    Folds the parse-or-raise tail repeated across the feed GET/POST endpoints."""
     status, data = _feed_request(
-        host, feed_key, "GET", f"/feeds/{feed_id}/meta",
+        host, feed_key, method, path, body=body, content_type=content_type,
     )
-    if status == 200:
+    if status == ok:
         try:
             return json.loads(data)
         except json.JSONDecodeError as e:
             raise NomnomError(f"relay returned bad JSON: {e}") from e
     _raise_feed_error(status, data)
+
+
+def _relay_get_feed_meta(host: str, feed_id: str, feed_key: bytes) -> dict:
+    return _feed_json(host, feed_key, "GET", f"/feeds/{feed_id}/meta")
 
 
 def _relay_put_member(
@@ -4846,32 +4842,20 @@ def _relay_list_members(
     host: str, feed_id: str, feed_key: bytes,
     *, since_ts: int = 0, wait_ms: int = 0,
 ) -> dict:
-    status, data = _feed_request(
+    return _feed_json(
         host, feed_key, "GET",
         f"/feeds/{feed_id}/members{_qs(wait=wait_ms, since=since_ts)}",
     )
-    if status == 200:
-        try:
-            return json.loads(data)
-        except json.JSONDecodeError as e:
-            raise NomnomError(f"relay returned bad JSON: {e}") from e
-    _raise_feed_error(status, data)
 
 
 def _relay_extend_feed(
     host: str, feed_id: str, feed_key: bytes, new_ttl_seconds: int,
 ) -> dict:
     body = json.dumps({"new_ttl_seconds": int(new_ttl_seconds)}).encode("utf-8")
-    status, data = _feed_request(
+    return _feed_json(
         host, feed_key, "POST", f"/feeds/{feed_id}/extend",
         body=body, content_type="application/json",
     )
-    if status == 200:
-        try:
-            return json.loads(data)
-        except json.JSONDecodeError as e:
-            raise NomnomError(f"relay returned bad JSON: {e}") from e
-    _raise_feed_error(status, data)
 
 
 def _relay_close_feed(host: str, feed_id: str, feed_key: bytes) -> None:
@@ -4918,17 +4902,11 @@ def _relay_list_feed_slots(
     host: str, feed_id: str, feed_key: bytes,
     *, since_ts: int = 0, wait_ms: int = 0,
 ) -> list:
-    status, data = _feed_request(
+    parsed = _feed_json(
         host, feed_key, "GET",
         f"/feeds/{feed_id}/slots{_qs(wait=wait_ms, since=since_ts)}",
     )
-    if status == 200:
-        try:
-            parsed = json.loads(data)
-        except json.JSONDecodeError as e:
-            raise NomnomError(f"relay returned bad JSON: {e}") from e
-        return parsed.get("slots") or []
-    _raise_feed_error(status, data)
+    return parsed.get("slots") or []
 
 
 # --- SSE slot stream (real-time push; stdlib-only streaming GET) ---
