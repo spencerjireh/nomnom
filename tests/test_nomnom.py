@@ -718,8 +718,9 @@ class TestLauncherScreen:
         s = nomnom.LauncherScreen()
         labels = [t[0] for t in s.tiles]
         for v in ("Bundle", "Commit", "PR", "Item", "Rebuild",
-                  "Send", "Receive", "Extensions", "Feeds"):
+                  "Send", "Receive", "Extensions", "Channel"):
             assert v in labels
+        assert "Feeds" not in labels
 
     def test_pair_tile_removed_in_v2(self):
         s = nomnom.LauncherScreen()
@@ -3774,46 +3775,72 @@ class TestV2MigrationNotice:
         assert capsys.readouterr().err == ""
 
 
-class TestFeedsScreen:
-    def test_empty_when_no_feeds(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
-        screen = nomnom.FeedsScreen()
-        assert screen.feeds == []
-
-    def test_loads_feeds_sorted_by_name(self, tmp_path, monkeypatch):
+class TestChannelScreen:
+    def _seed_channel(self, tmp_path, monkeypatch):
         monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
         cfg = nomnom._empty_feeds_config()
-        nomnom._add_or_replace_feed(cfg, _make_feed(name="zebra"))
-        nomnom._add_or_replace_feed(cfg, _make_feed(name="alpha", feed_id="abcDEF99_-zy"))
+        cfg["feeds"] = [_make_feed(name=nomnom._CHANNEL_NAME)]
+        cfg["default"] = nomnom._CHANNEL_NAME
         nomnom._save_feeds_config(cfg)
-        screen = nomnom.FeedsScreen()
-        assert [f.name for f, _ in screen.feeds] == ["alpha", "zebra"]
 
-    def test_marks_default(self, tmp_path, monkeypatch):
+    def test_no_channel_opens_in_join_mode(self, tmp_path, monkeypatch):
         monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
-        cfg = nomnom._empty_feeds_config()
-        nomnom._add_or_replace_feed(cfg, _make_feed(name="home"))
-        nomnom._save_feeds_config(cfg)
-        screen = nomnom.FeedsScreen()
-        assert any(is_default for _, is_default in screen.feeds)
+        screen = nomnom.ChannelScreen()
+        assert screen.feed is None
+        assert screen.mode == "join"
 
-    def test_esc_returns_back(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
-        screen = nomnom.FeedsScreen()
+    def test_with_channel_opens_in_view_mode(self, tmp_path, monkeypatch):
+        self._seed_channel(tmp_path, monkeypatch)
+        screen = nomnom.ChannelScreen()
+        assert screen.feed is not None
+        assert screen.mode == "view"
+
+    def test_esc_returns_back_from_view(self, tmp_path, monkeypatch):
+        self._seed_channel(tmp_path, monkeypatch)
+        screen = nomnom.ChannelScreen()
         assert screen.handle_key(27) == nomnom.ScreenAction.BACK
         assert screen.handle_key(ord("q")) == nomnom.ScreenAction.BACK
 
-    def test_d_sets_default(self, tmp_path, monkeypatch):
+    def test_join_mode_types_and_submits(self, tmp_path, monkeypatch):
         monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
-        cfg = nomnom._empty_feeds_config()
-        nomnom._add_or_replace_feed(cfg, _make_feed(name="home"))
-        nomnom._add_or_replace_feed(cfg, _make_feed(name="work", feed_id="abcDEF99_-zy"))
-        nomnom._save_feeds_config(cfg)
-        screen = nomnom.FeedsScreen()
-        # cursor starts at 0 ("home" — alphabetical); 'd' makes it default.
-        screen.cursor = 1
-        screen.handle_key(ord("d"))
-        assert nomnom._load_feeds_config()["default"] == "work"
+        captured = {}
+
+        def fake_join(secret):
+            captured["secret"] = secret
+            cfg = nomnom._empty_feeds_config()
+            feed = _make_feed(name=nomnom._CHANNEL_NAME)
+            cfg["feeds"] = [feed]
+            cfg["default"] = nomnom._CHANNEL_NAME
+            nomnom._save_feeds_config(cfg)
+            return feed
+
+        monkeypatch.setattr(nomnom, "_join_channel", fake_join)
+        screen = nomnom.ChannelScreen()  # starts in join mode (no channel)
+        for c in "relay.example.com/f/abc12345":
+            screen.handle_key(ord(c))
+        screen.handle_key(10)  # Enter
+        assert captured["secret"] == "relay.example.com/f/abc12345"
+        assert screen.mode == "view"
+        assert screen.feed is not None
+
+    def test_join_mode_reports_error(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+
+        def boom(secret):
+            raise nomnom.NomnomError("relay 404")
+
+        monkeypatch.setattr(nomnom, "_join_channel", boom)
+        screen = nomnom.ChannelScreen()
+        for c in "x/f/abc12345":
+            screen.handle_key(ord(c))
+        screen.handle_key(10)
+        assert "relay 404" in screen.error
+        assert screen.mode == "join"  # stays so the user can retry
+
+    def test_esc_from_join_with_no_channel_goes_back(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        screen = nomnom.ChannelScreen()
+        assert screen.handle_key(27) == nomnom.ScreenAction.BACK
 
 
 class TestFeedTofu:
