@@ -5015,6 +5015,41 @@ class TestEd25519:
         assert a != b
 
 
+class TestEd25519AdversarialVectors:
+    """Re-verify the shared adversarial fixture so the CLI's verdicts stay pinned.
+
+    The same vectors are asserted against @noble/curves in nomnom-web's
+    feeds.vectors.test.ts; together they guarantee the unaudited pure-Python
+    verify and the audited library can't diverge on malleable/non-canonical input.
+    """
+
+    _FIXTURE = (
+        Path(__file__).resolve().parents[1]
+        / "nomnom-web" / "test" / "fixtures" / "feeds-vectors.json"
+    )
+
+    def test_verify_matches_recorded_verdicts(self):
+        vectors = json.loads(self._FIXTURE.read_text(encoding="utf-8"))["verify"]
+        assert vectors, "expected adversarial verify vectors in the fixture"
+        for vec in vectors:
+            got = nomnom.ed25519_verify(
+                bytes.fromhex(vec["msgHex"]),
+                bytes.fromhex(vec["sigHex"]),
+                bytes.fromhex(vec["pubHex"]),
+            )
+            assert got is vec["valid"], f"verdict drift on {vec['label']!r}"
+
+    def test_rejects_non_canonical_s(self):
+        # A signature whose scalar S >= L (here S + L) must be rejected, matching
+        # @noble/curves — proves the canonical-S check is in force.
+        seed = bytes(range(32))
+        pub = nomnom.ed25519_pub_from_seed(seed)
+        sig = nomnom.ed25519_sign(b"canon", seed)
+        s = int.from_bytes(sig[32:], "little")
+        non_canonical = sig[:32] + (s + nomnom._ED_L).to_bytes(32, "little")
+        assert not nomnom.ed25519_verify(b"canon", non_canonical, pub)
+
+
 class TestFeedKeyDerivation:
     def test_deterministic(self):
         token = "k4n2pX9qLm3T"

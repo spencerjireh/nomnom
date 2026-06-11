@@ -3396,6 +3396,16 @@ def _hkdf(*, salt: bytes, ikm: bytes, info: bytes, length: int) -> bytes:
 # Sign / verify take ~50ms each on CPython. The interface (sign / verify
 # / pub-from-seed) is a strict subset of PyNaCl's signing module so the
 # logic is easy to spot-check against the spec.
+#
+# UNAUDITED, and deliberately so: nomnom is a single-file, stdlib-only CLI, so we
+# don't pull in libsodium/PyNaCl. This is the *reference* that generates the
+# interop test vectors the browser client (which uses the audited @noble/curves)
+# is checked against — so the cross-impl agreement tests, including the
+# adversarial verify vectors (tests/test_nomnom.py::TestEd25519AdversarialVectors
+# and nomnom-web's feeds.vectors.test.ts), are the safety net that this and the
+# audited library can't diverge unnoticed. `ed25519_verify` uses the strict
+# cofactorless equation [S]B == R + [k]A with canonical-S enforcement (s < L);
+# that is a deliberate choice and must keep matching @noble/curves.
 
 _ED_P = 2 ** 255 - 19
 _ED_L = 2 ** 252 + 27742317777372353535851937790883648493

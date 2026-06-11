@@ -71,6 +71,40 @@ def main() -> int:
             "sigHex": sig.hex(),
         })
 
+    # --- Ed25519 adversarial verify vectors ---
+    # Each records what the (unaudited) pure-Python verify returns for a crafted
+    # input; the TS test asserts @noble/curves returns the SAME verdict, so any
+    # malleability/canonicality divergence between the two fails CI.
+    verify_vectors = []
+
+    def add_verify(label: str, msg: bytes, sig: bytes, pub: bytes) -> None:
+        verify_vectors.append({
+            "label": label,
+            "msgHex": msg.hex(),
+            "sigHex": sig.hex(),
+            "pubHex": pub.hex(),
+            "valid": m.ed25519_verify(msg, sig, pub),
+        })
+
+    adv_msg = b"adversarial vectors"
+    pub = bytes.fromhex(sig_pub_hex)
+    base_sig = m.ed25519_sign(adv_msg, seed)
+    other_pub = m.ed25519_pub_from_seed(bytes(range(32, 64)))
+    flip_r = bytearray(base_sig); flip_r[0] ^= 0x01    # corrupt R
+    flip_s = bytearray(base_sig); flip_s[32] ^= 0x01   # corrupt S (stays < L)
+    s_val = int.from_bytes(base_sig[32:], "little")
+    non_canon_s = base_sig[:32] + (s_val + m._ED_L).to_bytes(32, "little")  # S >= L
+    add_verify("valid", adv_msg, base_sig, pub)
+    add_verify("flipped-r", adv_msg, bytes(flip_r), pub)
+    add_verify("flipped-s", adv_msg, bytes(flip_s), pub)
+    add_verify("wrong-msg", b"a different message", base_sig, pub)
+    add_verify("wrong-pub", adv_msg, base_sig, other_pub)
+    add_verify("non-canonical-s", adv_msg, non_canon_s, pub)
+    add_verify("zero-sig", adv_msg, bytes(64), pub)
+    # The baseline must verify; every tampered case must be rejected by the CLI.
+    assert verify_vectors[0]["valid"] is True
+    assert all(not vv["valid"] for vv in verify_vectors[1:])
+
     # --- feed_seal / feed_open ---
     seal_vectors = []
     bodies = {
@@ -120,6 +154,7 @@ def main() -> int:
         "postedAt": posted_at,
         "hkdf": hkdf_vectors,
         "ed25519": ed_vectors,
+        "verify": verify_vectors,
         "seal": seal_vectors,
         "requestMac": {
             "method": method,
