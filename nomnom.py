@@ -4160,7 +4160,12 @@ def feed_open(
 #   }
 
 _FEEDS_CONFIG_SCHEMA = 1
-_FEED_NICKNAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
+
+# nomnom has exactly one "channel": a single permanent feed shared across all of
+# a user's own devices. It's stored as the lone entry in feeds.json under this
+# fixed name. `_PERMANENT_TTL_SEC` matches the relay Worker's raised TTL cap.
+_CHANNEL_NAME = "channel"
+_PERMANENT_TTL_SEC = 3650 * 86_400  # ~10 years
 
 
 @dataclass
@@ -4282,25 +4287,6 @@ def _default_feed(config: dict) -> Feed | None:
     if not isinstance(name, str):
         return None
     return _find_feed(config, name)
-
-
-def _validate_feed_nickname(name: str) -> None:
-    """Raise NomnomError if `name` doesn't match the nickname format."""
-    if not _FEED_NICKNAME_RE.match(name):
-        raise NomnomError(
-            "feed nickname must be 1-32 chars of lowercase letters, "
-            "digits, or '-', and start with a letter or digit",
-        )
-
-
-def _autogen_feed_nickname(existing: list[Feed]) -> str:
-    """Return a fresh `feed-N` that doesn't collide with any existing feed."""
-    taken = {f.name for f in existing if isinstance(f, Feed)}
-    for i in range(1, 10_000):
-        candidate = f"feed-{i}"
-        if candidate not in taken:
-            return candidate
-    raise NomnomError("too many feeds; pick an explicit --name")
 
 
 def _format_feed_url(host: str, feed_id: str) -> str:
@@ -5095,22 +5081,24 @@ _RELAY_PAIR_MAGIC = "nomnom-pair-v1"
 # check is the trust gate, same as before.
 
 
-def _resolve_target_feed(feed_name: str | None) -> Feed | None:
-    """Look up the feed for send/receive, printing a friendly error on miss."""
-    cfg = _load_feeds_config()
-    if feed_name is not None:
-        feed = _find_feed(cfg, feed_name)
-        if feed is None:
-            sys.stderr.write(f"error: no feed named {feed_name!r}.\n")
-            return None
-        return feed
-    feed = _default_feed(cfg)
+def _the_channel() -> Feed | None:
+    """Return the single channel feed, or None if this device isn't set up."""
+    feeds = _load_feeds_config().get("feeds") or []
+    return feeds[0] if feeds else None
+
+
+def _no_channel_hint() -> str:
+    return (
+        "no channel yet. run `nomnom init` (first device) or "
+        "`nomnom join <secret>` (other devices)."
+    )
+
+
+def _resolve_target_feed() -> Feed | None:
+    """Return the channel for send/receive, printing a friendly error on miss."""
+    feed = _the_channel()
     if feed is None:
-        sys.stderr.write(
-            "error: no default feed. open one with `nomnom open` or join "
-            "one with `nomnom join <url>`.\n",
-        )
-        return None
+        sys.stderr.write(f"error: {_no_channel_hint()}\n")
     return feed
 
 
@@ -5172,8 +5160,8 @@ def _feed_send_bytes(
     lines: list[str] = []
     if not others:
         lines.append(
-            f"warning: feed {target.name!r} has no other members; the post "
-            "will sit until someone joins or the feed expires.",
+            "warning: your channel has no other devices yet; the file will "
+            "wait until one joins with `nomnom join`.",
         )
 
     ident = _load_identity()
@@ -5195,37 +5183,37 @@ def _feed_send_bytes(
         existing.members_cache = roster
         _save_feeds_config(cfg)
     lines.append(
-        f"sent {filename!r} ({len(data)} bytes) to feed {target.name!r} "
-        f"({len(others)} recipient(s)).",
+        f"sent {filename!r} ({len(data)} bytes) to your channel "
+        f"({len(others)} device(s)).",
     )
     return lines
 
 
 def _has_send_target() -> bool:
-    """True when a default feed is configured (so SEND is a usable destination)."""
+    """True when a channel is configured (so SEND is a usable destination)."""
     try:
-        return _default_feed(_load_feeds_config()) is not None
+        return _the_channel() is not None
     except Exception:
         return False
 
 
 def _emit_to_feed(data: bytes, filename: str) -> tuple[int, list[str]]:
-    """Broadcast already-rendered bytes to the default feed. (rc, status lines).
+    """Broadcast already-rendered bytes to the channel. (rc, status lines).
 
     The SEND destination for bundle/commit/pr/item routes here. Targets the
-    default feed (switch it via the Feeds screen). Never raises.
+    single channel. Never raises.
     """
-    target = _default_feed(_load_feeds_config())
+    target = _the_channel()
     if target is None:
-        return 1, ["no default feed; open or join one first."]
+        return 1, [_no_channel_hint()]
     try:
         return 0, _feed_send_bytes(target, data, _safe_filename(filename))
     except NomnomError as e:
         return 1, [f"send failed: {e}"]
 
 
-def cmd_send(path: str, *, feed: str | None = None, trust_new: bool = False) -> int:
-    """Broadcast a file into the default feed (or --feed)."""
+def cmd_send(path: str, *, trust_new: bool = False) -> int:
+    """Broadcast a file to every other device on your channel."""
     p = Path(path).expanduser()
     if not p.is_file():
         sys.stderr.write(f"error: not a file: {p}\n")
@@ -5247,7 +5235,7 @@ def cmd_send(path: str, *, feed: str | None = None, trust_new: bool = False) -> 
         sys.stderr.write(f"error: cannot read {p}: {e}\n")
         return 1
 
-    target = _resolve_target_feed(feed)
+    target = _resolve_target_feed()
     if target is None:
         return 1
     try:
@@ -5385,17 +5373,15 @@ def _cmd_receive_stream(
     return 0
 
 
-def cmd_receive(
-    *, feed: str | None = None, once: bool = False, trust_new: bool = False,
-) -> int:
-    """Watch a feed for new posts; write each to cwd.
+def cmd_receive(*, once: bool = False, trust_new: bool = False) -> int:
+    """Watch your channel for new files; write each to cwd.
 
     Continuous mode pushes via the SSE /stream endpoint (falling back to the
     /slots long-poll if the relay has no /stream). `--once` uses the long-poll
     directly. Each new post is decrypted, signature-verified, and written to
     disk (collisions auto-rename). Ctrl-C exits cleanly.
     """
-    target = _resolve_target_feed(feed)
+    target = _resolve_target_feed()
     if target is None:
         return 1
     feed_key = _feed_key_from_token(target.feed_token)
@@ -5403,9 +5389,7 @@ def cmd_receive(
 
     received_any = False
     if not once:
-        sys.stderr.write(
-            f"watching feed {target.name!r} (Ctrl-C to exit)...\n",
-        )
+        sys.stderr.write("watching for files (Ctrl-C to exit)...\n")
         sys.stderr.flush()
 
     last_ts = target.last_post_ts
@@ -5561,7 +5545,7 @@ def _ensure_relay_configured(*, interactive: bool = True) -> dict | None:
     cfg = _load_relay_config()
     if cfg is not None:
         return cfg
-    hint = "run `nomnom relay init` (first device) or `nomnom join <token>` (other devices)"
+    hint = "run `nomnom init` (first device) or `nomnom join <secret>` (other devices)"
     if not interactive or _in_tui():
         raise NomnomError(f"no relay configured. {hint}.")
     if not sys.stdin.isatty():
@@ -5628,9 +5612,6 @@ def _cmd_relay_init_interactive(*, allow_private: bool = False) -> dict | None:
         f"  echo {secret!r} | npx wrangler secret put NOMNOM_HMAC_SECRET\n"
         "  npx wrangler deploy\n",
     )
-    sys.stderr.write(
-        "\nshare with another device with: nomnom relay show --token\n",
-    )
     return candidate
 
 
@@ -5641,38 +5622,36 @@ def _cmd_relay_init(args) -> int:
     return 0 if cfg is not None else 1
 
 
-def cmd_open(args) -> int:
-    """Mint a new feed on the configured relay and save it locally.
+def cmd_init(args) -> int:
+    """Set up the relay (first device) and create your one permanent channel.
 
-    Requires relay.json (the relay HMAC gates feed minting). Generates a
-    random member_id, publishes a member card for this device, and prints
-    the shareable URL.
+    Run once, on the device that owns the relay. Configures relay.json if it's
+    missing, mints a single long-lived feed (the "channel"), stores it, and
+    prints the channel secret to paste on your other devices via `nomnom join`.
     """
-    relay = _ensure_relay_configured(
-        interactive=getattr(args, "interactive", True),
-    )
-    if relay is None:
+    if _the_channel() is not None:
+        sys.stderr.write(
+            "error: a channel already exists on this device. run "
+            "`nomnom channel` to show its secret, or `nomnom reset` to "
+            "start over.\n",
+        )
         return 1
 
-    cfg = _load_feeds_config()
-    name = getattr(args, "name", None)
-    if name:
-        try:
-            _validate_feed_nickname(name)
-        except NomnomError as e:
-            sys.stderr.write(f"error: {e}\n")
+    relay = _load_relay_config()
+    if relay is None:
+        if not sys.stdin.isatty():
+            sys.stderr.write(
+                "error: no relay configured, and stdin is not a tty so the "
+                "setup prompts can't run. run `nomnom init` interactively on "
+                "the device that owns the relay.\n",
+            )
             return 1
-        if _find_feed(cfg, name) is not None:
-            sys.stderr.write(f"error: feed nickname {name!r} already exists.\n")
-            return 1
-    else:
-        try:
-            name = _autogen_feed_nickname(cfg["feeds"])
-        except NomnomError as e:
-            sys.stderr.write(f"error: {e}\n")
+        relay = _cmd_relay_init_interactive(
+            allow_private=getattr(args, "allow_private", False),
+        )
+        if relay is None:
             return 1
 
-    ttl = int(getattr(args, "ttl", 0) or 86_400)
     ident = _load_identity()
     member_id = secrets.token_hex(16)
     card = {
@@ -5681,7 +5660,9 @@ def cmd_open(args) -> int:
         "name": ident["name"],
     }
     try:
-        result = _relay_mint_feed(relay, ttl_seconds=ttl, member_card=card)
+        result = _relay_mint_feed(
+            relay, ttl_seconds=_PERMANENT_TTL_SEC, member_card=card,
+        )
     except NomnomError as e:
         sys.stderr.write(f"error: {e}\n")
         return 1
@@ -5690,11 +5671,13 @@ def cmd_open(args) -> int:
     if not feed_id:
         sys.stderr.write("error: relay did not return a feed_id.\n")
         return 1
-    expires_at = int(result.get("expires_at") or (int(time.time()) + ttl))
     created_at = int(result.get("created_at") or time.time())
+    expires_at = int(
+        result.get("expires_at") or (created_at + _PERMANENT_TTL_SEC),
+    )
     host = _relay_split_url(relay["url"])[0]
     feed = Feed(
-        name=name,
+        name=_CHANNEL_NAME,
         feed_id=feed_id,
         feed_token=feed_id,
         url=_format_feed_url(host, feed_id),
@@ -5710,56 +5693,73 @@ def cmd_open(args) -> int:
             },
         ],
     )
-    _add_or_replace_feed(cfg, feed)
-    if getattr(args, "default", False):
-        cfg["default"] = name
+    cfg = _load_feeds_config()
+    cfg["feeds"] = [feed]
+    cfg["default"] = _CHANNEL_NAME
     _save_feeds_config(cfg)
 
     sys.stderr.write(
-        f"opened feed '{name}' (TTL {ttl}s, expires at {expires_at}).\n"
-        f"share this URL with the other device:\n",
+        "channel created. paste this secret on your other devices "
+        "(`nomnom join <secret>`):\n",
     )
     print(feed.url)
     return 0
 
 
-def cmd_join(args) -> int:
-    """Join an existing feed by URL.
+def cmd_channel(_args) -> int:
+    """Show your channel secret (to add devices) and the device roster."""
+    feed = _the_channel()
+    if feed is None:
+        sys.stderr.write(f"error: {_no_channel_hint()}\n")
+        return 1
+    feed_key = _feed_key_from_token(feed.feed_token)
+    host, _ = _parse_feed_url(feed.url)
+    sys.stderr.write(
+        "channel secret (paste on another device with `nomnom join`):\n",
+    )
+    print(feed.url)
+    try:
+        roster = _relay_list_members(host, feed.feed_id, feed_key)
+    except NomnomError as e:
+        sys.stderr.write(f"\nwarning: could not fetch devices: {e}\n")
+        return 0
+    members = roster.get("members") or []
+    sys.stderr.write(f"\ndevices ({len(members)}):\n")
+    for m in members:
+        marker = " *" if m.get("member_id") == feed.member_id else "  "
+        fp = (
+            _ik_fingerprint(m.get("identity_pubkey", ""))
+            if m.get("identity_pubkey") else "(no key)"
+        )
+        sys.stderr.write(f"{marker} {m.get('name', '?'):<28} {fp}\n")
+    feed.members_cache = members
+    cfg = _load_feeds_config()
+    existing = _find_feed(cfg, feed.name)
+    if existing is not None:
+        existing.members_cache = members
+        _save_feeds_config(cfg)
+    return 0
 
-    Doesn't require relay.json — feed-key signatures are the credential for
-    /feeds/:id/* endpoints. The local `relay.json` is only needed for
-    minting new feeds via `nomnom open`.
+
+def cmd_join(args) -> int:
+    """Add this device to your channel by pasting its secret.
+
+    Doesn't require relay.json — the channel secret (the feed URL) is the
+    credential for /feeds/:id/* endpoints. Replaces any channel already
+    configured on this device, so re-pairing is just running this again.
     """
     try:
-        host, feed_id = _parse_feed_url(args.url)
+        host, feed_id = _parse_feed_url(args.secret)
     except NomnomError as e:
         sys.stderr.write(f"error: {e}\n")
         return 1
 
-    cfg = _load_feeds_config()
-    name = getattr(args, "name", None)
-    if name:
-        try:
-            _validate_feed_nickname(name)
-        except NomnomError as e:
-            sys.stderr.write(f"error: {e}\n")
-            return 1
-        if _find_feed(cfg, name) is not None:
-            sys.stderr.write(f"error: feed nickname {name!r} already exists.\n")
-            return 1
-    else:
-        try:
-            name = _autogen_feed_nickname(cfg["feeds"])
-        except NomnomError as e:
-            sys.stderr.write(f"error: {e}\n")
-            return 1
-
     feed_key = _feed_key_from_token(feed_id)
-    # Probe the feed exists + the URL is correct before publishing anything.
+    # Probe the channel exists + the secret is correct before publishing.
     try:
         meta = _relay_get_feed_meta(host, feed_id, feed_key)
     except NomnomError as e:
-        sys.stderr.write(f"error: {e}\nfeed NOT joined.\n")
+        sys.stderr.write(f"error: {e}\nnot joined.\n")
         return 1
 
     ident = _load_identity()
@@ -5777,7 +5777,7 @@ def cmd_join(args) -> int:
         return 1
 
     feed = Feed(
-        name=name,
+        name=_CHANNEL_NAME,
         feed_id=feed_id,
         feed_token=feed_id,
         url=_format_feed_url(host, feed_id),
@@ -5786,163 +5786,12 @@ def cmd_join(args) -> int:
         member_id=member_id,
         members_cache=list(roster.get("members") or []),
     )
-    _add_or_replace_feed(cfg, feed)
-    if getattr(args, "default", False):
-        cfg["default"] = name
+    cfg = _load_feeds_config()
+    cfg["feeds"] = [feed]
+    cfg["default"] = _CHANNEL_NAME
     _save_feeds_config(cfg)
     sys.stderr.write(
-        f"joined feed '{name}' with {len(feed.members_cache)} member(s).\n",
-    )
-    return 0
-
-
-def cmd_feeds(args) -> int:
-    action = getattr(args, "action", None)
-    if action is None:
-        sys.stderr.write("error: feeds requires an action (try `feeds list`).\n")
-        return 2
-    handler = {
-        "list": _cmd_feeds_list,
-        "members": _cmd_feeds_members,
-        "url": _cmd_feeds_url,
-        "default": _cmd_feeds_default,
-        "rename": _cmd_feeds_rename,
-        "leave": _cmd_feeds_leave,
-        "extend": _cmd_feeds_extend,
-    }.get(action)
-    if handler is None:
-        sys.stderr.write(f"error: unknown feeds action {action!r}.\n")
-        return 2
-    return handler(args)
-
-
-def _cmd_feeds_list(_args) -> int:
-    cfg = _load_feeds_config()
-    feeds = cfg["feeds"]
-    if not feeds:
-        sys.stderr.write("no feeds joined. mint one with `nomnom open`.\n")
-        return 0
-    default = cfg.get("default")
-    now = int(time.time())
-    for f in feeds:
-        marker = " *" if f.name == default else "  "
-        ttl_remaining = max(0, f.expires_at - now)
-        members = len(f.members_cache)
-        status = "expired" if ttl_remaining == 0 else f"expires in {ttl_remaining}s"
-        print(f"{marker} {f.name:<24} {members} member(s)  {status}")
-    return 0
-
-
-def _cmd_feeds_members(args) -> int:
-    cfg = _load_feeds_config()
-    feed = _find_feed(cfg, args.name)
-    if feed is None:
-        sys.stderr.write(f"error: no feed named {args.name!r}.\n")
-        return 1
-    feed_key = _feed_key_from_token(feed.feed_token)
-    host, _ = _parse_feed_url(feed.url)
-    try:
-        roster = _relay_list_members(host, feed.feed_id, feed_key)
-    except NomnomError as e:
-        sys.stderr.write(f"error: {e}\n")
-        return 1
-    members = roster.get("members") or []
-    if not members:
-        sys.stderr.write("(no members)\n")
-        return 0
-    for m in members:
-        marker = " *" if m.get("member_id") == feed.member_id else "  "
-        fp = _ik_fingerprint(m.get("identity_pubkey", "")) if m.get("identity_pubkey") else "(no key)"
-        print(f"{marker} {m.get('name', '?'):<28} {fp}  ({m.get('member_id', '?')[:12]}...)")
-    # Refresh the local cache opportunistically.
-    feed.members_cache = members
-    _save_feeds_config(cfg)
-    return 0
-
-
-def _cmd_feeds_url(args) -> int:
-    cfg = _load_feeds_config()
-    feed = _find_feed(cfg, args.name)
-    if feed is None:
-        sys.stderr.write(f"error: no feed named {args.name!r}.\n")
-        return 1
-    print(feed.url)
-    return 0
-
-
-def _cmd_feeds_default(args) -> int:
-    cfg = _load_feeds_config()
-    feed = _find_feed(cfg, args.name)
-    if feed is None:
-        sys.stderr.write(f"error: no feed named {args.name!r}.\n")
-        return 1
-    cfg["default"] = feed.name
-    _save_feeds_config(cfg)
-    sys.stderr.write(f"default feed is now '{feed.name}'.\n")
-    return 0
-
-
-def _cmd_feeds_rename(args) -> int:
-    cfg = _load_feeds_config()
-    feed = _find_feed(cfg, args.name)
-    if feed is None:
-        sys.stderr.write(f"error: no feed named {args.name!r}.\n")
-        return 1
-    try:
-        _validate_feed_nickname(args.new_name)
-    except NomnomError as e:
-        sys.stderr.write(f"error: {e}\n")
-        return 1
-    if _find_feed(cfg, args.new_name) is not None:
-        sys.stderr.write(f"error: feed nickname {args.new_name!r} already exists.\n")
-        return 1
-    old = feed.name
-    feed.name = args.new_name
-    if cfg.get("default") == old:
-        cfg["default"] = args.new_name
-    _save_feeds_config(cfg)
-    sys.stderr.write(f"renamed '{old}' to '{args.new_name}'.\n")
-    return 0
-
-
-def _cmd_feeds_leave(args) -> int:
-    cfg = _load_feeds_config()
-    feed = _find_feed(cfg, args.name)
-    if feed is None:
-        sys.stderr.write(f"error: no feed named {args.name!r}.\n")
-        return 1
-    feed_key = _feed_key_from_token(feed.feed_token)
-    host, _ = _parse_feed_url(feed.url)
-    _relay_delete_member(host, feed.feed_id, feed_key, feed.member_id)
-    cfg["feeds"] = [f for f in cfg["feeds"] if f.name != feed.name]
-    if cfg.get("default") == feed.name:
-        cfg["default"] = cfg["feeds"][0].name if cfg["feeds"] else None
-    _save_feeds_config(cfg)
-    sys.stderr.write(f"left feed '{feed.name}' (member card deleted).\n")
-    return 0
-
-
-def _cmd_feeds_extend(args) -> int:
-    cfg = _load_feeds_config()
-    feed = _find_feed(cfg, args.name)
-    if feed is None:
-        sys.stderr.write(f"error: no feed named {args.name!r}.\n")
-        return 1
-    new_ttl = int(args.ttl)
-    if new_ttl < 60:
-        sys.stderr.write("error: --ttl must be at least 60 seconds.\n")
-        return 1
-    feed_key = _feed_key_from_token(feed.feed_token)
-    host, _ = _parse_feed_url(feed.url)
-    try:
-        result = _relay_extend_feed(host, feed.feed_id, feed_key, new_ttl)
-    except NomnomError as e:
-        sys.stderr.write(f"error: {e}\n")
-        return 1
-    feed.expires_at = int(result.get("expires_at") or (int(time.time()) + new_ttl))
-    _save_feeds_config(cfg)
-    sys.stderr.write(
-        f"extended '{feed.name}'; new expiry: {feed.expires_at}.\n",
+        f"joined the channel ({len(feed.members_cache)} device(s)).\n",
     )
     return 0
 
@@ -6467,8 +6316,8 @@ class ReceiveScreen(Screen):
         self._stream_failed = False  # relay lacks /stream → cooperative long-poll
         if self.feed is None:
             self.error = (
-                "no default feed. open one (`nomnom open`) or join one "
-                "(`nomnom join <url>`), then set it default in Feeds."
+                "no channel yet. run `nomnom init` (first device) or "
+                "`nomnom join <secret>` (other devices)."
             )
             return
         try:
@@ -7118,7 +6967,7 @@ class FeedsScreen(Screen):
             try:
                 stdscr.addstr(
                     2, 2,
-                    "(no feeds yet — run `nomnom open` or `nomnom join <url>`)",
+                    "(no channel yet — run `nomnom init` or `nomnom join <secret>`)",
                     theme["dim"],
                 )
             except curses.error:
@@ -8061,20 +7910,15 @@ def _build_send_parser() -> argparse.ArgumentParser:
     sub = argparse.ArgumentParser(
         prog="nomnom send",
         description=(
-            "Broadcast a file into the default feed (or --feed NAME). "
-            "Every other member of the feed will see it. The relay sees only "
-            "ciphertext; the sender's identity is signed per post."
+            "Send a file to every other device on your channel. The relay "
+            "sees only ciphertext; the sender's identity is signed per post."
         ),
     )
     sub.add_argument("file", help="Path to the file to send.")
     sub.add_argument(
-        "--feed", default=None, metavar="NAME",
-        help="Target feed nickname (default: the default feed).",
-    )
-    sub.add_argument(
         "--trust-new", action="store_true",
         help=(
-            "Auto-accept TOFU prompts on first sight of a member's identity. "
+            "Auto-accept TOFU prompts on first sight of a device's identity. "
             "Scriptable but loses the explicit gate."
         ),
     )
@@ -8085,15 +7929,10 @@ def _build_receive_parser() -> argparse.ArgumentParser:
     sub = argparse.ArgumentParser(
         prog="nomnom receive",
         description=(
-            "Watch a feed for new posts and write each received file into the "
-            "current directory. Default: keep listening on the default feed "
-            "until Ctrl-C. Pass --feed NAME to watch a different feed, or "
-            "--once to exit after the first received file."
+            "Watch your channel for new files and write each into the current "
+            "directory. Default: keep listening until Ctrl-C. Pass --once to "
+            "exit after the first received file."
         ),
-    )
-    sub.add_argument(
-        "--feed", default=None, metavar="NAME",
-        help="Feed nickname to watch (default: the default feed).",
     )
     sub.add_argument(
         "--once", action="store_true",
@@ -8105,7 +7944,7 @@ def _build_receive_parser() -> argparse.ArgumentParser:
     sub.add_argument(
         "--trust-new", action="store_true",
         help=(
-            "Auto-accept TOFU prompts on first sight of a member's identity. "
+            "Auto-accept TOFU prompts on first sight of a device's identity. "
             "Scriptable but loses the explicit gate."
         ),
     )
@@ -8151,8 +7990,9 @@ def _build_relay_parser() -> argparse.ArgumentParser:
     p_show.add_argument(
         "--token", action="store_true",
         help=(
-            "Print the shareable `host#secret` join token for `nomnom join` "
-            "on another device. The secret is NOT redacted."
+            "Print the bare `host#secret` (relay HMAC, NOT redacted). Lets "
+            "another owner device run `nomnom init` against the same relay; "
+            "regular devices just need the channel secret from `nomnom channel`."
         ),
     )
     sp.add_parser("clear", help="Delete relay.json after confirmation.")
@@ -8163,73 +8003,43 @@ def _build_join_parser() -> argparse.ArgumentParser:
     sub = argparse.ArgumentParser(
         prog="nomnom join",
         description=(
-            "Join an existing feed by URL (host/f/<token>). The URL alone "
-            "is the credential; no relay HMAC is needed on the joiner's side."
+            "Add this device to your channel by pasting its secret (the "
+            "host/f/<token> URL from `nomnom init` or `nomnom channel`). The "
+            "secret alone is the credential; no relay HMAC is needed here. "
+            "Replaces any channel already configured on this device."
         ),
     )
-    sub.add_argument("url", help="Feed URL (host/f/<token>).")
-    sub.add_argument(
-        "--name", default=None,
-        help="Local nickname for this feed (default: auto-generated `feed-N`).",
-    )
-    sub.add_argument(
-        "--default", action="store_true",
-        help="Set this feed as the default for `send`/`receive`.",
-    )
+    sub.add_argument("secret", help="Channel secret (host/f/<token>).")
     return sub
 
 
-def _build_open_parser() -> argparse.ArgumentParser:
+def _build_init_parser() -> argparse.ArgumentParser:
     sub = argparse.ArgumentParser(
-        prog="nomnom open",
+        prog="nomnom init",
         description=(
-            "Mint a new feed on the configured relay and save it locally. "
-            "Prints a shareable join URL for other devices."
+            "Set up the relay (first device) and create your one permanent "
+            "channel. Run once, on the device that owns the relay. Prints the "
+            "channel secret to paste on your other devices with `nomnom join`."
         ),
     )
     sub.add_argument(
-        "--name", default=None,
-        help="Local nickname for this feed (default: auto-generated `feed-N`).",
-    )
-    sub.add_argument(
-        "--ttl", type=int, default=86_400,
-        help="Time-to-live in seconds (default: 86400 = 1 day).",
-    )
-    sub.add_argument(
-        "--default", action="store_true",
-        help="Set this feed as the default for `send`/`receive`.",
+        "--allow-private", action="store_true",
+        help=(
+            "Allow a relay URL that resolves to a private / loopback / "
+            "link-local address (e.g., a local dev Worker)."
+        ),
     )
     return sub
 
 
-def _build_feeds_parser() -> argparse.ArgumentParser:
-    sub = argparse.ArgumentParser(
-        prog="nomnom feeds",
-        description="Inspect and manage joined feeds.",
+def _build_channel_parser() -> argparse.ArgumentParser:
+    return argparse.ArgumentParser(
+        prog="nomnom channel",
+        description=(
+            "Show your channel secret (paste on another device with "
+            "`nomnom join`) and the list of devices currently on it."
+        ),
     )
-    sp = sub.add_subparsers(dest="action", metavar="ACTION")
-    sp.add_parser("list", help="Show joined feeds, default marker, TTL.")
-    p_members = sp.add_parser("members", help="Fetch and show feed roster.")
-    p_members.add_argument("name", help="Local feed nickname.")
-    p_url = sp.add_parser("url", help="Print the shareable join URL.")
-    p_url.add_argument("name", help="Local feed nickname.")
-    p_default = sp.add_parser("default", help="Set the default feed.")
-    p_default.add_argument("name", help="Local feed nickname.")
-    p_rename = sp.add_parser("rename", help="Rename a feed locally.")
-    p_rename.add_argument("name", help="Current local nickname.")
-    p_rename.add_argument("new_name", help="New local nickname.")
-    p_leave = sp.add_parser(
-        "leave",
-        help="Leave a feed (deletes your member card, removes locally).",
-    )
-    p_leave.add_argument("name", help="Local feed nickname.")
-    p_extend = sp.add_parser("extend", help="Extend a feed's TTL.")
-    p_extend.add_argument("name", help="Local feed nickname.")
-    p_extend.add_argument(
-        "--ttl", type=int, required=True,
-        help="New TTL in seconds (relative to now).",
-    )
-    return sub
 
 
 def _build_peers_parser() -> argparse.ArgumentParser:
@@ -8304,29 +8114,27 @@ _DISPATCH = {
     ),
     "send": (
         _build_send_parser,
-        lambda a: cmd_send(a.file, feed=a.feed, trust_new=a.trust_new),
+        lambda a: cmd_send(a.file, trust_new=a.trust_new),
     ),
     "receive": (
         _build_receive_parser,
-        lambda a: cmd_receive(
-            feed=a.feed, once=a.once, trust_new=a.trust_new,
-        ),
+        lambda a: cmd_receive(once=a.once, trust_new=a.trust_new),
     ),
-    "relay": (
-        _build_relay_parser,
-        cmd_relay,
+    "init": (
+        _build_init_parser,
+        cmd_init,
     ),
     "join": (
         _build_join_parser,
         cmd_join,
     ),
-    "open": (
-        _build_open_parser,
-        cmd_open,
+    "channel": (
+        _build_channel_parser,
+        cmd_channel,
     ),
-    "feeds": (
-        _build_feeds_parser,
-        cmd_feeds,
+    "relay": (
+        _build_relay_parser,
+        cmd_relay,
     ),
     "peers": (
         _build_peers_parser,
@@ -8400,17 +8208,26 @@ def _emit_bundle(
 
 _RETIRED_VERBS = {
     "pair": (
-        "`nomnom pair` was retired in feeds v2. To onboard another device, "
-        "run `nomnom open` on this device to mint a feed and share the "
-        "printed URL; then run `nomnom join <url>` on the other device."
+        "`nomnom pair` was retired. To add another device, run `nomnom init` "
+        "on the first device and share the printed channel secret; then run "
+        "`nomnom join <secret>` on the other device."
+    ),
+    "open": (
+        "`nomnom open` was retired. nomnom now has one permanent channel: run "
+        "`nomnom init` once on the first device, then `nomnom join <secret>` "
+        "on the others."
+    ),
+    "feeds": (
+        "`nomnom feeds` was retired. There's one channel now — use "
+        "`nomnom channel` to show its secret and the devices on it."
     ),
     "encrypt": (
-        "`nomnom encrypt` was renamed in v1.5 and removed in feeds v2. "
-        "Use `nomnom send` (broadcast to your default feed)."
+        "`nomnom encrypt` was renamed in v1.5 and removed. "
+        "Use `nomnom send` (send to your channel)."
     ),
     "decrypt": (
-        "`nomnom decrypt` was renamed in v1.5 and removed in feeds v2. "
-        "Use `nomnom receive` (watch your default feed)."
+        "`nomnom decrypt` was renamed in v1.5 and removed. "
+        "Use `nomnom receive` (watch your channel)."
     ),
 }
 
@@ -8419,7 +8236,7 @@ def _maybe_print_v2_migration_notice() -> None:
     """Print a one-shot heads-up when legacy pins exist but no feeds do.
 
     Detects v1/v2 pin records (no `sig_pub` field) and points the user at
-    the new `open`/`join` flow. Best-effort — failure to print never blocks
+    the new `init`/`join` flow. Best-effort — failure to print never blocks
     startup.
     """
     try:
@@ -8436,9 +8253,10 @@ def _maybe_print_v2_migration_notice() -> None:
     if cfg["feeds"]:
         return
     sys.stderr.write(
-        f"nomnom: v2 introduces feeds; pair is retired. "
+        f"nomnom: pair is retired. "
         f"{len(legacy)} legacy pin(s) preserved as identity records but no "
-        "longer transport. open or join a feed to send/receive.\n",
+        "longer transport. run `nomnom init` or `nomnom join <secret>` to "
+        "send/receive.\n",
     )
 
 
@@ -8472,13 +8290,13 @@ def main() -> int:
             "subcommands: register / unregister edit the auto-managed "
             "extension lists; commit / pr / item bundle git context for "
             "an LLM; rebuild reconstructs a file tree from a bundle .txt; "
-            "relay init sets up a new relay on this machine; join <token> "
-            "joins an existing relay from another device; pair adds a new "
-            "device through the relay; send / receive move files between "
-            "pinned machines via the Cloudflare Worker relay you deploy "
-            "yourself (receive listens until Ctrl-C); peers manages pinned "
-            "identities; reset wipes ~/.config/nomnom/. "
-            "run `nomnom <subcommand> --help`."
+            "init sets up the relay and creates your one permanent channel "
+            "(first device); join <secret> adds another device to it; "
+            "channel shows the secret + devices; send / receive move files "
+            "across your devices via the Cloudflare Worker relay you deploy "
+            "yourself (receive listens until Ctrl-C); relay manages the relay "
+            "config; peers manages pinned identities; reset wipes "
+            "~/.config/nomnom/. run `nomnom <subcommand> --help`."
         ),
     )
     parser.add_argument(
