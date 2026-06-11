@@ -1080,7 +1080,7 @@ class TestCommitScreen:
         s = nomnom.CommitScreen()
         assert s.step == "inputs"
         assert s.field_cursor == 0
-        assert s.repo_buf == str(tmp_path)
+        assert s.bufs["repo"] == str(tmp_path)
         assert s.destination == nomnom.Destination.FILE
 
     def test_tab_cycles_fields(self):
@@ -1101,10 +1101,10 @@ class TestCommitScreen:
 
     def test_path_edit_appends_chars(self):
         s = nomnom.CommitScreen()
-        s.repo_buf = ""
+        s.bufs["repo"] = ""
         s.handle_key(ord("/"))
         s.handle_key(ord("a"))
-        assert s.repo_buf == "/a"
+        assert s.bufs["repo"] == "/a"
 
     def test_q_returns_back(self):
         s = nomnom.CommitScreen()
@@ -1112,7 +1112,7 @@ class TestCommitScreen:
 
     def test_execute_captures_stdout_stderr(self, monkeypatch):
         s = nomnom.CommitScreen()
-        s.repo_buf = "/tmp/some-repo"
+        s.bufs["repo"] = "/tmp/some-repo"
 
         def fake_cmd_commit(repo, *, destination):
             print("stdout line")
@@ -1127,7 +1127,7 @@ class TestCommitScreen:
 
     def test_execute_handles_nomnom_error(self, monkeypatch):
         s = nomnom.CommitScreen()
-        s.repo_buf = "/tmp/some-repo"
+        s.bufs["repo"] = "/tmp/some-repo"
 
         def boom(repo, *, destination):
             raise nomnom.NomnomError("not a git repository: /tmp/some-repo")
@@ -1153,12 +1153,12 @@ class TestPRScreen:
         # since 'd' is intercepted first, dest cycles even when on base.
         # We verify by testing base editing with non-d chars.
         s.field_cursor = 1
-        s.base_buf = ""
+        s.bufs["base"] = ""
         s.handle_key(ord("m"))
         s.handle_key(ord("a"))
         s.handle_key(ord("i"))
         s.handle_key(ord("n"))
-        assert s.base_buf == "main"
+        assert s.bufs["base"] == "main"
 
     def test_run_passes_base_to_cmd_pr(self, monkeypatch):
         called: dict = {}
@@ -1170,8 +1170,8 @@ class TestPRScreen:
             return 0
         monkeypatch.setattr(nomnom, "cmd_pr", fake_cmd_pr)
         s = nomnom.PRScreen()
-        s.repo_buf = "/tmp/r"
-        s.base_buf = "develop"
+        s.bufs["repo"] = "/tmp/r"
+        s.bufs["base"] = "develop"
         s.destination = nomnom.Destination.CLIPBOARD
         s.handle_key(10)
         assert called == {"repo": "/tmp/r", "base": "develop",
@@ -1185,8 +1185,8 @@ class TestPRScreen:
             return 0
         monkeypatch.setattr(nomnom, "cmd_pr", fake_cmd_pr)
         s = nomnom.PRScreen()
-        s.repo_buf = "/tmp/r"
-        s.base_buf = ""
+        s.bufs["repo"] = "/tmp/r"
+        s.bufs["base"] = ""
         s.handle_key(10)
         assert called["base"] is None
 
@@ -1202,7 +1202,7 @@ class TestItemScreen:
         s.field_cursor = 1  # focus id
         for ch in "v1.2.3":
             s.handle_key(ord(ch))
-        assert s.id_buf == "v1.2.3"
+        assert s.bufs["id"] == "v1.2.3"
 
     def test_diff_toggled_by_space_when_focused(self):
         s = nomnom.ItemScreen()
@@ -1217,8 +1217,8 @@ class TestItemScreen:
         monkeypatch.setattr(nomnom, "cmd_item",
                             lambda *a, **k: 0)
         s = nomnom.ItemScreen()
-        s.repo_buf = "/tmp/r"
-        s.id_buf = ""
+        s.bufs["repo"] = "/tmp/r"
+        s.bufs["id"] = ""
         s.handle_key(10)
         assert s.rc == 1
         assert "required" in s.error.lower()
@@ -1238,8 +1238,8 @@ class TestItemScreen:
             return 0
         monkeypatch.setattr(nomnom, "cmd_item", fake_cmd_item)
         s = nomnom.ItemScreen()
-        s.repo_buf = "/tmp/r"
-        s.id_buf = "42"
+        s.bufs["repo"] = "/tmp/r"
+        s.bufs["id"] = "42"
         s.include_diff = True
         s.destination = nomnom.Destination.CLIPBOARD
         s.handle_key(10)
@@ -1260,8 +1260,8 @@ class TestItemScreen:
             return 0
         monkeypatch.setattr(nomnom, "cmd_item", fake_cmd_item)
         s = nomnom.ItemScreen()
-        s.repo_buf = "/tmp/r"
-        s.id_buf = "discussion 7"
+        s.bufs["repo"] = "/tmp/r"
+        s.bufs["id"] = "discussion 7"
         s.handle_key(10)
         assert called == {"kind_or_id": "discussion", "ident": "7"}
 

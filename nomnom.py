@@ -5676,24 +5676,39 @@ def cmd_init(args) -> int:
     return 0
 
 
+def _refresh_channel_roster(feed: Feed) -> list[dict]:
+    """Fetch the channel roster and persist it onto `feed` and the stored copy.
+
+    Shared by `cmd_channel` and the TUI ChannelScreen so both cache identically
+    (mirrors the CLI/TUI parity goal of `_join_channel`). Raises NomnomError on
+    relay failure."""
+    feed_key = _feed_key_from_token(feed.feed_token)
+    host, _ = _parse_feed_url(feed.url)
+    members = _relay_list_members(host, feed.feed_id, feed_key).get("members") or []
+    feed.members_cache = members
+    cfg = _load_feeds_config()
+    existing = _find_feed(cfg, feed.name)
+    if existing is not None:
+        existing.members_cache = members
+        _save_feeds_config(cfg)
+    return members
+
+
 def cmd_channel(_args) -> int:
     """Show your channel secret (to add devices) and the device roster."""
     feed = _the_channel()
     if feed is None:
         sys.stderr.write(f"error: {_no_channel_hint()}\n")
         return 1
-    feed_key = _feed_key_from_token(feed.feed_token)
-    host, _ = _parse_feed_url(feed.url)
     sys.stderr.write(
         "channel secret (paste on another device with `nomnom join`):\n",
     )
     print(feed.url)
     try:
-        roster = _relay_list_members(host, feed.feed_id, feed_key)
+        members = _refresh_channel_roster(feed)
     except NomnomError as e:
         sys.stderr.write(f"\nwarning: could not fetch devices: {e}\n")
         return 0
-    members = roster.get("members") or []
     sys.stderr.write(f"\ndevices ({len(members)}):\n")
     for m in members:
         marker = " *" if m.get("member_id") == feed.member_id else "  "
@@ -5702,12 +5717,6 @@ def cmd_channel(_args) -> int:
             if m.get("identity_pubkey") else "(no key)"
         )
         sys.stderr.write(f"{marker} {m.get('name', '?'):<28} {fp}\n")
-    feed.members_cache = members
-    cfg = _load_feeds_config()
-    existing = _find_feed(cfg, feed.name)
-    if existing is not None:
-        existing.members_cache = members
-        _save_feeds_config(cfg)
     return 0
 
 
@@ -5989,31 +5998,9 @@ def show_help_modal(stdscr, lines: list[str]) -> None:  # pragma: no cover
     caller may have set a non-blocking timeout for a progress poll, which
     would otherwise close the modal in ~100ms before the user can read it.
     """
-    h, w = stdscr.getmaxyx()
-    rows = [" nomnom keys ".center(40, "─"), *lines, "─" * 40, " press any key to close "]
-    box_w = min(w - 2, max(len(r) for r in rows) + 2)
-    box_h = min(h - 2, len(rows) + 2)
-    y0 = max(0, (h - box_h) // 2)
-    x0 = max(0, (w - box_w) // 2)
-    for i in range(box_h):
-        try:
-            stdscr.addstr(y0 + i, x0, " " * box_w, curses.A_REVERSE)
-        except curses.error:
-            pass
-    for i, line in enumerate(rows[: box_h - 1]):
-        try:
-            stdscr.addstr(y0 + 1 + i, x0 + 1, line[: box_w - 2], curses.A_REVERSE)
-        except curses.error:
-            pass
-    stdscr.refresh()
-    try:
-        stdscr.timeout(-1)
-    except curses.error:
-        pass
-    while True:
-        ch = stdscr.getch()
-        if ch != -1:
-            return
+    body = [" nomnom keys ".center(40, "─"), *lines, "─" * 40, " press any key to close "]
+    _draw_overlay(stdscr, body, min_w=40)
+    _modal_wait_key(stdscr)
 
 
 _TUI_ACTIVE = False
@@ -6054,7 +6041,7 @@ def _tofu_modal(stdscr, card: dict) -> bool:  # pragma: no cover - curses I/O
     """Blocking y/N modal for a first-contact feed identity. Returns True to pin."""
     name = card.get("name") or "(no name)"
     fp = _ik_fingerprint(card.get("identity_pubkey") or "")
-    rows = [
+    body = [
         " first contact ".center(40, "─"),
         f" {name}",
         f"   fingerprint: {fp}",
@@ -6062,32 +6049,8 @@ def _tofu_modal(stdscr, card: dict) -> bool:  # pragma: no cover - curses I/O
         "─" * 40,
         " trust and pin this device?  [y/N] ",
     ]
-    h, w = stdscr.getmaxyx()
-    box_w = min(w - 2, max(len(r) for r in rows) + 2)
-    box_h = min(h - 2, len(rows) + 2)
-    y0 = max(0, (h - box_h) // 2)
-    x0 = max(0, (w - box_w) // 2)
-    for i in range(box_h):
-        try:
-            stdscr.addstr(y0 + i, x0, " " * box_w, curses.A_REVERSE)
-        except curses.error:
-            pass
-    for i, line in enumerate(rows[: box_h - 1]):
-        try:
-            stdscr.addstr(y0 + 1 + i, x0 + 1, line[: box_w - 2], curses.A_REVERSE)
-        except curses.error:
-            pass
-    stdscr.refresh()
-    try:
-        stdscr.timeout(-1)
-    except curses.error:
-        pass
-    while True:
-        ch = stdscr.getch()
-        if ch in (ord("y"), ord("Y")):
-            return True
-        if ch in (ord("n"), ord("N"), ord("q"), 3, 27, 10, 13, -1):
-            return False
+    _draw_overlay(stdscr, body, min_w=40)
+    return _modal_yn(stdscr, default=False)
 
 
 def run_app(initial: Screen) -> None:  # pragma: no cover - curses I/O
@@ -7011,16 +6974,7 @@ class ChannelScreen(Screen):
                 self.message = "no clipboard tool (pbcopy/wl-copy/xclip)"
         elif ch == ord("r") and self.feed is not None:
             try:
-                feed_key = _feed_key_from_token(self.feed.feed_token)
-                host, _ = _parse_feed_url(self.feed.url)
-                roster = _relay_list_members(host, self.feed.feed_id, feed_key)
-                self.devices = roster.get("members") or []
-                self.feed.members_cache = self.devices
-                cfg = _load_feeds_config()
-                existing = _find_feed(cfg, self.feed.name)
-                if existing is not None:
-                    existing.members_cache = self.devices
-                    _save_feeds_config(cfg)
+                self.devices = _refresh_channel_roster(self.feed)
                 self.error = ""
                 self.message = f"{len(self.devices)} device(s)"
             except NomnomError as e:
@@ -7150,20 +7104,7 @@ class BundleScreen(Screen):
             with _tui_tofu(stdscr), \
                  contextlib.redirect_stdout(out_buf), \
                  contextlib.redirect_stderr(err_buf):
-                if result.verb == Verb.COMMIT:
-                    rc = cmd_commit(str(root), destination=result.destination)
-                elif result.verb == Verb.PR:
-                    rc = cmd_pr(str(root), None, destination=result.destination)
-                elif result.verb == Verb.ITEM:
-                    if result.item_kind is None or result.item_id is None:
-                        raise NomnomError(
-                            "item verb selected without an id",
-                        )
-                    rc = cmd_item(
-                        str(root), result.item_kind, result.item_id,
-                        include_diff=False,
-                        destination=result.destination,
-                    )
+                rc = _run_picker_verb(result, root, include_diff=False)
         except NomnomError as e:
             self.error = str(e)
         captured = (err_buf.getvalue() + out_buf.getvalue()).rstrip("\n")
@@ -7244,11 +7185,15 @@ class _GitContextScreen(Screen):
     # Field ids that accept free-text input (rendered with `> ` prompt).
     # Anything else is treated as a read-only status row driven by a hotkey.
     _TEXT_FIDS: tuple[str, ...] = ("repo",)
+    # Placeholder shown for a text field whose buffer is empty.
+    _PLACEHOLDERS: dict[str, str] = {"repo": "(empty)"}
 
     def __init__(self) -> None:
         self.step = "inputs"
         self.field_cursor = 0
-        self.repo_buf = str(Path.cwd())
+        # Text fields keyed by field id, so the base class owns all editing;
+        # subclasses just declare `fields`, `_TEXT_FIDS`, and `_PLACEHOLDERS`.
+        self.bufs: dict[str, str] = {"repo": str(Path.cwd())}
         self.destination = Destination.FILE
         self.error = ""
         self.output_lines: list[str] = []
@@ -7292,18 +7237,18 @@ class _GitContextScreen(Screen):
         self.step = "done"
 
     def _field_value(self, fid: str) -> str:
-        if fid == "repo":
-            return self.repo_buf or "(empty)"
         if fid == "dest":
             return _DESTINATION_LABELS[self.destination]
+        if fid in self._TEXT_FIDS:
+            return self.bufs.get(fid, "") or self._PLACEHOLDERS.get(fid, "")
         return ""
 
     def _edit_field(self, fid: str, ch: int) -> None:
-        if fid == "repo":
+        if fid in self._TEXT_FIDS:
             if ch in (curses.KEY_BACKSPACE, 127, 8):
-                self.repo_buf = self.repo_buf[:-1]
+                self.bufs[fid] = self.bufs.get(fid, "")[:-1]
             elif 32 <= ch < 127:
-                self.repo_buf += chr(ch)
+                self.bufs[fid] = self.bufs.get(fid, "") + chr(ch)
 
     def render(self, stdscr) -> None:  # pragma: no cover - curses I/O
         theme = _setup_theme()
@@ -7394,7 +7339,7 @@ class CommitScreen(_GitContextScreen):
     ]
 
     def _run_cmd(self) -> int:
-        return cmd_commit(self.repo_buf.strip(), destination=self.destination)
+        return cmd_commit(self.bufs["repo"].strip(), destination=self.destination)
 
 
 class PRScreen(_GitContextScreen):
@@ -7403,16 +7348,13 @@ class PRScreen(_GitContextScreen):
     title = "PR"
     verb = "PR"
     _TEXT_FIDS = ("repo", "base")
+    _PLACEHOLDERS = {"repo": "(empty)", "base": "(default)"}
     help_lines = [
         "tab/arrows  move between fields",
         "type        edit the path or base branch",
         "d           cycle destination (file/clipboard/send)",
         "enter       run; esc/q to go back",
     ]
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.base_buf = ""
 
     @property
     def fields(self) -> list[tuple[str, str]]:
@@ -7422,23 +7364,9 @@ class PRScreen(_GitContextScreen):
             ("dest", "Destination:"),
         ]
 
-    def _field_value(self, fid: str) -> str:
-        if fid == "base":
-            return self.base_buf or "(default)"
-        return super()._field_value(fid)
-
-    def _edit_field(self, fid: str, ch: int) -> None:
-        if fid == "base":
-            if ch in (curses.KEY_BACKSPACE, 127, 8):
-                self.base_buf = self.base_buf[:-1]
-            elif 32 <= ch < 127:
-                self.base_buf += chr(ch)
-            return
-        super()._edit_field(fid, ch)
-
     def _run_cmd(self) -> int:
-        base = self.base_buf.strip() or None
-        return cmd_pr(self.repo_buf.strip(), base, destination=self.destination)
+        base = self.bufs.get("base", "").strip() or None
+        return cmd_pr(self.bufs["repo"].strip(), base, destination=self.destination)
 
 
 class ItemScreen(_GitContextScreen):
@@ -7447,6 +7375,7 @@ class ItemScreen(_GitContextScreen):
     title = "Item"
     verb = "Item"
     _TEXT_FIDS = ("repo", "id")
+    _PLACEHOLDERS = {"repo": "(empty)", "id": "(required)"}
     help_lines = [
         "tab/arrows  move between fields",
         "type        edit fields (id accepts number / sha / tag)",
@@ -7457,7 +7386,6 @@ class ItemScreen(_GitContextScreen):
 
     def __init__(self) -> None:
         super().__init__()
-        self.id_buf = ""
         self.include_diff = False
 
     @property
@@ -7470,19 +7398,12 @@ class ItemScreen(_GitContextScreen):
         ]
 
     def _field_value(self, fid: str) -> str:
-        if fid == "id":
-            return self.id_buf or "(required)"
+        # `diff` is a non-text toggle; text fields fall through to the base.
         if fid == "diff":
             return "yes" if self.include_diff else "no"
         return super()._field_value(fid)
 
     def _edit_field(self, fid: str, ch: int) -> None:
-        if fid == "id":
-            if ch in (curses.KEY_BACKSPACE, 127, 8):
-                self.id_buf = self.id_buf[:-1]
-            elif 32 <= ch < 127:
-                self.id_buf += chr(ch)
-            return
         if fid == "diff":
             if ch == ord(" "):
                 self.include_diff = not self.include_diff
@@ -7490,7 +7411,7 @@ class ItemScreen(_GitContextScreen):
         super()._edit_field(fid, ch)
 
     def _run_cmd(self) -> int:
-        id_text = self.id_buf.strip()
+        id_text = self.bufs.get("id", "").strip()
         if not id_text:
             raise NomnomError("item id is required")
         parts = id_text.split(maxsplit=1)
@@ -7499,7 +7420,7 @@ class ItemScreen(_GitContextScreen):
         else:
             kind_or_id, ident = id_text, None
         return cmd_item(
-            self.repo_buf.strip(), kind_or_id, ident,
+            self.bufs["repo"].strip(), kind_or_id, ident,
             include_diff=self.include_diff,
             destination=self.destination,
         )
@@ -7560,39 +7481,10 @@ def _confirm_modal(
 
     Returns True for `y`/`Y`, False for `n`/`N`/Esc, and `default` on
     Enter. Useful for destructive confirmations from inside a Screen."""
-    h, w = stdscr.getmaxyx()
     prompt = " [Y/n] " if default else " [y/N] "
     body = [title.center(50, "─"), *lines, "─" * 50, prompt]
-    box_w = min(max(1, w - 2), max(len(r) for r in body) + 4)
-    box_h = min(max(1, h - 2), len(body) + 2)
-    y0 = max(0, (h - box_h) // 2)
-    x0 = max(0, (w - box_w) // 2)
-    for i in range(box_h):
-        try:
-            stdscr.addstr(y0 + i, x0, " " * box_w, curses.A_REVERSE)
-        except curses.error:
-            pass
-    for i, line in enumerate(body[: box_h - 1]):
-        try:
-            stdscr.addstr(y0 + 1 + i, x0 + 2,
-                          line[: max(0, box_w - 4)], curses.A_REVERSE)
-        except curses.error:
-            pass
-    stdscr.refresh()
-    try:
-        stdscr.timeout(-1)
-    except curses.error:
-        pass
-    while True:
-        ch = stdscr.getch()
-        if ch == -1:
-            continue
-        if ch in (ord("y"), ord("Y")):
-            return True
-        if ch in (ord("n"), ord("N"), 27, 3):
-            return False
-        if ch in (10, 13):
-            return default
+    _draw_overlay(stdscr, body)
+    return _modal_yn(stdscr, default=default)
 
 
 def _draw_overlay(
@@ -7617,6 +7509,37 @@ def _draw_overlay(
         except curses.error:
             pass
     stdscr.refresh()
+
+
+def _modal_wait_key(stdscr) -> int:  # pragma: no cover - curses I/O
+    """Block (forcing timeout(-1)) until a real keypress and return it.
+
+    The caller may have set a non-blocking timeout for a progress poll; force
+    blocking so a modal doesn't dismiss itself before it can be read."""
+    try:
+        stdscr.timeout(-1)
+    except curses.error:
+        pass
+    while True:
+        ch = stdscr.getch()
+        if ch != -1:
+            return ch
+
+
+def _modal_yn(stdscr, default: bool) -> bool:  # pragma: no cover - curses I/O
+    """Block on a y/N gate: y/Y->True, n/N/q/Esc/Ctrl-C->False, Enter->default."""
+    try:
+        stdscr.timeout(-1)
+    except curses.error:
+        pass
+    while True:
+        ch = stdscr.getch()
+        if ch in (ord("y"), ord("Y")):
+            return True
+        if ch in (ord("n"), ord("N"), ord("q"), 27, 3):
+            return False
+        if ch in (10, 13):
+            return default
 
 
 def _prompt_item_id(
@@ -7785,6 +7708,15 @@ def _destination_from_args(args) -> Destination:
     return Destination.FILE
 
 
+def _add_repo_positional(sub: argparse.ArgumentParser, *, flag: bool = False) -> None:
+    """Attach the shared repo argument: a `repo` positional, or `--repo` flag."""
+    help_text = "Path to the project repo (default: current directory)."
+    if flag:
+        sub.add_argument("--repo", default=".", help=help_text)
+    else:
+        sub.add_argument("repo", nargs="?", default=".", help=help_text)
+
+
 def _build_commit_parser() -> argparse.ArgumentParser:
     sub = argparse.ArgumentParser(
         prog="nomnom commit",
@@ -7793,10 +7725,7 @@ def _build_commit_parser() -> argparse.ArgumentParser:
             "for an LLM to draft a commit message."
         ),
     )
-    sub.add_argument(
-        "repo", nargs="?", default=".",
-        help="Path to the project repo (default: current directory).",
-    )
+    _add_repo_positional(sub)
     _add_destination_flags(sub)
     return sub
 
@@ -7809,10 +7738,7 @@ def _build_pr_parser() -> argparse.ArgumentParser:
             "existing PR body) into a .txt for an LLM to draft a PR body."
         ),
     )
-    sub.add_argument(
-        "repo", nargs="?", default=".",
-        help="Path to the project repo (default: current directory).",
-    )
+    _add_repo_positional(sub)
     _add_destination_flags(sub)
     sub.add_argument(
         "--base", default=None,
@@ -7843,10 +7769,7 @@ def _build_item_parser() -> argparse.ArgumentParser:
         "ident", nargs="?", default=None,
         help="Id when the first argument names a kind (e.g. `pr 123`).",
     )
-    sub.add_argument(
-        "--repo", default=".",
-        help="Path to the project repo (default: current directory).",
-    )
+    _add_repo_positional(sub, flag=True)
     sub.add_argument(
         "--diff", action="store_true",
         help=(
@@ -8242,6 +8165,25 @@ def _maybe_print_v2_migration_notice() -> None:
     )
 
 
+def _run_picker_verb(result: PickResult, root: Path, *, include_diff: bool) -> int:
+    """Dispatch a non-BUNDLE picker verb (COMMIT/PR/ITEM) to its cmd_* handler.
+
+    Shared by the bare-CLI path (`include_diff=True`) and the TUI BundleScreen
+    (`include_diff=False`); both must stay in lock-step on how ITEM validates."""
+    if result.verb == Verb.COMMIT:
+        return cmd_commit(str(root), destination=result.destination)
+    if result.verb == Verb.PR:
+        return cmd_pr(str(root), None, destination=result.destination)
+    if result.verb == Verb.ITEM:
+        if result.item_kind is None or result.item_id is None:
+            raise NomnomError("item verb selected without an id")
+        return cmd_item(
+            str(root), result.item_kind, result.item_id,
+            include_diff=include_diff, destination=result.destination,
+        )
+    raise NomnomError(f"unsupported verb {result.verb}")
+
+
 def main() -> int:
     # Trip any pin-store migration up front so the notice lands on stderr
     # before either entry point claims the terminal (curses or CLI).
@@ -8281,10 +8223,7 @@ def main() -> int:
             "~/.config/nomnom/. run `nomnom <subcommand> --help`."
         ),
     )
-    parser.add_argument(
-        "repo", nargs="?", default=".",
-        help="Path to the project repo (default: current directory).",
-    )
+    _add_repo_positional(parser)
     parser.add_argument(
         "--all", action="store_true",
         help="Skip the picker and bundle every scanned file. Combine with "
@@ -8388,20 +8327,7 @@ def main() -> int:
                     file=sys.stderr,
                 )
             try:
-                if result.verb == Verb.COMMIT:
-                    return cmd_commit(str(root), destination=result.destination)
-                if result.verb == Verb.PR:
-                    return cmd_pr(str(root), None, destination=result.destination)
-                if result.verb == Verb.ITEM:
-                    if result.item_kind is None or result.item_id is None:
-                        raise NomnomError(
-                            "item verb selected without an id",
-                        )
-                    return cmd_item(
-                        str(root), result.item_kind, result.item_id,
-                        include_diff=True,
-                        destination=result.destination,
-                    )
+                return _run_picker_verb(result, root, include_diff=True)
             except NomnomError as e:
                 print(f"error: {e}", file=sys.stderr)
                 return 1
