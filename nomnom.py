@@ -460,10 +460,10 @@ def scan_repo(
                 continue
         dirs.sort()
         files.sort()
-        for name, rel, abs_path in dirs:
+        for _name, rel, abs_path in dirs:
             items.append(ScanItem(rel=rel, is_dir=True))
             walk(abs_path, rel)
-        for name, rel, abs_path in files:
+        for _name, rel, abs_path in files:
             if is_binary(abs_path):
                 continue
             items.append(ScanItem(rel=rel, is_dir=False))
@@ -1943,7 +1943,7 @@ def cmd_pr(repo: str, base: str | None, destination: Destination = Destination.F
 
 # ---------- item: pr (formerly review) ----------
 
-_PR_TIMELINE_KEEP = {
+_PR_TIMELINE_KEEP = frozenset({
     "review_requested",
     "assigned",
     "unassigned",
@@ -1953,7 +1953,7 @@ _PR_TIMELINE_KEEP = {
     "closed",
     "reopened",
     "head_ref_force_pushed",
-}
+})
 
 _PR_REVIEW_THREADS_QUERY = """\
 query($owner: String!, $repo: String!, $number: Int!) {
@@ -2130,7 +2130,7 @@ def _format_review_threads(graphql_result: dict) -> str:
     return "\n\n".join(parts)
 
 
-_ISSUE_TIMELINE_KEEP = {
+_ISSUE_TIMELINE_KEEP = frozenset({
     "assigned",
     "unassigned",
     "labeled",
@@ -2150,10 +2150,10 @@ _ISSUE_TIMELINE_KEEP = {
     "moved_columns_in_project",
     "added_to_project",
     "removed_from_project",
-}
+})
 
 
-def _format_timeline(events: list, keep: set[str] = _PR_TIMELINE_KEEP) -> str:
+def _format_timeline(events: list, keep: frozenset[str]) -> str:
     if not events:
         return ""
     lines: list[str] = []
@@ -2171,10 +2171,10 @@ def _format_timeline(events: list, keep: set[str] = _PR_TIMELINE_KEEP) -> str:
         elif kind in ("assigned", "unassigned"):
             who = ((ev.get("assignee") or {}).get("login")) or "?"
             suffix = f": @{who}"
-        elif kind == "labeled" or kind == "unlabeled":
+        elif kind in ("labeled", "unlabeled"):
             label = ((ev.get("label") or {}).get("name")) or "?"
             suffix = f": {label}"
-        elif kind == "milestoned" or kind == "demilestoned":
+        elif kind in ("milestoned", "demilestoned"):
             title = ((ev.get("milestone") or {}).get("title")) or "?"
             suffix = f": {title}"
         elif kind == "renamed":
@@ -2319,7 +2319,7 @@ def cmd_item_pr(
         _section("reviews", _format_reviews(reviews)),
         _section("issue_comments", _format_issue_comments(issue_comments)),
         _section("review_comments", _format_review_threads(threads_result)),
-        _section("timeline", _format_timeline(timeline)),
+        _section("timeline", _format_timeline(timeline, _PR_TIMELINE_KEEP)),
         _section("checks", _format_checks(checks)),
     ])
 
@@ -3014,7 +3014,7 @@ def _classify_item_id(value: str) -> str | None:
     if not value:
         return None
     if _COMMIT_SHA_RE.match(value):
-        return "commit"
+        return "commit"  # hex-shaped: assume commit; a rare hex tag needs `item release`
     if not value.isdigit():
         return "release"
     return None
@@ -3748,10 +3748,6 @@ def _set_peer_nickname(needle: str, nickname: str | None) -> tuple[str, str] | N
     return target, nickname or ""
 
 
-# RFC 3526 group 14 (2048-bit MODP prime), generator g = 2. Used for the
-# long-term identity keys and the per-transfer ephemeral keys alike.
-
-
 # ---------- TOFU helpers ----------
 
 
@@ -3762,7 +3758,7 @@ def _ik_fingerprint(ik_hex: str) -> str:
         # odd-length; pad before decoding (bytes.fromhex rejects odd lengths).
         raw = bytes.fromhex(ik_hex if len(ik_hex) % 2 == 0 else "0" + ik_hex)
     except (ValueError, TypeError):
-        return "?"
+        return "?"  # display-only sentinel; never compared against a real fingerprint
     d = hashlib.sha256(raw).hexdigest()[:16]
     return ":".join(d[i:i + 4] for i in range(0, 16, 4))
 
@@ -4188,7 +4184,7 @@ class Feed:
     expires_at: int
     joined_at: int
     member_id: str
-    members_cache: list = field(default_factory=list)
+    members_cache: list[dict] = field(default_factory=list)
     last_post_ts: int = 0
 
     def to_dict(self) -> dict:
@@ -4286,7 +4282,11 @@ def _find_feed(config: dict, nickname: str) -> Feed | None:
 
 
 def _default_feed(config: dict) -> Feed | None:
-    """Return the configured default feed, or None."""
+    """Return the configured default feed, or None.
+
+    Legacy: the single-channel model uses `feeds[0]` via `_the_channel`; the
+    `default` field and this helper are retained for back-compat with configs
+    written by the old multi-feed code."""
     name = config.get("default")
     if not isinstance(name, str):
         return None
@@ -4635,7 +4635,10 @@ def _relay_request(
 
 
 def _qs(**params: int) -> str:
-    """Build `?k=v&...` from positive int kwargs; empty string if none apply."""
+    """Build `?k=v&...` from positive int kwargs; empty string if none apply.
+
+    Zero/negative params are omitted, so `since=0` can't be sent explicitly —
+    the Worker treats an absent `since` as 0, which is the same thing."""
     parts = [f"{k}={int(v)}" for k, v in params.items() if v and v > 0]
     return ("?" + "&".join(parts)) if parts else ""
 
@@ -5534,6 +5537,14 @@ def _ensure_relay_configured(*, interactive: bool = True) -> dict | None:
     return _cmd_relay_init_interactive()
 
 
+def _wrangler_deploy_hint(secret: str) -> str:
+    """The two-line `wrangler secret put / deploy` hint shown on the Worker side."""
+    return (
+        f"  echo {secret!r} | npx wrangler secret put NOMNOM_HMAC_SECRET\n"
+        "  npx wrangler deploy\n"
+    )
+
+
 def _cmd_relay_init_interactive(*, allow_private: bool = False) -> dict | None:
     """First-device flow: prompt URL, generate secret, self-test, save, print wrangler commands."""
     sys.stderr.write(
@@ -5566,10 +5577,7 @@ def _cmd_relay_init_interactive(*, allow_private: bool = False) -> dict | None:
             "after deploying.\n",
         )
         sys.stderr.write("\non the Worker side, run:\n")
-        sys.stderr.write(
-            f"  echo {secret!r} | npx wrangler secret put NOMNOM_HMAC_SECRET\n"
-            "  npx wrangler deploy\n",
-        )
+        sys.stderr.write(_wrangler_deploy_hint(secret))
         return None
     try:
         _save_relay_config(url, secret, allow_private=allow_private)
@@ -6454,11 +6462,16 @@ class RebuildScreen(Screen):
         self.step = "input"
         self.path_buf = ""
         self.error = ""
+        self.message = ""
+        self._reset_parse_state()
+
+    def _reset_parse_state(self) -> None:
+        """Clear the parsed-bundle fields (shared by __init__ and the
+        preview->input back path, so a new field can't be forgotten in one)."""
         self.bundle_text = ""
         self.repo_name = ""
         self.files: list[tuple[str, str]] = []
         self.target: Path | None = None
-        self.message = ""
 
     def _parse(self) -> None:
         p = Path(self.path_buf.strip()).expanduser()
@@ -6549,7 +6562,7 @@ class RebuildScreen(Screen):
         else:
             try:
                 stdscr.addstr(2, 2,
-                              self.error and f"error: {self.error}" or self.message,
+                              f"error: {self.error}" if self.error else self.message,
                               theme["dim"])
             except curses.error:
                 pass
@@ -6578,10 +6591,7 @@ class RebuildScreen(Screen):
                 return ScreenAction.CONTINUE
             if ch in (ord("q"), 3, 27):
                 self.step = "input"
-                self.bundle_text = ""
-                self.repo_name = ""
-                self.files = []
-                self.target = None
+                self._reset_parse_state()
             return ScreenAction.CONTINUE
         # done
         if ch in (ord("q"), 3, 27, 10, 13):
@@ -6953,7 +6963,7 @@ class ChannelScreen(Screen):
         if ch in (curses.KEY_BACKSPACE, 127, 8):
             self.buf = self.buf[:-1]
             return ScreenAction.CONTINUE
-        if 32 <= ch <= 126:
+        if 32 <= ch < 127:
             self.buf += chr(ch)
         return ScreenAction.CONTINUE
 
@@ -7447,7 +7457,7 @@ def _wrap(text: str, width: int) -> list[str]:
 
 def _text_input_field(
     stdscr, y: int, x: int, label: str, buf: str, theme,
-    width: int = -1,
+    width: int,
     *,
     active: bool = False,
     read_only: bool = False,
@@ -7467,9 +7477,7 @@ def _text_input_field(
         label_attr = theme["cursor"] if active else theme["dim"]
         stdscr.addstr(y, x, label, label_attr)
         line = buf if read_only else "> " + buf
-        if width > 0:
-            line = line[:width]
-        stdscr.addstr(y + 1, x, line, 0)
+        stdscr.addstr(y + 1, x, line[:width], 0)
     except curses.error:
         pass
 
