@@ -112,12 +112,13 @@ async function routeFeed(
   const bucket = env.BUCKET;
   const routes: FeedRoute[] = [
     { re: /^\/?$/, methods: { DELETE: () => closeFeed(bucket, feedId) } },
-    { re: /^\/meta$/, methods: { GET: () => getFeedMeta(bucket, feedId) } },
+    { re: /^\/meta$/, methods: { GET: () => getFeedMeta(bucket, feedId, ctx) } },
     { re: /^\/extend$/, methods: { POST: () => extendFeed(bucket, feedId, req) } },
     {
       re: /^\/members$/,
       methods: {
-        GET: () => listMembers(bucket, feedId, parseWaitMs(url), parseSinceTs(url)),
+        GET: () =>
+          listMembers(bucket, feedId, parseWaitMs(url), parseSinceTs(url), ctx),
       },
     },
     {
@@ -125,7 +126,7 @@ async function routeFeed(
       guard: (m) =>
         validateMemberId(m[1]) ? null : errorResponse("bad-member-id", 400),
       methods: {
-        PUT: (m) => putMember(bucket, feedId, m[1], req),
+        PUT: (m) => putMember(bucket, feedId, m[1], req, ctx),
         DELETE: (m) => deleteMember(bucket, feedId, m[1]),
       },
     },
@@ -136,7 +137,8 @@ async function routeFeed(
     {
       re: /^\/slots$/,
       methods: {
-        GET: () => listFeedSlots(bucket, feedId, parseWaitMs(url), parseSinceTs(url)),
+        GET: () =>
+          listFeedSlots(bucket, feedId, parseWaitMs(url), parseSinceTs(url), ctx),
       },
     },
     {
@@ -145,7 +147,7 @@ async function routeFeed(
         validateFeedSlotId(m[1]) ? null : errorResponse("bad-slot-id", 400),
       methods: {
         PUT: (m) => putFeedSlot(bucket, feedId, m[1], req, env.FEED_NOTIFIER, ctx),
-        GET: (m) => getFeedSlot(bucket, feedId, m[1], parseWaitMs(url)),
+        GET: (m) => getFeedSlot(bucket, feedId, m[1], parseWaitMs(url), ctx),
       },
     },
   ];

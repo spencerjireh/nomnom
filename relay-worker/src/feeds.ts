@@ -6,7 +6,16 @@
 //   feeds/<id>/slots/<slot_id>   — raw ciphertext (encrypted file)
 //
 // All objects carry `customMetadata.expires_at` matching the feed's expiry.
-// Cleanup is the R2 bucket lifecycle's job (1-day TTL).
+//
+// Physical cleanup is the R2 bucket lifecycle's job. That rule expires objects
+// by AGE SINCE LAST WRITE, not last access, so on its own it would purge a
+// permanent channel a fixed time after minting even while it's in active use.
+// To turn it into "purge after N days of INACTIVITY", every feed operation
+// re-writes `feeds/<id>/meta` (throttled to once/day) so its R2 age tracks last
+// use — see `maybeTouchFeed`. Slots/member cards are intentionally left to age
+// out: a sent file or a stale roster card lapsing after the same window is the
+// desired "kept for up to a month" behaviour, and the channel itself (meta)
+// survives as long as any device keeps using it.
 //
 // Auth shape:
 //   POST /feeds                  — relay HMAC (gates who can mint feeds)
@@ -32,6 +41,12 @@ const DEFAULT_TTL_SEC = 86_400; // 1 day
 // TTL; this keeps the channel alive even when every device is idle for months.
 const MAX_TTL_SEC = 3650 * 86_400; // ~10 years
 const MIN_TTL_SEC = 60; // 1 minute (sanity floor)
+// Re-write the feed's meta at most this often so its R2 object age tracks last
+// use without a write on every request. The bucket lifecycle deletes objects
+// this-rule-many days after their last write; touching meta on use makes that
+// "days of inactivity" rather than "days since minting". One write/day per
+// active feed is a negligible cost.
+const TOUCH_THROTTLE_SEC = 86_400; // 1 day
 const MAX_MEMBER_CARD_BYTES = 4096;
 const MAX_MEMBER_NAME_LEN = 128;
 const MAX_BODY_BYTES = 256 * 1024 * 1024; // 256 MB
@@ -130,6 +145,7 @@ export async function mintFeed(
 export async function getFeedMeta(
   bucket: R2Bucket,
   feedId: string,
+  ctx?: ExecutionContext,
 ): Promise<Response> {
   const obj = await bucket.get(`feeds/${feedId}/meta`);
   if (obj === null) {
@@ -139,6 +155,7 @@ export async function getFeedMeta(
     await purgeFeed(bucket, feedId);
     return errorResponse("feed-expired", 410);
   }
+  maybeTouchFeed(bucket, feedId, obj.uploaded, ctx);
   return new Response(obj.body, {
     status: 200,
     headers: { "Content-Type": "application/json" },
@@ -208,8 +225,9 @@ export async function putMember(
   feedId: string,
   memberId: string,
   req: Request,
+  ctx?: ExecutionContext,
 ): Promise<Response> {
-  const live = await ensureFeedLive(bucket, feedId);
+  const live = await ensureFeedLive(bucket, feedId, ctx);
   if (!live.ok) return live.res;
 
   const text = await req.text();
@@ -280,8 +298,9 @@ export async function listMembers(
   feedId: string,
   waitMs: number,
   sinceTs: number,
+  ctx?: ExecutionContext,
 ): Promise<Response> {
-  const live = await ensureFeedLive(bucket, feedId);
+  const live = await ensureFeedLive(bucket, feedId, ctx);
   if (!live.ok) return live.res;
 
   const deadline = Date.now() + Math.min(Math.max(waitMs, 0), MAX_BUDGET_MS);
@@ -349,7 +368,7 @@ export async function putFeedSlot(
   notifier?: DurableObjectNamespace,
   ctx?: ExecutionContext,
 ): Promise<Response> {
-  const live = await ensureFeedLive(bucket, feedId);
+  const live = await ensureFeedLive(bucket, feedId, ctx);
   if (!live.ok) return live.res;
 
   const lenHdr = req.headers.get("Content-Length");
@@ -404,8 +423,9 @@ export async function getFeedSlot(
   feedId: string,
   slotId: string,
   waitMs: number,
+  ctx?: ExecutionContext,
 ): Promise<Response> {
-  const live = await ensureFeedLive(bucket, feedId);
+  const live = await ensureFeedLive(bucket, feedId, ctx);
   if (!live.ok) return live.res;
 
   const key = `feeds/${feedId}/slots/${slotId}`;
@@ -431,8 +451,9 @@ export async function listFeedSlots(
   feedId: string,
   waitMs: number,
   sinceTs: number,
+  ctx?: ExecutionContext,
 ): Promise<Response> {
-  const live = await ensureFeedLive(bucket, feedId);
+  const live = await ensureFeedLive(bucket, feedId, ctx);
   if (!live.ok) return live.res;
 
   const prefix = `feeds/${feedId}/slots/`;
@@ -520,6 +541,7 @@ type FeedLive =
 async function ensureFeedLive(
   bucket: R2Bucket,
   feedId: string,
+  ctx?: ExecutionContext,
 ): Promise<FeedLive> {
   const head = await bucket.head(`feeds/${feedId}/meta`);
   if (head === null) {
@@ -529,7 +551,53 @@ async function ensureFeedLive(
     await purgeFeed(bucket, feedId);
     return { ok: false, res: errorResponse("feed-expired", 410) };
   }
+  maybeTouchFeed(bucket, feedId, head.uploaded, ctx);
   return { ok: true, expiresAt: parseTs(head.customMetadata?.expires_at) };
+}
+
+// Reset the meta object's R2 age when the feed is used, so the bucket's
+// age-based lifecycle rule purges by inactivity rather than by mint time.
+// Throttled: skip unless meta hasn't been re-written for TOUCH_THROTTLE_SEC.
+// The re-write is a byte-identical copy of meta — its only effect is bumping
+// the object's `uploaded` timestamp. Fire-and-forget via waitUntil so it never
+// adds latency to the request; errors are swallowed (a missed touch only risks
+// an earlier purge, which the next use re-arms).
+function maybeTouchFeed(
+  bucket: R2Bucket,
+  feedId: string,
+  uploaded: Date,
+  ctx?: ExecutionContext,
+): void {
+  if ((Date.now() - uploaded.getTime()) / 1000 < TOUCH_THROTTLE_SEC) return;
+  const work = touchFeedMeta(bucket, feedId).catch(() => undefined);
+  // Without an ExecutionContext the runtime may cancel the write after the
+  // response is sent, so only fire it when we can keep it alive.
+  if (ctx) ctx.waitUntil(work);
+}
+
+async function touchFeedMeta(bucket: R2Bucket, feedId: string): Promise<void> {
+  const key = `feeds/${feedId}/meta`;
+  const obj = await bucket.get(key);
+  if (obj === null) return;
+  const body = await obj.text();
+  // Re-derive customMetadata from the body (the source of truth) so a touch of
+  // legacy meta lacking customMetadata still re-writes a complete object.
+  let createdAt = parseTs(obj.customMetadata?.created_at);
+  let expiresAt = parseTs(obj.customMetadata?.expires_at);
+  try {
+    const parsed = JSON.parse(body) as { created_at?: unknown; expires_at?: unknown };
+    if (createdAt === null) createdAt = parseTs(String(parsed.created_at));
+    if (expiresAt === null) expiresAt = parseTs(String(parsed.expires_at));
+  } catch {
+    return; // unparseable meta — don't risk rewriting it
+  }
+  if (expiresAt === null) return;
+  const customMetadata: Record<string, string> = { expires_at: String(expiresAt) };
+  if (createdAt !== null) customMetadata.created_at = String(createdAt);
+  await bucket.put(key, body, {
+    customMetadata,
+    httpMetadata: { contentType: "application/json" },
+  });
 }
 
 async function purgeFeed(bucket: R2Bucket, feedId: string): Promise<void> {

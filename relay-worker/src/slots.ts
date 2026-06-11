@@ -6,7 +6,7 @@
 //   GET on a live slot returns the body AND deletes (delete-on-read).
 //
 // Belt-and-suspenders: configure an R2 bucket lifecycle rule to delete
-// objects older than 1 day so orphans (sender abandons after PUT, etc.)
+// objects older than 30 days so orphans (sender abandons after PUT, etc.)
 // don't accumulate. See relay-worker/README.md for the dashboard step.
 
 import { errorResponse } from "./http";
