@@ -562,11 +562,11 @@ class TestCycleVerb:
 
 
 class TestComputeSummary:
-    def _node(self, rel, *, is_dir=False, checked=False, size=0):
+    def _node(self, rel, *, is_dir=False, checked=False, size=0, tokens=0):
         return nomnom.Node(
             rel=rel, name=rel.rsplit("/", 1)[-1], is_dir=is_dir,
             depth=rel.count("/"), parent=None,
-            checked=checked, size=size,
+            checked=checked, size=size, tokens=tokens,
         )
 
     def test_empty_selection(self):
@@ -575,18 +575,19 @@ class TestComputeSummary:
 
     def test_mixed_excludes_dirs(self):
         nodes = [
-            self._node("src", is_dir=True, checked=True, size=999),
-            self._node("src/a.py", checked=True, size=400),
-            self._node("src/b.py", checked=False, size=800),
-            self._node("c.py", checked=True, size=400),
+            self._node("src", is_dir=True, checked=True, size=999, tokens=250),
+            self._node("src/a.py", checked=True, size=400, tokens=100),
+            self._node("src/b.py", checked=False, size=800, tokens=200),
+            self._node("c.py", checked=True, size=400, tokens=100),
         ]
-        # Two checked files, 800 bytes total, 200 approx tokens.
+        # Two checked files: 800 bytes, tokens summed from the nodes (not
+        # recomputed from bytes), so the footer total equals the per-row totals.
         assert nomnom.compute_summary(nodes) == (2, 800, 200)
 
     def test_all_checked(self):
         nodes = [
-            self._node("a.py", checked=True, size=400),
-            self._node("b.py", checked=True, size=600),
+            self._node("a.py", checked=True, size=400, tokens=100),
+            self._node("b.py", checked=True, size=600, tokens=150),
         ]
         assert nomnom.compute_summary(nodes) == (2, 1000, 250)
 
@@ -642,6 +643,13 @@ class TestFormatFooter:
         # with "verb: bundle" implied by the default.
         out = nomnom.format_footer(nomnom.Destination.FILE, True, (1, 100, 25), 120)
         assert "verb: bundle" in out
+
+    def test_token_block_has_single_tilde(self):
+        # _fmt_tokens already prepends "~"; the footer must not add a second
+        # one (regression guard against the "~~1.2KT" double-tilde bug).
+        out = nomnom.format_footer(nomnom.Destination.FILE, True, (3, 4096, 1024), 120)
+        assert "~~" not in out
+        assert nomnom._fmt_tokens(1024) in out
 
 
 # ---------- --include / --exclude filters ----------
@@ -4701,7 +4709,9 @@ class _MockRelay:
         return f"http://127.0.0.1:{self.port}"
 
     def cfg(self) -> dict:
-        return {"url": self.url(), "secret": self.secret}
+        # Loopback dev server: opt into private addresses so _relay_open's
+        # per-request SSRF guard allows it (the legitimate --allow-private path).
+        return {"url": self.url(), "secret": self.secret, "allow_private": True}
 
     def stop(self):
         self.server.shutdown()
@@ -5064,6 +5074,23 @@ class TestFeedSeal:
         assert header["smid"] == "mem-abc"
         assert header["sik"] == sig_pub
         assert header["fs"] == len(body)
+
+    def test_seal_rejects_mismatched_sig_pub(self):
+        # feed_seal holds both key halves; a pub that doesn't match the priv
+        # must fail locally rather than produce a post every receiver rejects.
+        feed_key = nomnom._feed_key_from_token("k4n2pX9qLm3T")
+        sig_priv, _ = self._seed_and_pub()
+        _, wrong_pub = self._seed_and_pub()
+        with pytest.raises(ValueError, match="sig_pub does not match sig_priv"):
+            nomnom.feed_seal(
+                feed_key=feed_key,
+                feed_id="k4n2pX9qLm3T",
+                sender_member_id="mem-abc",
+                sender_sig_priv_hex=sig_priv,
+                sender_sig_pub_hex=wrong_pub,
+                filename="hello.txt",
+                body=b"data",
+            )
 
     def test_open_rejects_wrong_feed_key(self):
         feed_key = nomnom._feed_key_from_token("k4n2pX9qLm3T")

@@ -784,12 +784,14 @@ def compute_summary(nodes: list[Node]) -> tuple[int, int, int]:
     """(file_count, total_bytes, approx_tokens) over checked non-dir nodes."""
     count = 0
     total_bytes = 0
+    total_tokens = 0
     for n in nodes:
         if n.is_dir or not n.checked:
             continue
         count += 1
         total_bytes += n.size
-    return count, total_bytes, total_bytes // APPROX_BYTES_PER_TOKEN
+        total_tokens += n.tokens
+    return count, total_bytes, total_tokens
 
 
 def format_footer(
@@ -806,7 +808,7 @@ def format_footer(
     block; the selected-count is the last to go."""
     files, total_bytes, approx_tokens = summary
     left = f"selected: {files} files"
-    stats = f" | {_fmt_size(total_bytes)} ~{_fmt_tokens(approx_tokens)}"
+    stats = f" | {_fmt_size(total_bytes)} {_fmt_tokens(approx_tokens)}"
     right = (
         f"verb: {_VERB_LABELS[verb]}  "
         f"dest: {_DESTINATION_LABELS[dest]}  "
@@ -3596,8 +3598,11 @@ def _load_identity() -> dict:
     if changed:
         try:
             _atomic_write_text(path, json.dumps(ident))
-        except OSError:
-            pass
+        except OSError as e:
+            # A fresh signing key that never reaches disk means peers will see
+            # a new fingerprint next run and TOFU-reprompt — warn rather than
+            # fail silently. (TUI redirects stderr, so this only shows in CLI.)
+            sys.stderr.write(f"warning: could not persist identity: {e}\n")
     return ident
 
 
@@ -3643,6 +3648,11 @@ def _atomic_write_text(path: Path, content: str, *, mode: int = 0o600) -> None:
         os.fchmod(fd, mode)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(content)
+            # Flush to disk before the rename so a crash can't leave a
+            # truncated identity/peer-pin store (the whole point of the helper
+            # is durability, not just atomicity of the name swap).
+            f.flush()
+            os.fsync(f.fileno())
     except BaseException:
         try:
             os.unlink(tmp)
@@ -4025,6 +4035,13 @@ def feed_seal(
 
     `_nonce` is a test hook; production callers leave it None.
     """
+    # Bind the stamped public key to the signing key here — the one place we
+    # hold both halves. A mismatched (priv, pub) pair would otherwise produce a
+    # post every receiver silently rejects; fail locally instead.
+    if bytes.fromhex(sender_sig_pub_hex) != ed25519_pub_from_seed(
+        bytes.fromhex(sender_sig_priv_hex),
+    ):
+        raise ValueError("feed_seal: sig_pub does not match sig_priv")
     nonce = _nonce if _nonce is not None else secrets.token_bytes(_FEED_NONCE_LEN)
     content_hash = hashlib.sha256(body).digest()
     when = posted_at if posted_at is not None else int(time.time())
@@ -4376,7 +4393,12 @@ def _load_relay_config() -> dict | None:
         return None
     if not url.startswith(("http://", "https://")):
         return None
-    return {"url": url.rstrip("/"), "secret": secret}
+    out = {"url": url.rstrip("/"), "secret": secret}
+    # Carry the user's explicit private-address opt-in (e.g. a local dev
+    # Worker) so the per-request SSRF re-check in _relay_open honors it.
+    if data.get("allow_private") is True:
+        out["allow_private"] = True
+    return out
 
 
 def _url_resolves_private(url: str) -> str | None:
@@ -4434,8 +4456,12 @@ def _save_relay_config(url: str, secret: str, *, allow_private: bool = False) ->
                 "pass --allow-private if this is intentional (e.g., a local "
                 "dev Worker).",
             )
-    body = json.dumps({"url": url.rstrip("/"), "secret": secret}, indent=2)
-    _atomic_write_text(_relay_config_path(), body)
+    config = {"url": url.rstrip("/"), "secret": secret}
+    # Persist the opt-in so _relay_open's per-request re-check doesn't reject a
+    # local dev Worker the user deliberately allowed.
+    if allow_private:
+        config["allow_private"] = True
+    _atomic_write_text(_relay_config_path(), json.dumps(config, indent=2))
 
 
 def _relay_clear_config() -> bool:
@@ -4525,9 +4551,26 @@ def _relay_split_url(url: str) -> tuple[str, int, str, bool]:
     return parsed.hostname, port, parsed.path.rstrip("/"), is_https
 
 
+def _assert_relay_url_allowed(relay: dict) -> None:
+    """Re-run the private-address guard on every request, not just at import.
+
+    `_save_relay_config` checks once at write time, but each request re-resolves
+    the host at connect — so a name that was public at import can later resolve
+    to loopback/metadata (DNS rebinding / TOCTOU). Checking here, the one
+    chokepoint every request flows through, closes that gap. (A stronger fix
+    pins the vetted literal IP and connects to it; deferred as follow-up.)
+    """
+    if relay.get("allow_private"):
+        return
+    reason = _url_resolves_private(relay["url"])
+    if reason is not None:
+        raise NomnomError(f"refusing relay request: {reason}")
+
+
 def _relay_open(
     relay: dict, *, timeout: float = _RELAY_REQUEST_TIMEOUT,
 ) -> http.client.HTTPConnection:
+    _assert_relay_url_allowed(relay)
     host, port, _, is_https = _relay_split_url(relay["url"])
     if is_https:
         return http.client.HTTPSConnection(host, port, timeout=timeout)
@@ -4638,7 +4681,15 @@ def _feed_relay_dict(host: str) -> dict:
     """
     if "://" not in host:
         host = f"https://{host}"
-    return {"url": host.rstrip("/")}
+    relay = {"url": host.rstrip("/")}
+    # Honor the configured relay's private-address opt-in when the feed lives on
+    # that same host, so _relay_open's re-check doesn't reject a local dev relay.
+    cfg = _load_relay_config()
+    if cfg and cfg.get("allow_private"):
+        cfg_host = urllib.parse.urlsplit(cfg["url"]).hostname
+        if cfg_host and cfg_host == urllib.parse.urlsplit(relay["url"]).hostname:
+            relay["allow_private"] = True
+    return relay
 
 
 def _feed_auth_headers(feed_key: bytes, method: str, path: str) -> dict[str, str]:
@@ -5406,15 +5457,7 @@ def cmd_receive(*, once: bool = False, trust_new: bool = False) -> int:
         # Roster refresh + TOFU prompts before each slot long-poll. Up to a
         # 30s lag between a new member joining and the prompt firing, but
         # interleaving keeps the I/O on a single thread.
-        roster = _refresh_roster_with_tofu(
-            target, host, feed_key, trust_new=trust_new,
-        )
-        if roster is not None:
-            cfg_now = _load_feeds_config()
-            existing = _find_feed(cfg_now, target.name)
-            if existing is not None:
-                existing.members_cache = roster
-                _save_feeds_config(cfg_now)
+        _receive_refresh_roster(target, host, feed_key, trust_new)
         try:
             slots = _relay_list_feed_slots(
                 host, target.feed_id, feed_key,
@@ -5432,82 +5475,31 @@ def cmd_receive(*, once: bool = False, trust_new: bool = False) -> int:
                 return 0 if received_any else 1
             continue
         # Iterate in chronological order; the Worker already sorts by created_at.
+        # Fetch/verify/write goes through the same _receive_one_post the stream
+        # path uses, so tamper handling (raise → warn + skip) is identical.
         for entry in slots:
             slot_id = entry.get("slot_id")
             created_at = int(entry.get("created_at") or 0)
-            if not slot_id:
-                continue
-            # Skip posts authored by this device (our own broadcast comes back).
-            try:
-                raw = _relay_get_feed_slot(host, target.feed_id, feed_key, slot_id)
-            except NomnomError as e:
-                sys.stderr.write(f"warning: {e}\n")
-                if created_at > last_ts:
-                    last_ts = created_at
-                continue
-            if raw is None:
-                if created_at > last_ts:
-                    last_ts = created_at
-                continue
-            try:
-                header, body = feed_open(
-                    feed_key=feed_key, feed_id=target.feed_id, blob=raw,
-                )
-            except ValueError as e:
-                sys.stderr.write(f"warning: dropping bad post: {e}\n")
-                if created_at > last_ts:
-                    last_ts = created_at
-                continue
-            sender_id = header.get("smid")
-            if sender_id == target.member_id:
-                # our own broadcast — don't write our own file back to disk
-                if created_at > last_ts:
-                    last_ts = created_at
-                continue
-            sender_name = "(unknown)"
-            sender_pub = header.get("sik")
-            for m in target.members_cache or []:
-                if m.get("member_id") == sender_id:
-                    sender_name = m.get("name", sender_name)
-                    if m.get("identity_pubkey") and m.get("identity_pubkey") != sender_pub:
-                        sys.stderr.write(
-                            f"warning: dropping post; sender {sender_id!r} "
-                            "identity key changed from roster cache.\n",
-                        )
-                        sender_id = None
-                    break
-            if sender_id is None:
-                if created_at > last_ts:
-                    last_ts = created_at
-                continue
-            try:
-                filename = _safe_filename(header.get("fn") or "post")
-            except NomnomError as e:
-                sys.stderr.write(f"warning: dropping bad post: {e}\n")
-                if created_at > last_ts:
-                    last_ts = created_at
-                continue
-            out = _pick_decrypted_path(Path.cwd(), filename)
-            try:
-                out.write_bytes(body)
-            except OSError as e:
-                sys.stderr.write(f"error writing {out}: {e}\n")
-                return 1
-            sys.stderr.write(
-                f"received {filename!r} ({len(body)} bytes) "
-                f"from {sender_name} -> {out}\n",
-            )
-            sys.stderr.flush()
-            received_any = True
-            if created_at > last_ts:
-                last_ts = created_at
-            # Persist last_post_ts so a restart doesn't re-fetch.
-            cfg_now = _load_feeds_config()
-            existing = _find_feed(cfg_now, target.name)
-            if existing is not None:
-                existing.last_post_ts = last_ts
-                _save_feeds_config(cfg_now)
-            if once:
+            res = None
+            if slot_id:
+                try:
+                    res = _receive_one_post(
+                        feed=target, host=host, feed_key=feed_key, slot_id=slot_id,
+                    )
+                except NomnomError as e:
+                    sys.stderr.write(f"warning: {e}\n")
+                    res = None
+                if res is not None:
+                    filename, nbytes, sender, out_path = res
+                    sys.stderr.write(
+                        f"received {filename!r} ({nbytes} bytes) "
+                        f"from {sender} -> {out_path}\n",
+                    )
+                    sys.stderr.flush()
+                    received_any = True
+            last_ts = max(last_ts, created_at)
+            _receive_persist_ts(target, last_ts)
+            if once and res is not None:
                 return 0
 
 
