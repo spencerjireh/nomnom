@@ -1,16 +1,9 @@
 import { useMemo, useState } from "react";
 import { useStore } from "../state/store";
 import { useTransfer } from "../hooks/useTransfer";
-import { fmtSize } from "./FileDrop";
+import { fmtSize, clock } from "../util/format";
 import { looksLikeText, decodePreview, decodeText, PREVIEW_CAP_BYTES } from "../textPreview";
 import type { TimelineEntry } from "../types";
-
-function clock(at: number): string {
-  const d = new Date(at);
-  const h = d.getHours().toString().padStart(2, "0");
-  const m = d.getMinutes().toString().padStart(2, "0");
-  return `${h}:${m}`;
-}
 
 /** The channel's session timeline. In-flight sends show an inline progress bar;
  * held receives show [save] / [discard]; everything else is a static row. */

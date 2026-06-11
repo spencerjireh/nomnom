@@ -6,7 +6,8 @@ import { FeedClient, mintFeed, type MemberCard } from "../relay/feed-client";
 import { feedKeyFromToken } from "../crypto/feeds";
 import { ikFingerprint } from "../crypto/fingerprint";
 import { bytesToHexDigest } from "../crypto/hex";
-import { FEED_TOKEN_RE } from "../crypto/constants";
+import { randomHex } from "../util/ids";
+import { formatFeedUrl, parseFeedUrl } from "../util/feed-url";
 import type { Feed, Identity, Member, OnTofu, RelayConfig } from "../types";
 
 const DEFAULT_TTL_SECONDS = 86_400; // 1 day, matches the CLI default
@@ -38,38 +39,6 @@ export function feedContext(feed: Feed, identity: Identity): FeedContext {
     host: new URL(feed.url).origin,
     client: new FeedClient(new URL(feed.url).origin),
   };
-}
-
-function randomHex(nBytes: number): string {
-  const b = new Uint8Array(nBytes);
-  crypto.getRandomValues(b);
-  return bytesToHexDigest(b);
-}
-
-/** secrets.token_urlsafe(n) — n random bytes, url-safe base64, no padding. */
-export function randomToken(nBytes: number): string {
-  const b = new Uint8Array(nBytes);
-  crypto.getRandomValues(b);
-  let s = btoa(String.fromCharCode(...b));
-  return s.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-}
-
-function formatFeedUrl(host: string, feedId: string): string {
-  return `${host.replace(/\/+$/, "")}/f/${feedId}`;
-}
-
-/** Split a feed URL into (origin, feedId). Strict: requires /f/<token>. */
-export function parseFeedUrl(raw: string): { host: string; feedId: string } {
-  const u = raw.trim();
-  if (!u) throw new Error("feed url must not be empty");
-  const withScheme = /^https?:\/\//.test(u) ? u : `https://${u}`;
-  const m = withScheme.match(/^(https?:\/\/[^/]+)\/f\/([^/?#]+)$/);
-  if (!m) throw new Error("feed url must look like https://<host>/f/<token>");
-  const feedId = m[2];
-  if (!FEED_TOKEN_RE.test(feedId)) {
-    throw new Error("feed token in url must be 8-32 url-safe base64 chars");
-  }
-  return { host: m[1], feedId };
 }
 
 function memberCard(identity: Identity, memberId: string): MemberCard {

@@ -64,12 +64,12 @@ export async function runReceive(p: ReceiveParams): Promise<number> {
     try {
       raw = await ctx.client.getSlot(ctx.feed.feed_id, ctx.feedKey, slotId, { signal: p.signal });
     } catch {
-      if (p.signal.aborted) return;
-      advance(createdAt);
+      // Transport hiccup — do NOT advance the cursor, or we'd permanently drop an
+      // unread post. Leaving lastTs put lets the next notification re-surface it.
       return;
     }
     if (raw === null) {
-      advance(createdAt);
+      advance(createdAt); // genuine 404: slot gone / already cleaned up
       return;
     }
 

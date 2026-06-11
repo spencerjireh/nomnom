@@ -9,6 +9,9 @@ import type { Feed } from "../types";
 export function FeedView({ feed }: { feed: Feed }) {
   const { send, sending: globalSending } = useTransfer();
   const [staged, setStaged] = useState<StagedPayload | null>(null);
+  // Local `sending` covers the staged.read() window before the transfer slice
+  // flips globalSending; both guard the button so a double-click can't fire two
+  // sends. (The store doesn't know about the pre-send file read.)
   const [sending, setSending] = useState(false);
 
   async function onSend() {

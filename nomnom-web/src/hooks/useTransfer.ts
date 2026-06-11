@@ -9,6 +9,8 @@ import { openFeed, joinFeed, leaveFeed, type TofuHooks } from "../orchestration/
 import { cryptoClient } from "../worker/cryptoClient";
 import { friendlyRelayMessage } from "../relay/errors";
 import { CHANNEL_NAME, PERMANENT_TTL_SECONDS } from "../config";
+import { downloadBlob } from "../util/dom";
+import { newId } from "../util/ids";
 import type { Feed } from "../types";
 
 function tofuHooks(): TofuHooks {
@@ -17,23 +19,6 @@ function tofuHooks(): TofuHooks {
     onTofu: (req) => useStore.getState().requestTofu(req),
     pinPeer: (sigPub, name) => useStore.getState().pinPeer(sigPub, name),
   };
-}
-
-function downloadBlob(name: string, body: ArrayBuffer): void {
-  const url = URL.createObjectURL(new Blob([body], { type: "application/octet-stream" }));
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = name;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 10_000);
-}
-
-function newId(): string {
-  return typeof crypto.randomUUID === "function"
-    ? crypto.randomUUID()
-    : `e${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
 }
 
 export function useTransfer() {
@@ -99,6 +84,9 @@ export function useTransfer() {
   async function receive(feed: Feed, signal: AbortSignal): Promise<void> {
     const s = useStore.getState();
     if (!s.identity) return;
+    // Identity is pinned for the watch's lifetime: it's this device's own
+    // signing key, which only changes via factoryReset — and that aborts the
+    // watch (via the signal), so a fresh receive() picks up the new identity.
     try {
       await runReceive({
         feed,

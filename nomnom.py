@@ -37,7 +37,7 @@ import urllib.parse
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import NamedTuple, NoReturn, Tuple
+from typing import NamedTuple, NoReturn, Tuple, TypeVar
 
 try:
     locale.setlocale(locale.LC_ALL, "")
@@ -301,6 +301,36 @@ class GitignoreMatcher:
         return ignored
 
 
+def _parse_ignore_line(
+    raw: str, base: str, *, dir_only_semantics: bool,
+) -> GitignoreRule | None:
+    """Parse one gitignore-style line into a GitignoreRule, or None to skip.
+
+    Shared by `.gitignore` parsing and CLI --include/--exclude so the glob
+    grammar stays in lock-step. `dir_only_semantics=False` (CLI filtering a
+    flat list) strips a trailing slash but never marks the rule dir-only,
+    since there's no walker to stop from descending."""
+    line = raw.strip()
+    if not line or line.startswith("#"):
+        return None
+    negated = line.startswith("!")
+    if negated:
+        line = line[1:]
+    dir_only = line.endswith("/")
+    if dir_only:
+        line = line[:-1]
+    anchored = "/" in line
+    if line.startswith("/"):
+        line = line[1:]
+    if not line:
+        return None
+    try:
+        regex = _glob_to_regex(line, anchored)
+    except re.error:
+        return None
+    return GitignoreRule(line, negated, dir_only and dir_only_semantics, base, regex)
+
+
 def _build_pattern_matcher(patterns: list[str]) -> GitignoreMatcher:
     """Build a GitignoreMatcher from CLI --include / --exclude patterns.
 
@@ -308,26 +338,11 @@ def _build_pattern_matcher(patterns: list[str]) -> GitignoreMatcher:
     under that directory (unlike .gitignore's dir-only semantics, since a
     walker would never descend; here we're filtering a flat list). A
     leading `!` negates."""
-    rules: list[GitignoreRule] = []
-    for raw in patterns:
-        line = raw.strip()
-        if not line:
-            continue
-        negated = line.startswith("!")
-        if negated:
-            line = line[1:]
-        if line.endswith("/"):
-            line = line[:-1]
-        anchored = "/" in line
-        if line.startswith("/"):
-            line = line[1:]
-        if not line:
-            continue
-        try:
-            regex = _glob_to_regex(line, anchored)
-        except re.error:
-            continue
-        rules.append(GitignoreRule(line, negated, False, "", regex))
+    rules = [
+        rule for raw in patterns
+        if (rule := _parse_ignore_line(raw, "", dir_only_semantics=False))
+        is not None
+    ]
     return GitignoreMatcher(rules)
 
 
@@ -350,25 +365,9 @@ def load_gitignore(root: Path) -> GitignoreMatcher:
         if rel_base == ".":
             rel_base = ""
         for raw in text.splitlines():
-            line = raw.strip()
-            if not line or line.startswith("#"):
-                continue
-            negated = line.startswith("!")
-            if negated:
-                line = line[1:]
-            dir_only = line.endswith("/")
-            if dir_only:
-                line = line[:-1]
-            anchored = "/" in line
-            if line.startswith("/"):
-                line = line[1:]
-            if not line:
-                continue
-            try:
-                regex = _glob_to_regex(line, anchored)
-            except re.error:
-                continue
-            rules.append(GitignoreRule(line, negated, dir_only, rel_base, regex))
+            rule = _parse_ignore_line(raw, rel_base, dir_only_semantics=True)
+            if rule is not None:
+                rules.append(rule)
     return GitignoreMatcher(rules)
 
 
@@ -384,16 +383,16 @@ def _fmt_count(n: int) -> str:
     """999 / 1.0K / 12K / 1.2M / 12M (decimal, one decimal under 10)."""
     if n < 1000:
         return str(n)
+    value = float(n)
     for unit in ("K", "M", "G", "T"):
-        n_unit = n / 1000
-        if n_unit < 1000 or unit == "T":
-            return f"{n_unit:.1f}{unit}" if n_unit < 10 else f"{n_unit:.0f}{unit}"
-        n = int(n_unit)
-    return str(n)
+        value /= 1000
+        if value < 1000 or unit == "T":
+            return f"{value:.1f}{unit}" if value < 10 else f"{value:.0f}{unit}"
+    raise AssertionError("unreachable")  # the "T" iteration always returns
 
 
 def _fmt_size(n: int) -> str:
-    return _fmt_count(n)
+    return _fmt_count(n) + "B"
 
 
 def _fmt_loc(n: int) -> str:
@@ -461,10 +460,10 @@ def scan_repo(
                 continue
         dirs.sort()
         files.sort()
-        for name, rel, abs_path in dirs:
+        for _name, rel, abs_path in dirs:
             items.append(ScanItem(rel=rel, is_dir=True))
             walk(abs_path, rel)
-        for name, rel, abs_path in files:
+        for _name, rel, abs_path in files:
             if is_binary(abs_path):
                 continue
             items.append(ScanItem(rel=rel, is_dir=False))
@@ -736,20 +735,28 @@ _DESTINATION_LABELS = {
 }
 
 
+_E = TypeVar("_E", bound=enum.IntEnum)
+
+
+def _cycle(value: _E, members: type[_E], allowed: tuple[_E, ...] | None) -> _E:
+    """Advance `value` to the next member, restricted to `allowed` if given.
+
+    If `value` isn't in `allowed`, snap to the first allowed entry."""
+    if allowed is None:
+        return members((int(value) + 1) % len(members))
+    if value not in allowed:
+        return allowed[0]
+    return allowed[(allowed.index(value) + 1) % len(allowed)]
+
+
 def cycle_destination(
     d: Destination, allowed: tuple[Destination, ...] | None = None,
 ) -> Destination:
     """Advance `d` to the next destination.
 
     `allowed` restricts the cycle to a subset (used inside the TUI to hide
-    STDOUT, which is meaningless when curses owns the terminal). If `d`
-    isn't in `allowed`, snap to the first allowed entry."""
-    if allowed is None:
-        return Destination((int(d) + 1) % len(Destination))
-    if d not in allowed:
-        return allowed[0]
-    i = allowed.index(d)
-    return allowed[(i + 1) % len(allowed)]
+    STDOUT, which is meaningless when curses owns the terminal)."""
+    return _cycle(d, Destination, allowed)
 
 
 class Verb(enum.IntEnum):
@@ -770,26 +777,22 @@ _VERB_LABELS = {
 def cycle_verb(v: Verb, allowed: tuple[Verb, ...] | None = None) -> Verb:
     """Advance `v` to the next verb, restricted to `allowed` if given.
 
-    Mirrors `cycle_destination`. Non-git directories pass
-    `allowed=(Verb.BUNDLE,)` so cycling becomes a no-op."""
-    if allowed is None:
-        return Verb((int(v) + 1) % len(Verb))
-    if v not in allowed:
-        return allowed[0]
-    i = allowed.index(v)
-    return allowed[(i + 1) % len(allowed)]
+    Non-git directories pass `allowed=(Verb.BUNDLE,)` so cycling is a no-op."""
+    return _cycle(v, Verb, allowed)
 
 
 def compute_summary(nodes: list[Node]) -> tuple[int, int, int]:
     """(file_count, total_bytes, approx_tokens) over checked non-dir nodes."""
     count = 0
     total_bytes = 0
+    total_tokens = 0
     for n in nodes:
         if n.is_dir or not n.checked:
             continue
         count += 1
         total_bytes += n.size
-    return count, total_bytes, total_bytes // APPROX_BYTES_PER_TOKEN
+        total_tokens += n.tokens
+    return count, total_bytes, total_tokens
 
 
 def format_footer(
@@ -806,7 +809,7 @@ def format_footer(
     block; the selected-count is the last to go."""
     files, total_bytes, approx_tokens = summary
     left = f"selected: {files} files"
-    stats = f" | {_fmt_size(total_bytes)} ~{_fmt_tokens(approx_tokens)}"
+    stats = f" | {_fmt_size(total_bytes)} {_fmt_tokens(approx_tokens)}"
     right = (
         f"verb: {_VERB_LABELS[verb]}  "
         f"dest: {_DESTINATION_LABELS[dest]}  "
@@ -1226,15 +1229,15 @@ def pick(
     """
     if not nodes:
         return PickResult(set(), initial_destination, initial_include_tree)
-    result: list = []
+    # curses.wrapper passes *args/**kwds through and returns the callable's
+    # value (and restores the terminal on exception), so no accumulator needed.
     try:
-        curses.wrapper(lambda stdscr: result.append(_picker_ui(
-            stdscr, nodes, root, initial_destination, initial_include_tree,
+        return curses.wrapper(
+            _picker_ui, nodes, root, initial_destination, initial_include_tree,
             allow_stdout=True, allow_git_verbs=allow_git_verbs,
-        )))
+        )
     except KeyboardInterrupt:
         return None
-    return result[0] if result else None
 
 
 # ---------- output ----------
@@ -1940,7 +1943,7 @@ def cmd_pr(repo: str, base: str | None, destination: Destination = Destination.F
 
 # ---------- item: pr (formerly review) ----------
 
-_PR_TIMELINE_KEEP = {
+_PR_TIMELINE_KEEP = frozenset({
     "review_requested",
     "assigned",
     "unassigned",
@@ -1950,7 +1953,7 @@ _PR_TIMELINE_KEEP = {
     "closed",
     "reopened",
     "head_ref_force_pushed",
-}
+})
 
 _PR_REVIEW_THREADS_QUERY = """\
 query($owner: String!, $repo: String!, $number: Int!) {
@@ -1977,25 +1980,34 @@ query($owner: String!, $repo: String!, $number: Int!) {
 """
 
 
+def _kv_block(pairs: list[tuple[str, str]]) -> str:
+    """Render aligned `key: value` lines.
+
+    The value column is computed from the longest key, so adding a field can't
+    silently misalign the block the way the old hand-counted padding could."""
+    width = max((len(k) for k, _ in pairs), default=0)
+    return "\n".join(f"{k + ':':<{width + 1}} {v}" for k, v in pairs)
+
+
 def _format_pr_meta(pr: dict) -> str:
     author = ((pr.get("author") or {}).get("login")) or "?"
     labels = ", ".join(
         l.get("name", "") for l in (pr.get("labels") or []) if l
     ) or "(none)"
     milestone = ((pr.get("milestone") or {}).get("title")) or "(none)"
-    return "\n".join([
-        f"number:    #{pr.get('number', '?')}",
-        f"title:     {pr.get('title', '')}",
-        f"url:       {pr.get('url', '')}",
-        f"author:    @{author}",
-        f"state:     {pr.get('state', '?')}",
-        f"draft:     {'true' if pr.get('isDraft') else 'false'}",
-        f"head:      {pr.get('headRefName', '')}",
-        f"base:      {pr.get('baseRefName', '')}",
-        f"labels:    {labels}",
-        f"milestone: {milestone}",
-        f"created:   {pr.get('createdAt', '')}",
-        f"updated:   {pr.get('updatedAt', '')}",
+    return _kv_block([
+        ("number", f"#{pr.get('number', '?')}"),
+        ("title", pr.get("title", "")),
+        ("url", pr.get("url", "")),
+        ("author", f"@{author}"),
+        ("state", pr.get("state", "?")),
+        ("draft", "true" if pr.get("isDraft") else "false"),
+        ("head", pr.get("headRefName", "")),
+        ("base", pr.get("baseRefName", "")),
+        ("labels", labels),
+        ("milestone", milestone),
+        ("created", pr.get("createdAt", "")),
+        ("updated", pr.get("updatedAt", "")),
     ])
 
 
@@ -2046,31 +2058,32 @@ def _format_diff_summary(files: list) -> str:
     return "\n".join(lines)
 
 
-def _format_reviews(reviews: list) -> str:
-    if not reviews:
+def _format_comment_blocks(items: list, head_fn) -> str:
+    """Render `## <header>\\n<body-or-(no body)>` blocks joined by blank lines.
+
+    Shared by the review/issue-comment/commit-comment formatters, which differ
+    only in how each block's header line is built (passed as `head_fn`)."""
+    if not items:
         return ""
     parts: list[str] = []
-    for r in reviews:
-        login = ((r.get("user") or {}).get("login")) or "?"
-        state = r.get("state") or ""
-        when = r.get("submitted_at") or ""
-        body = (r.get("body") or "").rstrip()
-        head = f"## @{login} [{state}] {when}".rstrip()
-        parts.append(head + "\n" + (body if body else "(no body)"))
+    for c in items:
+        body = (c.get("body") or "").rstrip()
+        parts.append(head_fn(c) + "\n" + (body or "(no body)"))
     return "\n\n".join(parts)
+
+
+def _format_reviews(reviews: list) -> str:
+    def head(r: dict) -> str:
+        login = ((r.get("user") or {}).get("login")) or "?"
+        return f"## @{login} [{r.get('state') or ''}] {r.get('submitted_at') or ''}".rstrip()
+    return _format_comment_blocks(reviews, head)
 
 
 def _format_issue_comments(comments: list) -> str:
-    if not comments:
-        return ""
-    parts: list[str] = []
-    for c in comments:
+    def head(c: dict) -> str:
         login = ((c.get("user") or {}).get("login")) or "?"
-        when = c.get("created_at") or ""
-        body = (c.get("body") or "").rstrip()
-        head = f"## @{login} {when}".rstrip()
-        parts.append(head + "\n" + (body if body else "(no body)"))
-    return "\n\n".join(parts)
+        return f"## @{login} {c.get('created_at') or ''}".rstrip()
+    return _format_comment_blocks(comments, head)
 
 
 def _format_review_threads(graphql_result: dict) -> str:
@@ -2117,7 +2130,7 @@ def _format_review_threads(graphql_result: dict) -> str:
     return "\n\n".join(parts)
 
 
-_ISSUE_TIMELINE_KEEP = {
+_ISSUE_TIMELINE_KEEP = frozenset({
     "assigned",
     "unassigned",
     "labeled",
@@ -2137,10 +2150,10 @@ _ISSUE_TIMELINE_KEEP = {
     "moved_columns_in_project",
     "added_to_project",
     "removed_from_project",
-}
+})
 
 
-def _format_timeline(events: list, keep: set[str] = _PR_TIMELINE_KEEP) -> str:
+def _format_timeline(events: list, keep: frozenset[str]) -> str:
     if not events:
         return ""
     lines: list[str] = []
@@ -2158,10 +2171,10 @@ def _format_timeline(events: list, keep: set[str] = _PR_TIMELINE_KEEP) -> str:
         elif kind in ("assigned", "unassigned"):
             who = ((ev.get("assignee") or {}).get("login")) or "?"
             suffix = f": @{who}"
-        elif kind == "labeled" or kind == "unlabeled":
+        elif kind in ("labeled", "unlabeled"):
             label = ((ev.get("label") or {}).get("name")) or "?"
             suffix = f": {label}"
-        elif kind == "milestoned" or kind == "demilestoned":
+        elif kind in ("milestoned", "demilestoned"):
             title = ((ev.get("milestone") or {}).get("title")) or "?"
             suffix = f": {title}"
         elif kind == "renamed":
@@ -2226,21 +2239,9 @@ def cmd_item_pr(
                 f"gh pr view returned non-numeric: {view_out.strip()!r}"
             ) from e
 
-    if pr_number <= 0:
-        raise NomnomError(f"pr number must be positive, got {pr_number}")
+    _require_positive("pr number", pr_number)
 
-    rc, owner_repo, err = _run(
-        ["gh", "repo", "view", "--json", "nameWithOwner",
-         "-q", ".nameWithOwner"],
-        root,
-    )
-    owner_repo = owner_repo.strip()
-    if rc != 0 or "/" not in owner_repo:
-        raise NomnomError(
-            f"could not resolve gh repo: "
-            f"{err.strip() or owner_repo or 'unknown error'}"
-        )
-    owner, name = owner_repo.split("/", 1)
+    owner, name = _resolve_owner_repo(root)
 
     fields = (
         "number,url,title,body,author,state,headRefName,baseRefName,"
@@ -2260,35 +2261,19 @@ def cmd_item_pr(
     except json.JSONDecodeError as e:
         raise NomnomError(f"gh pr view returned invalid json: {e}") from e
 
-    def _api_json(args: list[str]) -> object:
-        rc, out, err = _run(args, root)
-        if rc != 0:
-            msg = err.strip() or out.strip() or "(no error message)"
-            print(
-                f"warn: {' '.join(args[:3])} … exited {rc}: {msg}",
-                file=sys.stderr,
-            )
-            return None
-        if not out.strip():
-            return None
-        try:
-            return json.loads(out)
-        except json.JSONDecodeError:
-            return None
-
-    issue_comments = _api_json([
+    issue_comments = _gh_api_json(root, [
         "gh", "api",
         f"repos/{owner}/{name}/issues/{pr_number}/comments",
         "--paginate",
     ]) or []
 
-    reviews = _api_json([
+    reviews = _gh_api_json(root, [
         "gh", "api",
         f"repos/{owner}/{name}/pulls/{pr_number}/reviews",
         "--paginate",
     ]) or []
 
-    threads_result = _api_json([
+    threads_result = _gh_api_json(root, [
         "gh", "api", "graphql",
         "-F", f"owner={owner}",
         "-F", f"repo={name}",
@@ -2296,7 +2281,7 @@ def cmd_item_pr(
         "-f", f"query={_PR_REVIEW_THREADS_QUERY}",
     ]) or {}
 
-    timeline = _api_json([
+    timeline = _gh_api_json(root, [
         "gh", "api",
         f"repos/{owner}/{name}/issues/{pr_number}/timeline",
         "--paginate",
@@ -2334,7 +2319,7 @@ def cmd_item_pr(
         _section("reviews", _format_reviews(reviews)),
         _section("issue_comments", _format_issue_comments(issue_comments)),
         _section("review_comments", _format_review_threads(threads_result)),
-        _section("timeline", _format_timeline(timeline)),
+        _section("timeline", _format_timeline(timeline, _PR_TIMELINE_KEEP)),
         _section("checks", _format_checks(checks)),
     ])
 
@@ -2353,6 +2338,12 @@ def cmd_item_pr(
 
 
 # ---------- item: shared helpers ----------
+
+
+def _require_positive(label: str, n: int) -> None:
+    """Guard an item id; `label` names the kind (e.g. 'pr number', 'run id')."""
+    if n <= 0:
+        raise NomnomError(f"{label} must be positive, got {n}")
 
 
 def _resolve_owner_repo(root: Path) -> tuple[str, str]:
@@ -2415,17 +2406,17 @@ def _format_issue_meta(issue: dict) -> str:
         for a in (issue.get("assignees") or [])
     ) or "(none)"
     milestone = ((issue.get("milestone") or {}).get("title")) or "(none)"
-    return "\n".join([
-        f"number:    #{issue.get('number', '?')}",
-        f"title:     {issue.get('title', '')}",
-        f"url:       {issue.get('html_url', '')}",
-        f"author:    @{user}",
-        f"state:     {issue.get('state', '?')}",
-        f"labels:    {labels}",
-        f"milestone: {milestone}",
-        f"assignees: {assignees}",
-        f"created:   {issue.get('created_at', '')}",
-        f"updated:   {issue.get('updated_at', '')}",
+    return _kv_block([
+        ("number", f"#{issue.get('number', '?')}"),
+        ("title", issue.get("title", "")),
+        ("url", issue.get("html_url", "")),
+        ("author", f"@{user}"),
+        ("state", issue.get("state", "?")),
+        ("labels", labels),
+        ("milestone", milestone),
+        ("assignees", assignees),
+        ("created", issue.get("created_at", "")),
+        ("updated", issue.get("updated_at", "")),
     ])
 
 
@@ -2436,10 +2427,7 @@ def cmd_item_issue(
     _require_gh()
     root, repo_name = _resolve_git_repo(repo)
 
-    if issue_number <= 0:
-        raise NomnomError(
-            f"issue number must be positive, got {issue_number}"
-        )
+    _require_positive("issue number", issue_number)
 
     owner, name = _resolve_owner_repo(root)
 
@@ -2543,15 +2531,15 @@ def _format_discussion_meta(d: dict) -> str:
         n.get("name") or ""
         for n in ((d.get("labels") or {}).get("nodes") or [])
     ) or "(none)"
-    return "\n".join([
-        f"number:   #{d.get('number', '?')}",
-        f"title:    {d.get('title', '')}",
-        f"url:      {d.get('url', '')}",
-        f"author:   @{author}",
-        f"category: {category}",
-        f"labels:   {labels}",
-        f"created:  {d.get('createdAt', '')}",
-        f"updated:  {d.get('updatedAt', '')}",
+    return _kv_block([
+        ("number", f"#{d.get('number', '?')}"),
+        ("title", d.get("title", "")),
+        ("url", d.get("url", "")),
+        ("author", f"@{author}"),
+        ("category", category),
+        ("labels", labels),
+        ("created", d.get("createdAt", "")),
+        ("updated", d.get("updatedAt", "")),
     ])
 
 
@@ -2598,10 +2586,7 @@ def cmd_item_discussion(
     _require_gh()
     root, repo_name = _resolve_git_repo(repo)
 
-    if discussion_number <= 0:
-        raise NomnomError(
-            f"discussion number must be positive, got {discussion_number}"
-        )
+    _require_positive("discussion number", discussion_number)
 
     owner, name = _resolve_owner_repo(root)
 
@@ -2651,39 +2636,33 @@ def _format_commit_meta(commit: dict) -> str:
         (p.get("sha", "") or "")[:7] for p in (commit.get("parents") or [])
     ) or "(none)"
     stats = commit.get("stats") or {}
-    return "\n".join([
-        f"sha:        {sha}",
-        f"short:      {sha[:7] if sha != '?' else '?'}",
-        f"url:        {commit.get('html_url', '')}",
-        f"author:     {author.get('name', '?')} <{author.get('email', '')}>",
-        f"authored:   {author.get('date', '')}",
-        f"committer:  {committer.get('name', '?')} <{committer.get('email', '')}>",
-        f"committed:  {committer.get('date', '')}",
-        f"parents:    {parents}",
-        f"stats:      +{stats.get('additions', 0)} -{stats.get('deletions', 0)} "
-        f"({stats.get('total', 0)})",
+    return _kv_block([
+        ("sha", sha),
+        ("short", sha[:7] if sha != "?" else "?"),
+        ("url", commit.get("html_url", "")),
+        ("author", f"{author.get('name', '?')} <{author.get('email', '')}>"),
+        ("authored", author.get("date", "")),
+        ("committer", f"{committer.get('name', '?')} <{committer.get('email', '')}>"),
+        ("committed", committer.get("date", "")),
+        ("parents", parents),
+        ("stats", f"+{stats.get('additions', 0)} -{stats.get('deletions', 0)} "
+                  f"({stats.get('total', 0)})"),
     ])
 
 
 def _format_commit_comments(comments: list) -> str:
-    if not comments:
-        return ""
-    parts: list[str] = []
-    for c in comments:
+    def head(c: dict) -> str:
         login = ((c.get("user") or {}).get("login")) or "?"
         when = c.get("created_at") or ""
         path = c.get("path") or ""
         line = c.get("line") or c.get("position")
         if path:
-            head = (
+            return (
                 f"## {path}:{line if line is not None else '?'}  "
                 f"@{login} {when}".rstrip()
             )
-        else:
-            head = f"## @{login} {when}".rstrip()
-        body = (c.get("body") or "").rstrip()
-        parts.append(head + "\n" + (body or "(no body)"))
-    return "\n\n".join(parts)
+        return f"## @{login} {when}".rstrip()
+    return _format_comment_blocks(comments, head)
 
 
 def _commit_diff(root: Path, owner: str, name: str, sha: str) -> str:
@@ -2769,16 +2748,16 @@ def cmd_item_commit(
 
 def _format_release_meta(rel: dict) -> str:
     author = ((rel.get("author") or {}).get("login")) or "?"
-    return "\n".join([
-        f"tag:           {rel.get('tag_name', '?')}",
-        f"name:          {rel.get('name', '') or '(none)'}",
-        f"url:           {rel.get('html_url', '')}",
-        f"author:        @{author}",
-        f"target:        {rel.get('target_commitish', '')}",
-        f"published:     {rel.get('published_at', '')}",
-        f"created:       {rel.get('created_at', '')}",
-        f"draft:         {'true' if rel.get('draft') else 'false'}",
-        f"prerelease:    {'true' if rel.get('prerelease') else 'false'}",
+    return _kv_block([
+        ("tag", rel.get("tag_name", "?")),
+        ("name", rel.get("name", "") or "(none)"),
+        ("url", rel.get("html_url", "")),
+        ("author", f"@{author}"),
+        ("target", rel.get("target_commitish", "")),
+        ("published", rel.get("published_at", "")),
+        ("created", rel.get("created_at", "")),
+        ("draft", "true" if rel.get("draft") else "false"),
+        ("prerelease", "true" if rel.get("prerelease") else "false"),
     ])
 
 
@@ -2840,20 +2819,20 @@ def cmd_item_release(
 
 def _format_run_meta(run: dict) -> str:
     sha = (run.get("headSha") or "")[:7]
-    return "\n".join([
-        f"id:         {run.get('databaseId') or run.get('id', '?')}",
-        f"number:     {run.get('number', '?')}",
-        f"workflow:   {run.get('workflowName', '')}",
-        f"title:      {run.get('displayTitle', '')}",
-        f"url:        {run.get('url', '')}",
-        f"branch:     {run.get('headBranch', '')}",
-        f"sha:        {sha}",
-        f"event:      {run.get('event', '')}",
-        f"status:     {run.get('status', '')}",
-        f"conclusion: {run.get('conclusion', '')}",
-        f"attempt:    {run.get('attempt', '?')}",
-        f"created:    {run.get('createdAt', '')}",
-        f"updated:    {run.get('updatedAt', '')}",
+    return _kv_block([
+        ("id", f"{run.get('databaseId') or run.get('id', '?')}"),
+        ("number", f"{run.get('number', '?')}"),
+        ("workflow", run.get("workflowName", "")),
+        ("title", run.get("displayTitle", "")),
+        ("url", run.get("url", "")),
+        ("branch", run.get("headBranch", "")),
+        ("sha", sha),
+        ("event", run.get("event", "")),
+        ("status", run.get("status", "")),
+        ("conclusion", run.get("conclusion", "")),
+        ("attempt", f"{run.get('attempt', '?')}"),
+        ("created", run.get("createdAt", "")),
+        ("updated", run.get("updatedAt", "")),
     ])
 
 
@@ -2877,18 +2856,18 @@ def _format_run_jobs(jobs: list) -> str:
 
 
 def _format_job_meta(job: dict) -> str:
-    return "\n".join([
-        f"id:         {job.get('id', '?')}",
-        f"name:       {job.get('name', '')}",
-        f"run_id:     {job.get('run_id', '?')}",
-        f"run_url:    {job.get('run_url', '')}",
-        f"url:        {job.get('html_url', '')}",
-        f"workflow:   {job.get('workflow_name', '')}",
-        f"status:     {job.get('status', '')}",
-        f"conclusion: {job.get('conclusion', '')}",
-        f"started:    {job.get('started_at', '')}",
-        f"completed:  {job.get('completed_at', '')}",
-        f"runner:     {job.get('runner_name', '')}",
+    return _kv_block([
+        ("id", f"{job.get('id', '?')}"),
+        ("name", job.get("name", "")),
+        ("run_id", f"{job.get('run_id', '?')}"),
+        ("run_url", job.get("run_url", "")),
+        ("url", job.get("html_url", "")),
+        ("workflow", job.get("workflow_name", "")),
+        ("status", job.get("status", "")),
+        ("conclusion", job.get("conclusion", "")),
+        ("started", job.get("started_at", "")),
+        ("completed", job.get("completed_at", "")),
+        ("runner", job.get("runner_name", "")),
     ])
 
 
@@ -2943,8 +2922,7 @@ def cmd_item_run(
 ) -> int:
     _require_gh()
     root, repo_name = _resolve_git_repo(repo)
-    if run_id <= 0:
-        raise NomnomError(f"run id must be positive, got {run_id}")
+    _require_positive("run id", run_id)
 
     fields = (
         "databaseId,number,attempt,status,conclusion,event,workflowName,"
@@ -2988,8 +2966,7 @@ def cmd_item_job(
 ) -> int:
     _require_gh()
     root, repo_name = _resolve_git_repo(repo)
-    if job_id <= 0:
-        raise NomnomError(f"job id must be positive, got {job_id}")
+    _require_positive("job id", job_id)
 
     owner, name = _resolve_owner_repo(root)
 
@@ -3037,7 +3014,7 @@ def _classify_item_id(value: str) -> str | None:
     if not value:
         return None
     if _COMMIT_SHA_RE.match(value):
-        return "commit"
+        return "commit"  # hex-shaped: assume commit; a rare hex tag needs `item release`
     if not value.isdigit():
         return "release"
     return None
@@ -3293,8 +3270,12 @@ def _derive_keys(passphrase: str, salt: bytes) -> tuple[bytes, bytes]:
 
 
 def _stream_xor(enc_key: bytes, nonce: bytes, data: bytes) -> bytes:
-    out = bytearray(len(data))
     block_size = 32  # HMAC-SHA256 output
+    if len(data) > block_size * (2 ** 32):
+        # The block counter is a 32-bit BE value; past 2**32 blocks it would
+        # wrap and reuse keystream. Unreachable for real payloads, but guard it.
+        raise ValueError("stream_xor: input too large for 32-bit block counter")
+    out = bytearray(len(data))
     counter = 0
     for off in range(0, len(data), block_size):
         ks = hmac.new(
@@ -3303,8 +3284,10 @@ def _stream_xor(enc_key: bytes, nonce: bytes, data: bytes) -> bytes:
             hashlib.sha256,
         ).digest()
         chunk = data[off:off + block_size]
-        for i, b in enumerate(chunk):
-            out[off + i] = b ^ ks[i]
+        # XOR the whole block at once at C speed rather than byte-by-byte; the
+        # fixed width preserves leading zero bytes.
+        xored = int.from_bytes(chunk, "big") ^ int.from_bytes(ks[:len(chunk)], "big")
+        out[off:off + len(chunk)] = xored.to_bytes(len(chunk), "big")
         counter += 1
     return bytes(out)
 
@@ -3413,6 +3396,16 @@ def _hkdf(*, salt: bytes, ikm: bytes, info: bytes, length: int) -> bytes:
 # Sign / verify take ~50ms each on CPython. The interface (sign / verify
 # / pub-from-seed) is a strict subset of PyNaCl's signing module so the
 # logic is easy to spot-check against the spec.
+#
+# UNAUDITED, and deliberately so: nomnom is a single-file, stdlib-only CLI, so we
+# don't pull in libsodium/PyNaCl. This is the *reference* that generates the
+# interop test vectors the browser client (which uses the audited @noble/curves)
+# is checked against — so the cross-impl agreement tests, including the
+# adversarial verify vectors (tests/test_nomnom.py::TestEd25519AdversarialVectors
+# and nomnom-web's feeds.vectors.test.ts), are the safety net that this and the
+# audited library can't diverge unnoticed. `ed25519_verify` uses the strict
+# cofactorless equation [S]B == R + [k]A with canonical-S enforcement (s < L);
+# that is a deliberate choice and must keep matching @noble/curves.
 
 _ED_P = 2 ** 255 - 19
 _ED_L = 2 ** 252 + 27742317777372353535851937790883648493
@@ -3596,8 +3589,11 @@ def _load_identity() -> dict:
     if changed:
         try:
             _atomic_write_text(path, json.dumps(ident))
-        except OSError:
-            pass
+        except OSError as e:
+            # A fresh signing key that never reaches disk means peers will see
+            # a new fingerprint next run and TOFU-reprompt — warn rather than
+            # fail silently. (TUI redirects stderr, so this only shows in CLI.)
+            sys.stderr.write(f"warning: could not persist identity: {e}\n")
     return ident
 
 
@@ -3643,6 +3639,11 @@ def _atomic_write_text(path: Path, content: str, *, mode: int = 0o600) -> None:
         os.fchmod(fd, mode)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(content)
+            # Flush to disk before the rename so a crash can't leave a
+            # truncated identity/peer-pin store (the whole point of the helper
+            # is durability, not just atomicity of the name swap).
+            f.flush()
+            os.fsync(f.fileno())
     except BaseException:
         try:
             os.unlink(tmp)
@@ -3691,15 +3692,26 @@ def _load_known_peers() -> dict:
     return _migrate_known_peers_v2(data)
 
 
+def _peer_matches(pid: str, rec: object, needle: str) -> bool:
+    """True if non-empty `needle` matches a peer's device id, name, or nickname."""
+    if not needle:
+        return False
+    if needle == pid:
+        return True
+    if not isinstance(rec, dict):
+        return False
+    return needle in (rec.get("name", ""), rec.get("nickname", ""))
+
+
 def _forget_peer(needle: str) -> list:
     """Drop pins matching `needle` (a device id, name, or nickname). Returns dropped names."""
     peers = _load_known_peers()
     dropped = []
     for dev_id in list(peers.keys()):
         rec = peers[dev_id]
-        name = rec.get("name", "") if isinstance(rec, dict) else ""
-        nickname = rec.get("nickname", "") if isinstance(rec, dict) else ""
-        if needle in (dev_id, name, nickname) and needle:
+        if _peer_matches(dev_id, rec, needle):
+            name = rec.get("name", "") if isinstance(rec, dict) else ""
+            nickname = rec.get("nickname", "") if isinstance(rec, dict) else ""
             dropped.append(nickname or name or dev_id)
             del peers[dev_id]
     if dropped:
@@ -3717,12 +3729,7 @@ def _resolve_peer(needle: str) -> list:
     for pid, rec in _load_known_peers().items():
         if not isinstance(rec, dict):
             continue
-        if needle == pid:
-            matches.append((pid, rec))
-            continue
-        name = rec.get("name", "")
-        nickname = rec.get("nickname", "")
-        if needle and (needle == name or needle == nickname):
+        if _peer_matches(pid, rec, needle):
             matches.append((pid, rec))
     return matches
 
@@ -3734,7 +3741,7 @@ def _set_peer_nickname(needle: str, nickname: str | None) -> tuple[str, str] | N
     for pid, rec in peers.items():
         if not isinstance(rec, dict):
             continue
-        if needle in (pid, rec.get("name", ""), rec.get("nickname", "")) and needle:
+        if _peer_matches(pid, rec, needle):
             target = pid
             break
     if target is None:
@@ -3751,10 +3758,6 @@ def _set_peer_nickname(needle: str, nickname: str | None) -> tuple[str, str] | N
     return target, nickname or ""
 
 
-# RFC 3526 group 14 (2048-bit MODP prime), generator g = 2. Used for the
-# long-term identity keys and the per-transfer ephemeral keys alike.
-
-
 # ---------- TOFU helpers ----------
 
 
@@ -3765,7 +3768,7 @@ def _ik_fingerprint(ik_hex: str) -> str:
         # odd-length; pad before decoding (bytes.fromhex rejects odd lengths).
         raw = bytes.fromhex(ik_hex if len(ik_hex) % 2 == 0 else "0" + ik_hex)
     except (ValueError, TypeError):
-        return "?"
+        return "?"  # display-only sentinel; never compared against a real fingerprint
     d = hashlib.sha256(raw).hexdigest()[:16]
     return ":".join(d[i:i + 4] for i in range(0, 16, 4))
 
@@ -4025,6 +4028,13 @@ def feed_seal(
 
     `_nonce` is a test hook; production callers leave it None.
     """
+    # Bind the stamped public key to the signing key here — the one place we
+    # hold both halves. A mismatched (priv, pub) pair would otherwise produce a
+    # post every receiver silently rejects; fail locally instead.
+    if bytes.fromhex(sender_sig_pub_hex) != ed25519_pub_from_seed(
+        bytes.fromhex(sender_sig_priv_hex),
+    ):
+        raise ValueError("feed_seal: sig_pub does not match sig_priv")
     nonce = _nonce if _nonce is not None else secrets.token_bytes(_FEED_NONCE_LEN)
     content_hash = hashlib.sha256(body).digest()
     when = posted_at if posted_at is not None else int(time.time())
@@ -4184,7 +4194,7 @@ class Feed:
     expires_at: int
     joined_at: int
     member_id: str
-    members_cache: list = field(default_factory=list)
+    members_cache: list[dict] = field(default_factory=list)
     last_post_ts: int = 0
 
     def to_dict(self) -> dict:
@@ -4282,7 +4292,11 @@ def _find_feed(config: dict, nickname: str) -> Feed | None:
 
 
 def _default_feed(config: dict) -> Feed | None:
-    """Return the configured default feed, or None."""
+    """Return the configured default feed, or None.
+
+    Legacy: the single-channel model uses `feeds[0]` via `_the_channel`; the
+    `default` field and this helper are retained for back-compat with configs
+    written by the old multi-feed code."""
     name = config.get("default")
     if not isinstance(name, str):
         return None
@@ -4376,7 +4390,12 @@ def _load_relay_config() -> dict | None:
         return None
     if not url.startswith(("http://", "https://")):
         return None
-    return {"url": url.rstrip("/"), "secret": secret}
+    out = {"url": url.rstrip("/"), "secret": secret}
+    # Carry the user's explicit private-address opt-in (e.g. a local dev
+    # Worker) so the per-request SSRF re-check in _relay_open honors it.
+    if data.get("allow_private") is True:
+        out["allow_private"] = True
+    return out
 
 
 def _url_resolves_private(url: str) -> str | None:
@@ -4434,8 +4453,12 @@ def _save_relay_config(url: str, secret: str, *, allow_private: bool = False) ->
                 "pass --allow-private if this is intentional (e.g., a local "
                 "dev Worker).",
             )
-    body = json.dumps({"url": url.rstrip("/"), "secret": secret}, indent=2)
-    _atomic_write_text(_relay_config_path(), body)
+    config = {"url": url.rstrip("/"), "secret": secret}
+    # Persist the opt-in so _relay_open's per-request re-check doesn't reject a
+    # local dev Worker the user deliberately allowed.
+    if allow_private:
+        config["allow_private"] = True
+    _atomic_write_text(_relay_config_path(), json.dumps(config, indent=2))
 
 
 def _relay_clear_config() -> bool:
@@ -4525,9 +4548,26 @@ def _relay_split_url(url: str) -> tuple[str, int, str, bool]:
     return parsed.hostname, port, parsed.path.rstrip("/"), is_https
 
 
+def _assert_relay_url_allowed(relay: dict) -> None:
+    """Re-run the private-address guard on every request, not just at import.
+
+    `_save_relay_config` checks once at write time, but each request re-resolves
+    the host at connect — so a name that was public at import can later resolve
+    to loopback/metadata (DNS rebinding / TOCTOU). Checking here, the one
+    chokepoint every request flows through, closes that gap. (A stronger fix
+    pins the vetted literal IP and connects to it; deferred as follow-up.)
+    """
+    if relay.get("allow_private"):
+        return
+    reason = _url_resolves_private(relay["url"])
+    if reason is not None:
+        raise NomnomError(f"refusing relay request: {reason}")
+
+
 def _relay_open(
     relay: dict, *, timeout: float = _RELAY_REQUEST_TIMEOUT,
 ) -> http.client.HTTPConnection:
+    _assert_relay_url_allowed(relay)
     host, port, _, is_https = _relay_split_url(relay["url"])
     if is_https:
         return http.client.HTTPSConnection(host, port, timeout=timeout)
@@ -4539,22 +4579,21 @@ def _relay_full_path(relay: dict, path: str) -> str:
     return f"{base}{path}" if base else path
 
 
-def _relay_request(
-    relay: dict, method: str, path: str,
-    *, body: bytes | None = None,
-    extra_headers: dict[str, str] | None = None,
-    signed: bool = True,
+def _http_send(
+    relay: dict, method: str, full_path: str,
+    *, body: bytes | None, headers: dict[str, str],
+    content_type: str = "application/octet-stream",
 ) -> tuple[int, bytes]:
-    """One-shot relay request. Returns (status, body). Raises NomnomError on network errors."""
-    full_path = _relay_full_path(relay, path)
-    headers: dict[str, str] = {}
-    if signed:
-        headers.update(_relay_hmac_headers(relay["secret"], method, full_path))
+    """Open a connection, send one request, return (status, body).
+
+    Shared core for the HMAC (`_relay_request`) and feed-key (`_feed_request`)
+    schemes — they differ only in which auth headers they build. Enforces the
+    response-size ceiling (declared Content-Length and actual bytes) and maps
+    network errors to NomnomError. `_relay_open` is the injection seam for
+    tests (monkeypatch it to feed canned responses without a live socket)."""
     if body is not None:
-        headers["Content-Length"] = str(len(body))
-        headers["Content-Type"] = "application/octet-stream"
-    if extra_headers:
-        headers.update(extra_headers)
+        headers.setdefault("Content-Length", str(len(body)))
+        headers.setdefault("Content-Type", content_type)
     conn = _relay_open(relay)
     try:
         try:
@@ -4589,8 +4628,27 @@ def _relay_request(
             pass
 
 
+def _relay_request(
+    relay: dict, method: str, path: str,
+    *, body: bytes | None = None,
+    extra_headers: dict[str, str] | None = None,
+    signed: bool = True,
+) -> tuple[int, bytes]:
+    """One-shot HMAC-signed relay request. Returns (status, body)."""
+    full_path = _relay_full_path(relay, path)
+    headers: dict[str, str] = {}
+    if signed:
+        headers.update(_relay_hmac_headers(relay["secret"], method, full_path))
+    if extra_headers:
+        headers.update(extra_headers)
+    return _http_send(relay, method, full_path, body=body, headers=headers)
+
+
 def _qs(**params: int) -> str:
-    """Build `?k=v&...` from positive int kwargs; empty string if none apply."""
+    """Build `?k=v&...` from positive int kwargs; empty string if none apply.
+
+    Zero/negative params are omitted, so `since=0` can't be sent explicitly —
+    the Worker treats an absent `since` as 0, which is the same thing."""
     parts = [f"{k}={int(v)}" for k, v in params.items() if v and v > 0]
     return ("?" + "&".join(parts)) if parts else ""
 
@@ -4638,7 +4696,15 @@ def _feed_relay_dict(host: str) -> dict:
     """
     if "://" not in host:
         host = f"https://{host}"
-    return {"url": host.rstrip("/")}
+    relay = {"url": host.rstrip("/")}
+    # Honor the configured relay's private-address opt-in when the feed lives on
+    # that same host, so _relay_open's re-check doesn't reject a local dev relay.
+    cfg = _load_relay_config()
+    if cfg and cfg.get("allow_private"):
+        cfg_host = urllib.parse.urlsplit(cfg["url"]).hostname
+        if cfg_host and cfg_host == urllib.parse.urlsplit(relay["url"]).hostname:
+            relay["allow_private"] = True
+    return relay
 
 
 def _feed_auth_headers(feed_key: bytes, method: str, path: str) -> dict[str, str]:
@@ -4672,27 +4738,10 @@ def _feed_request(
     relay = _feed_relay_dict(host)
     full_path = _relay_full_path(relay, path)
     headers = _feed_auth_headers(feed_key, method, full_path)
-    if body is not None:
-        headers["Content-Length"] = str(len(body))
-        headers["Content-Type"] = content_type
-    conn = _relay_open(relay)
-    try:
-        try:
-            conn.request(method, full_path, body=body, headers=headers)
-            resp = conn.getresponse()
-            data = resp.read(_RELAY_MAX_BODY + 1)
-            if len(data) > _RELAY_MAX_BODY:
-                raise NomnomError(
-                    f"relay returned oversized body (> {_RELAY_MAX_BODY} bytes)",
-                )
-            return resp.status, data
-        except (OSError, http.client.HTTPException) as e:
-            raise NomnomError(f"relay request failed: {e}") from e
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
+    return _http_send(
+        relay, method, full_path,
+        body=body, headers=headers, content_type=content_type,
+    )
 
 
 def _decode_relay_reason(body: bytes) -> str:
@@ -4753,16 +4802,27 @@ def _relay_mint_feed(
     _raise_relay_error(status, data)
 
 
-def _relay_get_feed_meta(host: str, feed_id: str, feed_key: bytes) -> dict:
+def _feed_json(
+    host: str, feed_key: bytes, method: str, path: str,
+    *, ok: int = 200, body: bytes | None = None,
+    content_type: str = "application/octet-stream",
+) -> dict:
+    """Feed-key request that returns parsed JSON on `ok`, else raises.
+
+    Folds the parse-or-raise tail repeated across the feed GET/POST endpoints."""
     status, data = _feed_request(
-        host, feed_key, "GET", f"/feeds/{feed_id}/meta",
+        host, feed_key, method, path, body=body, content_type=content_type,
     )
-    if status == 200:
+    if status == ok:
         try:
             return json.loads(data)
         except json.JSONDecodeError as e:
             raise NomnomError(f"relay returned bad JSON: {e}") from e
     _raise_feed_error(status, data)
+
+
+def _relay_get_feed_meta(host: str, feed_id: str, feed_key: bytes) -> dict:
+    return _feed_json(host, feed_key, "GET", f"/feeds/{feed_id}/meta")
 
 
 def _relay_put_member(
@@ -4795,32 +4855,20 @@ def _relay_list_members(
     host: str, feed_id: str, feed_key: bytes,
     *, since_ts: int = 0, wait_ms: int = 0,
 ) -> dict:
-    status, data = _feed_request(
+    return _feed_json(
         host, feed_key, "GET",
         f"/feeds/{feed_id}/members{_qs(wait=wait_ms, since=since_ts)}",
     )
-    if status == 200:
-        try:
-            return json.loads(data)
-        except json.JSONDecodeError as e:
-            raise NomnomError(f"relay returned bad JSON: {e}") from e
-    _raise_feed_error(status, data)
 
 
 def _relay_extend_feed(
     host: str, feed_id: str, feed_key: bytes, new_ttl_seconds: int,
 ) -> dict:
     body = json.dumps({"new_ttl_seconds": int(new_ttl_seconds)}).encode("utf-8")
-    status, data = _feed_request(
+    return _feed_json(
         host, feed_key, "POST", f"/feeds/{feed_id}/extend",
         body=body, content_type="application/json",
     )
-    if status == 200:
-        try:
-            return json.loads(data)
-        except json.JSONDecodeError as e:
-            raise NomnomError(f"relay returned bad JSON: {e}") from e
-    _raise_feed_error(status, data)
 
 
 def _relay_close_feed(host: str, feed_id: str, feed_key: bytes) -> None:
@@ -4867,17 +4915,11 @@ def _relay_list_feed_slots(
     host: str, feed_id: str, feed_key: bytes,
     *, since_ts: int = 0, wait_ms: int = 0,
 ) -> list:
-    status, data = _feed_request(
+    parsed = _feed_json(
         host, feed_key, "GET",
         f"/feeds/{feed_id}/slots{_qs(wait=wait_ms, since=since_ts)}",
     )
-    if status == 200:
-        try:
-            parsed = json.loads(data)
-        except json.JSONDecodeError as e:
-            raise NomnomError(f"relay returned bad JSON: {e}") from e
-        return parsed.get("slots") or []
-    _raise_feed_error(status, data)
+    return parsed.get("slots") or []
 
 
 # --- SSE slot stream (real-time push; stdlib-only streaming GET) ---
@@ -5406,15 +5448,7 @@ def cmd_receive(*, once: bool = False, trust_new: bool = False) -> int:
         # Roster refresh + TOFU prompts before each slot long-poll. Up to a
         # 30s lag between a new member joining and the prompt firing, but
         # interleaving keeps the I/O on a single thread.
-        roster = _refresh_roster_with_tofu(
-            target, host, feed_key, trust_new=trust_new,
-        )
-        if roster is not None:
-            cfg_now = _load_feeds_config()
-            existing = _find_feed(cfg_now, target.name)
-            if existing is not None:
-                existing.members_cache = roster
-                _save_feeds_config(cfg_now)
+        _receive_refresh_roster(target, host, feed_key, trust_new)
         try:
             slots = _relay_list_feed_slots(
                 host, target.feed_id, feed_key,
@@ -5432,82 +5466,31 @@ def cmd_receive(*, once: bool = False, trust_new: bool = False) -> int:
                 return 0 if received_any else 1
             continue
         # Iterate in chronological order; the Worker already sorts by created_at.
+        # Fetch/verify/write goes through the same _receive_one_post the stream
+        # path uses, so tamper handling (raise → warn + skip) is identical.
         for entry in slots:
             slot_id = entry.get("slot_id")
             created_at = int(entry.get("created_at") or 0)
-            if not slot_id:
-                continue
-            # Skip posts authored by this device (our own broadcast comes back).
-            try:
-                raw = _relay_get_feed_slot(host, target.feed_id, feed_key, slot_id)
-            except NomnomError as e:
-                sys.stderr.write(f"warning: {e}\n")
-                if created_at > last_ts:
-                    last_ts = created_at
-                continue
-            if raw is None:
-                if created_at > last_ts:
-                    last_ts = created_at
-                continue
-            try:
-                header, body = feed_open(
-                    feed_key=feed_key, feed_id=target.feed_id, blob=raw,
-                )
-            except ValueError as e:
-                sys.stderr.write(f"warning: dropping bad post: {e}\n")
-                if created_at > last_ts:
-                    last_ts = created_at
-                continue
-            sender_id = header.get("smid")
-            if sender_id == target.member_id:
-                # our own broadcast — don't write our own file back to disk
-                if created_at > last_ts:
-                    last_ts = created_at
-                continue
-            sender_name = "(unknown)"
-            sender_pub = header.get("sik")
-            for m in target.members_cache or []:
-                if m.get("member_id") == sender_id:
-                    sender_name = m.get("name", sender_name)
-                    if m.get("identity_pubkey") and m.get("identity_pubkey") != sender_pub:
-                        sys.stderr.write(
-                            f"warning: dropping post; sender {sender_id!r} "
-                            "identity key changed from roster cache.\n",
-                        )
-                        sender_id = None
-                    break
-            if sender_id is None:
-                if created_at > last_ts:
-                    last_ts = created_at
-                continue
-            try:
-                filename = _safe_filename(header.get("fn") or "post")
-            except NomnomError as e:
-                sys.stderr.write(f"warning: dropping bad post: {e}\n")
-                if created_at > last_ts:
-                    last_ts = created_at
-                continue
-            out = _pick_decrypted_path(Path.cwd(), filename)
-            try:
-                out.write_bytes(body)
-            except OSError as e:
-                sys.stderr.write(f"error writing {out}: {e}\n")
-                return 1
-            sys.stderr.write(
-                f"received {filename!r} ({len(body)} bytes) "
-                f"from {sender_name} -> {out}\n",
-            )
-            sys.stderr.flush()
-            received_any = True
-            if created_at > last_ts:
-                last_ts = created_at
-            # Persist last_post_ts so a restart doesn't re-fetch.
-            cfg_now = _load_feeds_config()
-            existing = _find_feed(cfg_now, target.name)
-            if existing is not None:
-                existing.last_post_ts = last_ts
-                _save_feeds_config(cfg_now)
-            if once:
+            res = None
+            if slot_id:
+                try:
+                    res = _receive_one_post(
+                        feed=target, host=host, feed_key=feed_key, slot_id=slot_id,
+                    )
+                except NomnomError as e:
+                    sys.stderr.write(f"warning: {e}\n")
+                    res = None
+                if res is not None:
+                    filename, nbytes, sender, out_path = res
+                    sys.stderr.write(
+                        f"received {filename!r} ({nbytes} bytes) "
+                        f"from {sender} -> {out_path}\n",
+                    )
+                    sys.stderr.flush()
+                    received_any = True
+            last_ts = max(last_ts, created_at)
+            _receive_persist_ts(target, last_ts)
+            if once and res is not None:
                 return 0
 
 
@@ -5564,6 +5547,14 @@ def _ensure_relay_configured(*, interactive: bool = True) -> dict | None:
     return _cmd_relay_init_interactive()
 
 
+def _wrangler_deploy_hint(secret: str) -> str:
+    """The two-line `wrangler secret put / deploy` hint shown on the Worker side."""
+    return (
+        f"  echo {secret!r} | npx wrangler secret put NOMNOM_HMAC_SECRET\n"
+        "  npx wrangler deploy\n"
+    )
+
+
 def _cmd_relay_init_interactive(*, allow_private: bool = False) -> dict | None:
     """First-device flow: prompt URL, generate secret, self-test, save, print wrangler commands."""
     sys.stderr.write(
@@ -5596,10 +5587,7 @@ def _cmd_relay_init_interactive(*, allow_private: bool = False) -> dict | None:
             "after deploying.\n",
         )
         sys.stderr.write("\non the Worker side, run:\n")
-        sys.stderr.write(
-            f"  echo {secret!r} | npx wrangler secret put NOMNOM_HMAC_SECRET\n"
-            "  npx wrangler deploy\n",
-        )
+        sys.stderr.write(_wrangler_deploy_hint(secret))
         return None
     try:
         _save_relay_config(url, secret, allow_private=allow_private)
@@ -5706,24 +5694,39 @@ def cmd_init(args) -> int:
     return 0
 
 
+def _refresh_channel_roster(feed: Feed) -> list[dict]:
+    """Fetch the channel roster and persist it onto `feed` and the stored copy.
+
+    Shared by `cmd_channel` and the TUI ChannelScreen so both cache identically
+    (mirrors the CLI/TUI parity goal of `_join_channel`). Raises NomnomError on
+    relay failure."""
+    feed_key = _feed_key_from_token(feed.feed_token)
+    host, _ = _parse_feed_url(feed.url)
+    members = _relay_list_members(host, feed.feed_id, feed_key).get("members") or []
+    feed.members_cache = members
+    cfg = _load_feeds_config()
+    existing = _find_feed(cfg, feed.name)
+    if existing is not None:
+        existing.members_cache = members
+        _save_feeds_config(cfg)
+    return members
+
+
 def cmd_channel(_args) -> int:
     """Show your channel secret (to add devices) and the device roster."""
     feed = _the_channel()
     if feed is None:
         sys.stderr.write(f"error: {_no_channel_hint()}\n")
         return 1
-    feed_key = _feed_key_from_token(feed.feed_token)
-    host, _ = _parse_feed_url(feed.url)
     sys.stderr.write(
         "channel secret (paste on another device with `nomnom join`):\n",
     )
     print(feed.url)
     try:
-        roster = _relay_list_members(host, feed.feed_id, feed_key)
+        members = _refresh_channel_roster(feed)
     except NomnomError as e:
         sys.stderr.write(f"\nwarning: could not fetch devices: {e}\n")
         return 0
-    members = roster.get("members") or []
     sys.stderr.write(f"\ndevices ({len(members)}):\n")
     for m in members:
         marker = " *" if m.get("member_id") == feed.member_id else "  "
@@ -5732,12 +5735,6 @@ def cmd_channel(_args) -> int:
             if m.get("identity_pubkey") else "(no key)"
         )
         sys.stderr.write(f"{marker} {m.get('name', '?'):<28} {fp}\n")
-    feed.members_cache = members
-    cfg = _load_feeds_config()
-    existing = _find_feed(cfg, feed.name)
-    if existing is not None:
-        existing.members_cache = members
-        _save_feeds_config(cfg)
     return 0
 
 
@@ -6019,31 +6016,9 @@ def show_help_modal(stdscr, lines: list[str]) -> None:  # pragma: no cover
     caller may have set a non-blocking timeout for a progress poll, which
     would otherwise close the modal in ~100ms before the user can read it.
     """
-    h, w = stdscr.getmaxyx()
-    rows = [" nomnom keys ".center(40, "─"), *lines, "─" * 40, " press any key to close "]
-    box_w = min(w - 2, max(len(r) for r in rows) + 2)
-    box_h = min(h - 2, len(rows) + 2)
-    y0 = max(0, (h - box_h) // 2)
-    x0 = max(0, (w - box_w) // 2)
-    for i in range(box_h):
-        try:
-            stdscr.addstr(y0 + i, x0, " " * box_w, curses.A_REVERSE)
-        except curses.error:
-            pass
-    for i, line in enumerate(rows[: box_h - 1]):
-        try:
-            stdscr.addstr(y0 + 1 + i, x0 + 1, line[: box_w - 2], curses.A_REVERSE)
-        except curses.error:
-            pass
-    stdscr.refresh()
-    try:
-        stdscr.timeout(-1)
-    except curses.error:
-        pass
-    while True:
-        ch = stdscr.getch()
-        if ch != -1:
-            return
+    body = [" nomnom keys ".center(40, "─"), *lines, "─" * 40, " press any key to close "]
+    _draw_overlay(stdscr, body, min_w=40)
+    _modal_wait_key(stdscr)
 
 
 _TUI_ACTIVE = False
@@ -6084,7 +6059,7 @@ def _tofu_modal(stdscr, card: dict) -> bool:  # pragma: no cover - curses I/O
     """Blocking y/N modal for a first-contact feed identity. Returns True to pin."""
     name = card.get("name") or "(no name)"
     fp = _ik_fingerprint(card.get("identity_pubkey") or "")
-    rows = [
+    body = [
         " first contact ".center(40, "─"),
         f" {name}",
         f"   fingerprint: {fp}",
@@ -6092,32 +6067,8 @@ def _tofu_modal(stdscr, card: dict) -> bool:  # pragma: no cover - curses I/O
         "─" * 40,
         " trust and pin this device?  [y/N] ",
     ]
-    h, w = stdscr.getmaxyx()
-    box_w = min(w - 2, max(len(r) for r in rows) + 2)
-    box_h = min(h - 2, len(rows) + 2)
-    y0 = max(0, (h - box_h) // 2)
-    x0 = max(0, (w - box_w) // 2)
-    for i in range(box_h):
-        try:
-            stdscr.addstr(y0 + i, x0, " " * box_w, curses.A_REVERSE)
-        except curses.error:
-            pass
-    for i, line in enumerate(rows[: box_h - 1]):
-        try:
-            stdscr.addstr(y0 + 1 + i, x0 + 1, line[: box_w - 2], curses.A_REVERSE)
-        except curses.error:
-            pass
-    stdscr.refresh()
-    try:
-        stdscr.timeout(-1)
-    except curses.error:
-        pass
-    while True:
-        ch = stdscr.getch()
-        if ch in (ord("y"), ord("Y")):
-            return True
-        if ch in (ord("n"), ord("N"), ord("q"), 3, 27, 10, 13, -1):
-            return False
+    _draw_overlay(stdscr, body, min_w=40)
+    return _modal_yn(stdscr, default=False)
 
 
 def run_app(initial: Screen) -> None:  # pragma: no cover - curses I/O
@@ -6521,11 +6472,16 @@ class RebuildScreen(Screen):
         self.step = "input"
         self.path_buf = ""
         self.error = ""
+        self.message = ""
+        self._reset_parse_state()
+
+    def _reset_parse_state(self) -> None:
+        """Clear the parsed-bundle fields (shared by __init__ and the
+        preview->input back path, so a new field can't be forgotten in one)."""
         self.bundle_text = ""
         self.repo_name = ""
         self.files: list[tuple[str, str]] = []
         self.target: Path | None = None
-        self.message = ""
 
     def _parse(self) -> None:
         p = Path(self.path_buf.strip()).expanduser()
@@ -6616,7 +6572,7 @@ class RebuildScreen(Screen):
         else:
             try:
                 stdscr.addstr(2, 2,
-                              self.error and f"error: {self.error}" or self.message,
+                              f"error: {self.error}" if self.error else self.message,
                               theme["dim"])
             except curses.error:
                 pass
@@ -6645,10 +6601,7 @@ class RebuildScreen(Screen):
                 return ScreenAction.CONTINUE
             if ch in (ord("q"), 3, 27):
                 self.step = "input"
-                self.bundle_text = ""
-                self.repo_name = ""
-                self.files = []
-                self.target = None
+                self._reset_parse_state()
             return ScreenAction.CONTINUE
         # done
         if ch in (ord("q"), 3, 27, 10, 13):
@@ -7020,7 +6973,7 @@ class ChannelScreen(Screen):
         if ch in (curses.KEY_BACKSPACE, 127, 8):
             self.buf = self.buf[:-1]
             return ScreenAction.CONTINUE
-        if 32 <= ch <= 126:
+        if 32 <= ch < 127:
             self.buf += chr(ch)
         return ScreenAction.CONTINUE
 
@@ -7041,16 +6994,7 @@ class ChannelScreen(Screen):
                 self.message = "no clipboard tool (pbcopy/wl-copy/xclip)"
         elif ch == ord("r") and self.feed is not None:
             try:
-                feed_key = _feed_key_from_token(self.feed.feed_token)
-                host, _ = _parse_feed_url(self.feed.url)
-                roster = _relay_list_members(host, self.feed.feed_id, feed_key)
-                self.devices = roster.get("members") or []
-                self.feed.members_cache = self.devices
-                cfg = _load_feeds_config()
-                existing = _find_feed(cfg, self.feed.name)
-                if existing is not None:
-                    existing.members_cache = self.devices
-                    _save_feeds_config(cfg)
+                self.devices = _refresh_channel_roster(self.feed)
                 self.error = ""
                 self.message = f"{len(self.devices)} device(s)"
             except NomnomError as e:
@@ -7180,20 +7124,7 @@ class BundleScreen(Screen):
             with _tui_tofu(stdscr), \
                  contextlib.redirect_stdout(out_buf), \
                  contextlib.redirect_stderr(err_buf):
-                if result.verb == Verb.COMMIT:
-                    rc = cmd_commit(str(root), destination=result.destination)
-                elif result.verb == Verb.PR:
-                    rc = cmd_pr(str(root), None, destination=result.destination)
-                elif result.verb == Verb.ITEM:
-                    if result.item_kind is None or result.item_id is None:
-                        raise NomnomError(
-                            "item verb selected without an id",
-                        )
-                    rc = cmd_item(
-                        str(root), result.item_kind, result.item_id,
-                        include_diff=False,
-                        destination=result.destination,
-                    )
+                rc = _run_picker_verb(result, root, include_diff=False)
         except NomnomError as e:
             self.error = str(e)
         captured = (err_buf.getvalue() + out_buf.getvalue()).rstrip("\n")
@@ -7274,11 +7205,15 @@ class _GitContextScreen(Screen):
     # Field ids that accept free-text input (rendered with `> ` prompt).
     # Anything else is treated as a read-only status row driven by a hotkey.
     _TEXT_FIDS: tuple[str, ...] = ("repo",)
+    # Placeholder shown for a text field whose buffer is empty.
+    _PLACEHOLDERS: dict[str, str] = {"repo": "(empty)"}
 
     def __init__(self) -> None:
         self.step = "inputs"
         self.field_cursor = 0
-        self.repo_buf = str(Path.cwd())
+        # Text fields keyed by field id, so the base class owns all editing;
+        # subclasses just declare `fields`, `_TEXT_FIDS`, and `_PLACEHOLDERS`.
+        self.bufs: dict[str, str] = {"repo": str(Path.cwd())}
         self.destination = Destination.FILE
         self.error = ""
         self.output_lines: list[str] = []
@@ -7322,18 +7257,18 @@ class _GitContextScreen(Screen):
         self.step = "done"
 
     def _field_value(self, fid: str) -> str:
-        if fid == "repo":
-            return self.repo_buf or "(empty)"
         if fid == "dest":
             return _DESTINATION_LABELS[self.destination]
+        if fid in self._TEXT_FIDS:
+            return self.bufs.get(fid, "") or self._PLACEHOLDERS.get(fid, "")
         return ""
 
     def _edit_field(self, fid: str, ch: int) -> None:
-        if fid == "repo":
+        if fid in self._TEXT_FIDS:
             if ch in (curses.KEY_BACKSPACE, 127, 8):
-                self.repo_buf = self.repo_buf[:-1]
+                self.bufs[fid] = self.bufs.get(fid, "")[:-1]
             elif 32 <= ch < 127:
-                self.repo_buf += chr(ch)
+                self.bufs[fid] = self.bufs.get(fid, "") + chr(ch)
 
     def render(self, stdscr) -> None:  # pragma: no cover - curses I/O
         theme = _setup_theme()
@@ -7424,7 +7359,7 @@ class CommitScreen(_GitContextScreen):
     ]
 
     def _run_cmd(self) -> int:
-        return cmd_commit(self.repo_buf.strip(), destination=self.destination)
+        return cmd_commit(self.bufs["repo"].strip(), destination=self.destination)
 
 
 class PRScreen(_GitContextScreen):
@@ -7433,16 +7368,13 @@ class PRScreen(_GitContextScreen):
     title = "PR"
     verb = "PR"
     _TEXT_FIDS = ("repo", "base")
+    _PLACEHOLDERS = {"repo": "(empty)", "base": "(default)"}
     help_lines = [
         "tab/arrows  move between fields",
         "type        edit the path or base branch",
         "d           cycle destination (file/clipboard/send)",
         "enter       run; esc/q to go back",
     ]
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.base_buf = ""
 
     @property
     def fields(self) -> list[tuple[str, str]]:
@@ -7452,23 +7384,9 @@ class PRScreen(_GitContextScreen):
             ("dest", "Destination:"),
         ]
 
-    def _field_value(self, fid: str) -> str:
-        if fid == "base":
-            return self.base_buf or "(default)"
-        return super()._field_value(fid)
-
-    def _edit_field(self, fid: str, ch: int) -> None:
-        if fid == "base":
-            if ch in (curses.KEY_BACKSPACE, 127, 8):
-                self.base_buf = self.base_buf[:-1]
-            elif 32 <= ch < 127:
-                self.base_buf += chr(ch)
-            return
-        super()._edit_field(fid, ch)
-
     def _run_cmd(self) -> int:
-        base = self.base_buf.strip() or None
-        return cmd_pr(self.repo_buf.strip(), base, destination=self.destination)
+        base = self.bufs.get("base", "").strip() or None
+        return cmd_pr(self.bufs["repo"].strip(), base, destination=self.destination)
 
 
 class ItemScreen(_GitContextScreen):
@@ -7477,6 +7395,7 @@ class ItemScreen(_GitContextScreen):
     title = "Item"
     verb = "Item"
     _TEXT_FIDS = ("repo", "id")
+    _PLACEHOLDERS = {"repo": "(empty)", "id": "(required)"}
     help_lines = [
         "tab/arrows  move between fields",
         "type        edit fields (id accepts number / sha / tag)",
@@ -7487,7 +7406,6 @@ class ItemScreen(_GitContextScreen):
 
     def __init__(self) -> None:
         super().__init__()
-        self.id_buf = ""
         self.include_diff = False
 
     @property
@@ -7500,19 +7418,12 @@ class ItemScreen(_GitContextScreen):
         ]
 
     def _field_value(self, fid: str) -> str:
-        if fid == "id":
-            return self.id_buf or "(required)"
+        # `diff` is a non-text toggle; text fields fall through to the base.
         if fid == "diff":
             return "yes" if self.include_diff else "no"
         return super()._field_value(fid)
 
     def _edit_field(self, fid: str, ch: int) -> None:
-        if fid == "id":
-            if ch in (curses.KEY_BACKSPACE, 127, 8):
-                self.id_buf = self.id_buf[:-1]
-            elif 32 <= ch < 127:
-                self.id_buf += chr(ch)
-            return
         if fid == "diff":
             if ch == ord(" "):
                 self.include_diff = not self.include_diff
@@ -7520,7 +7431,7 @@ class ItemScreen(_GitContextScreen):
         super()._edit_field(fid, ch)
 
     def _run_cmd(self) -> int:
-        id_text = self.id_buf.strip()
+        id_text = self.bufs.get("id", "").strip()
         if not id_text:
             raise NomnomError("item id is required")
         parts = id_text.split(maxsplit=1)
@@ -7529,7 +7440,7 @@ class ItemScreen(_GitContextScreen):
         else:
             kind_or_id, ident = id_text, None
         return cmd_item(
-            self.repo_buf.strip(), kind_or_id, ident,
+            self.bufs["repo"].strip(), kind_or_id, ident,
             include_diff=self.include_diff,
             destination=self.destination,
         )
@@ -7556,7 +7467,7 @@ def _wrap(text: str, width: int) -> list[str]:
 
 def _text_input_field(
     stdscr, y: int, x: int, label: str, buf: str, theme,
-    width: int = -1,
+    width: int,
     *,
     active: bool = False,
     read_only: bool = False,
@@ -7576,9 +7487,7 @@ def _text_input_field(
         label_attr = theme["cursor"] if active else theme["dim"]
         stdscr.addstr(y, x, label, label_attr)
         line = buf if read_only else "> " + buf
-        if width > 0:
-            line = line[:width]
-        stdscr.addstr(y + 1, x, line, 0)
+        stdscr.addstr(y + 1, x, line[:width], 0)
     except curses.error:
         pass
 
@@ -7590,39 +7499,10 @@ def _confirm_modal(
 
     Returns True for `y`/`Y`, False for `n`/`N`/Esc, and `default` on
     Enter. Useful for destructive confirmations from inside a Screen."""
-    h, w = stdscr.getmaxyx()
     prompt = " [Y/n] " if default else " [y/N] "
     body = [title.center(50, "─"), *lines, "─" * 50, prompt]
-    box_w = min(max(1, w - 2), max(len(r) for r in body) + 4)
-    box_h = min(max(1, h - 2), len(body) + 2)
-    y0 = max(0, (h - box_h) // 2)
-    x0 = max(0, (w - box_w) // 2)
-    for i in range(box_h):
-        try:
-            stdscr.addstr(y0 + i, x0, " " * box_w, curses.A_REVERSE)
-        except curses.error:
-            pass
-    for i, line in enumerate(body[: box_h - 1]):
-        try:
-            stdscr.addstr(y0 + 1 + i, x0 + 2,
-                          line[: max(0, box_w - 4)], curses.A_REVERSE)
-        except curses.error:
-            pass
-    stdscr.refresh()
-    try:
-        stdscr.timeout(-1)
-    except curses.error:
-        pass
-    while True:
-        ch = stdscr.getch()
-        if ch == -1:
-            continue
-        if ch in (ord("y"), ord("Y")):
-            return True
-        if ch in (ord("n"), ord("N"), 27, 3):
-            return False
-        if ch in (10, 13):
-            return default
+    _draw_overlay(stdscr, body)
+    return _modal_yn(stdscr, default=default)
 
 
 def _draw_overlay(
@@ -7647,6 +7527,37 @@ def _draw_overlay(
         except curses.error:
             pass
     stdscr.refresh()
+
+
+def _modal_wait_key(stdscr) -> int:  # pragma: no cover - curses I/O
+    """Block (forcing timeout(-1)) until a real keypress and return it.
+
+    The caller may have set a non-blocking timeout for a progress poll; force
+    blocking so a modal doesn't dismiss itself before it can be read."""
+    try:
+        stdscr.timeout(-1)
+    except curses.error:
+        pass
+    while True:
+        ch = stdscr.getch()
+        if ch != -1:
+            return ch
+
+
+def _modal_yn(stdscr, default: bool) -> bool:  # pragma: no cover - curses I/O
+    """Block on a y/N gate: y/Y->True, n/N/q/Esc/Ctrl-C->False, Enter->default."""
+    try:
+        stdscr.timeout(-1)
+    except curses.error:
+        pass
+    while True:
+        ch = stdscr.getch()
+        if ch in (ord("y"), ord("Y")):
+            return True
+        if ch in (ord("n"), ord("N"), ord("q"), 27, 3):
+            return False
+        if ch in (10, 13):
+            return default
 
 
 def _prompt_item_id(
@@ -7815,6 +7726,15 @@ def _destination_from_args(args) -> Destination:
     return Destination.FILE
 
 
+def _add_repo_positional(sub: argparse.ArgumentParser, *, flag: bool = False) -> None:
+    """Attach the shared repo argument: a `repo` positional, or `--repo` flag."""
+    help_text = "Path to the project repo (default: current directory)."
+    if flag:
+        sub.add_argument("--repo", default=".", help=help_text)
+    else:
+        sub.add_argument("repo", nargs="?", default=".", help=help_text)
+
+
 def _build_commit_parser() -> argparse.ArgumentParser:
     sub = argparse.ArgumentParser(
         prog="nomnom commit",
@@ -7823,10 +7743,7 @@ def _build_commit_parser() -> argparse.ArgumentParser:
             "for an LLM to draft a commit message."
         ),
     )
-    sub.add_argument(
-        "repo", nargs="?", default=".",
-        help="Path to the project repo (default: current directory).",
-    )
+    _add_repo_positional(sub)
     _add_destination_flags(sub)
     return sub
 
@@ -7839,10 +7756,7 @@ def _build_pr_parser() -> argparse.ArgumentParser:
             "existing PR body) into a .txt for an LLM to draft a PR body."
         ),
     )
-    sub.add_argument(
-        "repo", nargs="?", default=".",
-        help="Path to the project repo (default: current directory).",
-    )
+    _add_repo_positional(sub)
     _add_destination_flags(sub)
     sub.add_argument(
         "--base", default=None,
@@ -7873,10 +7787,7 @@ def _build_item_parser() -> argparse.ArgumentParser:
         "ident", nargs="?", default=None,
         help="Id when the first argument names a kind (e.g. `pr 123`).",
     )
-    sub.add_argument(
-        "--repo", default=".",
-        help="Path to the project repo (default: current directory).",
-    )
+    _add_repo_positional(sub, flag=True)
     sub.add_argument(
         "--diff", action="store_true",
         help=(
@@ -8272,6 +8183,25 @@ def _maybe_print_v2_migration_notice() -> None:
     )
 
 
+def _run_picker_verb(result: PickResult, root: Path, *, include_diff: bool) -> int:
+    """Dispatch a non-BUNDLE picker verb (COMMIT/PR/ITEM) to its cmd_* handler.
+
+    Shared by the bare-CLI path (`include_diff=True`) and the TUI BundleScreen
+    (`include_diff=False`); both must stay in lock-step on how ITEM validates."""
+    if result.verb == Verb.COMMIT:
+        return cmd_commit(str(root), destination=result.destination)
+    if result.verb == Verb.PR:
+        return cmd_pr(str(root), None, destination=result.destination)
+    if result.verb == Verb.ITEM:
+        if result.item_kind is None or result.item_id is None:
+            raise NomnomError("item verb selected without an id")
+        return cmd_item(
+            str(root), result.item_kind, result.item_id,
+            include_diff=include_diff, destination=result.destination,
+        )
+    raise NomnomError(f"unsupported verb {result.verb}")
+
+
 def main() -> int:
     # Trip any pin-store migration up front so the notice lands on stderr
     # before either entry point claims the terminal (curses or CLI).
@@ -8311,10 +8241,7 @@ def main() -> int:
             "~/.config/nomnom/. run `nomnom <subcommand> --help`."
         ),
     )
-    parser.add_argument(
-        "repo", nargs="?", default=".",
-        help="Path to the project repo (default: current directory).",
-    )
+    _add_repo_positional(parser)
     parser.add_argument(
         "--all", action="store_true",
         help="Skip the picker and bundle every scanned file. Combine with "
@@ -8418,20 +8345,7 @@ def main() -> int:
                     file=sys.stderr,
                 )
             try:
-                if result.verb == Verb.COMMIT:
-                    return cmd_commit(str(root), destination=result.destination)
-                if result.verb == Verb.PR:
-                    return cmd_pr(str(root), None, destination=result.destination)
-                if result.verb == Verb.ITEM:
-                    if result.item_kind is None or result.item_id is None:
-                        raise NomnomError(
-                            "item verb selected without an id",
-                        )
-                    return cmd_item(
-                        str(root), result.item_kind, result.item_id,
-                        include_diff=True,
-                        destination=result.destination,
-                    )
+                return _run_picker_verb(result, root, include_diff=True)
             except NomnomError as e:
                 print(f"error: {e}", file=sys.stderr)
                 return 1

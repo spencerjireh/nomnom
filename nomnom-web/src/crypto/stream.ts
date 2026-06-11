@@ -22,6 +22,12 @@ export async function streamXorInPlace(
   const msg = new Uint8Array(nonce.length + 4);
   msg.set(nonce, 0);
   const total = Math.ceil(buf.length / BLOCK);
+  if (total > 0xffffffff) {
+    // The block counter is a 32-bit BE value; past 2**32 blocks it would wrap
+    // and reuse keystream (and desync byte-for-byte with the CLI). Unreachable
+    // under MAX_PAYLOAD_BYTES, but guard it in case the cap is ever raised.
+    throw new Error("stream too large for 32-bit counter");
+  }
   let counter = 0;
   for (let off = 0; off < buf.length; off += BLOCK) {
     msg[nonce.length] = (counter >>> 24) & 0xff;

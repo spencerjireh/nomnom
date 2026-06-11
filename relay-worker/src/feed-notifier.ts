@@ -15,12 +15,13 @@
 // ±300s window (EventSource auto-reconnects to the same, eventually-stale URL).
 
 import { errorResponse } from "./http";
+import { TIMESTAMP_WINDOW_SEC } from "./crypto-util";
+import { readSlotsSince } from "./slot-index";
 
 const HEARTBEAT_MS = 20_000;
-// Below the 300s auth window so a reconnect always re-signs in time.
-const STREAM_MAX_MS = 240_000;
-const LIST_BATCH_SIZE = 1000;
-const SLOT_HEAD_CONCURRENCY = 16;
+// Self-close a minute inside the auth window so a reconnect always re-signs in
+// time (derived from the window so the two can't silently drift apart).
+const STREAM_MAX_MS = (TIMESTAMP_WINDOW_SEC - 60) * 1000;
 
 interface NotifierEnv {
   BUCKET: R2Bucket;
@@ -114,29 +115,12 @@ export class FeedNotifier {
     conn: Conn,
   ): Promise<void> {
     if (!feedId) return;
-    const prefix = `feeds/${feedId}/slots/`;
-    let list;
+    let fresh;
     try {
-      list = await this.env.BUCKET.list({ prefix, limit: LIST_BATCH_SIZE });
+      fresh = await readSlotsSince(this.env.BUCKET, feedId, sinceTs);
     } catch {
       return;
     }
-    const fresh: { slot_id: string; created_at: number }[] = [];
-    for (let i = 0; i < list.objects.length; i += SLOT_HEAD_CONCURRENCY) {
-      const slice = list.objects.slice(i, i + SLOT_HEAD_CONCURRENCY);
-      const heads = await Promise.all(
-        slice.map((o) => this.env.BUCKET.head(o.key)),
-      );
-      for (let j = 0; j < slice.length; j++) {
-        const createdAt = parseTs(heads[j]?.customMetadata?.created_at);
-        if (createdAt === null || createdAt <= sinceTs) continue;
-        fresh.push({
-          slot_id: slice[j].key.slice(prefix.length),
-          created_at: createdAt,
-        });
-      }
-    }
-    fresh.sort((a, b) => a.created_at - b.created_at);
     for (const s of fresh) this.frame(conn, s.slot_id, s.created_at);
   }
 
@@ -146,7 +130,9 @@ export class FeedNotifier {
 
   private frame(conn: Conn, slotId: string, createdAt: number): void {
     const data = JSON.stringify({ slot_id: slotId, created_at: createdAt });
-    this.write(conn, `id: ${createdAt}\ndata: ${data}\n\n`);
+    // The slot id is the collision-free event id; created_at (seconds) would
+    // collide for two posts in the same second if Last-Event-ID is ever wired up.
+    this.write(conn, `id: ${slotId}\ndata: ${data}\n\n`);
   }
 
   private write(conn: Conn, s: string): void {
@@ -170,12 +156,6 @@ export class FeedNotifier {
       // already closed/errored
     }
   }
-}
-
-function parseTs(s: string | undefined): number | null {
-  if (s === undefined) return null;
-  const n = Number.parseInt(s, 10);
-  return Number.isFinite(n) ? n : null;
 }
 
 function parseSince(s: string | null): number {

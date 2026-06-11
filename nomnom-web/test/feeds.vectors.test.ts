@@ -51,6 +51,20 @@ describe("Ed25519", () => {
   });
 });
 
+describe("Ed25519 adversarial verify (cross-impl agreement)", () => {
+  // Each vector records the CLI's verdict for a crafted input (valid, corrupt R,
+  // corrupt S, wrong msg/pub, non-canonical S >= L, zero sig). @noble/curves must
+  // return the SAME verdict, or the two implementations have diverged on
+  // malleability/canonicality — exactly what the hand-rolled CLI impl risks.
+  for (const [i, x] of v.verify.entries()) {
+    it(`vector ${i} (${x.label}): TS verify agrees with the CLI (${x.valid})`, () => {
+      expect(
+        ed25519Verify(hexToBytes(x.msgHex), hexToBytes(x.sigHex), hexToBytes(x.pubHex)),
+      ).toBe(x.valid);
+    });
+  }
+});
+
 describe("feed key derivation", () => {
   it("derives the feed key from the URL token", () => {
     expect(hex(feedKeyFromToken(v.token))).toBe(v.feedKeyHex);

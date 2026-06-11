@@ -43,14 +43,20 @@ export class RelayClient {
         headers: { Authorization: relayAuthHeader(this.config.secret, "GET", path) },
         signal,
       });
-      if (res.status !== 401) return "ok";
-      let reason = "";
-      try {
-        reason = ((await res.json()) as { error?: string })?.error ?? "";
-      } catch {
-        // non-JSON 401 body — treat as a plain rejection
+      // A good secret hits the missing slot → 404. Fail closed: only 404 means
+      // "ok"; 401 distinguishes skew vs reject; anything else (5xx, a stripped
+      // proxy response) is unexpected, so don't claim the passphrase is valid.
+      if (res.status === 404) return "ok";
+      if (res.status === 401) {
+        let reason = "";
+        try {
+          reason = ((await res.json()) as { error?: string })?.error ?? "";
+        } catch {
+          // non-JSON 401 body — treat as a plain rejection
+        }
+        return reason === "clock-skew" ? "skew" : "rejected";
       }
-      return reason === "clock-skew" ? "skew" : "rejected";
+      return "unreachable";
     } catch {
       return "unreachable";
     }

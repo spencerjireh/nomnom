@@ -55,6 +55,57 @@
       "sigHex": "3ec938cc5f97236c622a32d86eb1f0aa4b794e91a67933811a2b9c9ca9f101529138be3f9d33089c8d8724d5b24fc805d4a434574d4471c68341d7bc1dfa6701"
     }
   ],
+  "verify": [
+    {
+      "label": "valid",
+      "msgHex": "616476657273617269616c20766563746f7273",
+      "sigHex": "b64a03df1d84ae6a1c0ae89c2535fe141bb79c5dad1c23c90e32f0f7fcc3b70bd2a3a61c255eb7e579920bdcae28426e09a6a40dc4594ac00bb538d5463f6508",
+      "pubHex": "03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8",
+      "valid": true
+    },
+    {
+      "label": "flipped-r",
+      "msgHex": "616476657273617269616c20766563746f7273",
+      "sigHex": "b74a03df1d84ae6a1c0ae89c2535fe141bb79c5dad1c23c90e32f0f7fcc3b70bd2a3a61c255eb7e579920bdcae28426e09a6a40dc4594ac00bb538d5463f6508",
+      "pubHex": "03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8",
+      "valid": false
+    },
+    {
+      "label": "flipped-s",
+      "msgHex": "616476657273617269616c20766563746f7273",
+      "sigHex": "b64a03df1d84ae6a1c0ae89c2535fe141bb79c5dad1c23c90e32f0f7fcc3b70bd3a3a61c255eb7e579920bdcae28426e09a6a40dc4594ac00bb538d5463f6508",
+      "pubHex": "03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8",
+      "valid": false
+    },
+    {
+      "label": "wrong-msg",
+      "msgHex": "6120646966666572656e74206d657373616765",
+      "sigHex": "b64a03df1d84ae6a1c0ae89c2535fe141bb79c5dad1c23c90e32f0f7fcc3b70bd2a3a61c255eb7e579920bdcae28426e09a6a40dc4594ac00bb538d5463f6508",
+      "pubHex": "03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8",
+      "valid": false
+    },
+    {
+      "label": "wrong-pub",
+      "msgHex": "616476657273617269616c20766563746f7273",
+      "sigHex": "b64a03df1d84ae6a1c0ae89c2535fe141bb79c5dad1c23c90e32f0f7fcc3b70bd2a3a61c255eb7e579920bdcae28426e09a6a40dc4594ac00bb538d5463f6508",
+      "pubHex": "29acbae141bccaf0b22e1a94d34d0bc7361e526d0bfe12c89794bc9322966dd7",
+      "valid": false
+    },
+    {
+      "label": "non-canonical-s",
+      "msgHex": "616476657273617269616c20766563746f7273",
+      "sigHex": "b64a03df1d84ae6a1c0ae89c2535fe141bb79c5dad1c23c90e32f0f7fcc3b70bbf779c793fc1c93d502f037f8d22218309a6a40dc4594ac00bb538d5463f6518",
+      "pubHex": "03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8",
+      "valid": false
+    },
+    {
+      "label": "zero-sig",
+      "msgHex": "616476657273617269616c20766563746f7273",
+      "sigHex": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+      "pubHex": "03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8",
+      "valid": false
+    }
+  ],
   "seal": [
     {
       "filename": "bundle.txt",

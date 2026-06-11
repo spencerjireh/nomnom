@@ -1,5 +1,6 @@
 import { useRef, useState } from "react";
 import { MAX_PAYLOAD_BYTES } from "../config";
+import { fmtSize } from "../util/format";
 
 /** A staged payload: metadata now, bytes read lazily at send time (the worker
  * transfer detaches the buffer, so we read a fresh one per send). */
@@ -11,17 +12,6 @@ export interface StagedPayload {
 
 const enc = new TextEncoder();
 
-export function fmtSize(n: number): string {
-  if (n < 1000) return `${n} B`;
-  const u = ["KB", "MB", "GB"];
-  let v = n / 1000;
-  let i = 0;
-  while (v >= 1000 && i < u.length - 1) {
-    v /= 1000;
-    i++;
-  }
-  return `${v < 10 ? v.toFixed(1) : Math.round(v)} ${u[i]}`;
-}
 
 /** File picker + drag-drop + text mode. Rejects >100 MB before any crypto. */
 export function FileDrop({

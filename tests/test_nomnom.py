@@ -562,11 +562,11 @@ class TestCycleVerb:
 
 
 class TestComputeSummary:
-    def _node(self, rel, *, is_dir=False, checked=False, size=0):
+    def _node(self, rel, *, is_dir=False, checked=False, size=0, tokens=0):
         return nomnom.Node(
             rel=rel, name=rel.rsplit("/", 1)[-1], is_dir=is_dir,
             depth=rel.count("/"), parent=None,
-            checked=checked, size=size,
+            checked=checked, size=size, tokens=tokens,
         )
 
     def test_empty_selection(self):
@@ -575,18 +575,19 @@ class TestComputeSummary:
 
     def test_mixed_excludes_dirs(self):
         nodes = [
-            self._node("src", is_dir=True, checked=True, size=999),
-            self._node("src/a.py", checked=True, size=400),
-            self._node("src/b.py", checked=False, size=800),
-            self._node("c.py", checked=True, size=400),
+            self._node("src", is_dir=True, checked=True, size=999, tokens=250),
+            self._node("src/a.py", checked=True, size=400, tokens=100),
+            self._node("src/b.py", checked=False, size=800, tokens=200),
+            self._node("c.py", checked=True, size=400, tokens=100),
         ]
-        # Two checked files, 800 bytes total, 200 approx tokens.
+        # Two checked files: 800 bytes, tokens summed from the nodes (not
+        # recomputed from bytes), so the footer total equals the per-row totals.
         assert nomnom.compute_summary(nodes) == (2, 800, 200)
 
     def test_all_checked(self):
         nodes = [
-            self._node("a.py", checked=True, size=400),
-            self._node("b.py", checked=True, size=600),
+            self._node("a.py", checked=True, size=400, tokens=100),
+            self._node("b.py", checked=True, size=600, tokens=150),
         ]
         assert nomnom.compute_summary(nodes) == (2, 1000, 250)
 
@@ -642,6 +643,13 @@ class TestFormatFooter:
         # with "verb: bundle" implied by the default.
         out = nomnom.format_footer(nomnom.Destination.FILE, True, (1, 100, 25), 120)
         assert "verb: bundle" in out
+
+    def test_token_block_has_single_tilde(self):
+        # _fmt_tokens already prepends "~"; the footer must not add a second
+        # one (regression guard against the "~~1.2KT" double-tilde bug).
+        out = nomnom.format_footer(nomnom.Destination.FILE, True, (3, 4096, 1024), 120)
+        assert "~~" not in out
+        assert nomnom._fmt_tokens(1024) in out
 
 
 # ---------- --include / --exclude filters ----------
@@ -1072,7 +1080,7 @@ class TestCommitScreen:
         s = nomnom.CommitScreen()
         assert s.step == "inputs"
         assert s.field_cursor == 0
-        assert s.repo_buf == str(tmp_path)
+        assert s.bufs["repo"] == str(tmp_path)
         assert s.destination == nomnom.Destination.FILE
 
     def test_tab_cycles_fields(self):
@@ -1093,10 +1101,10 @@ class TestCommitScreen:
 
     def test_path_edit_appends_chars(self):
         s = nomnom.CommitScreen()
-        s.repo_buf = ""
+        s.bufs["repo"] = ""
         s.handle_key(ord("/"))
         s.handle_key(ord("a"))
-        assert s.repo_buf == "/a"
+        assert s.bufs["repo"] == "/a"
 
     def test_q_returns_back(self):
         s = nomnom.CommitScreen()
@@ -1104,7 +1112,7 @@ class TestCommitScreen:
 
     def test_execute_captures_stdout_stderr(self, monkeypatch):
         s = nomnom.CommitScreen()
-        s.repo_buf = "/tmp/some-repo"
+        s.bufs["repo"] = "/tmp/some-repo"
 
         def fake_cmd_commit(repo, *, destination):
             print("stdout line")
@@ -1119,7 +1127,7 @@ class TestCommitScreen:
 
     def test_execute_handles_nomnom_error(self, monkeypatch):
         s = nomnom.CommitScreen()
-        s.repo_buf = "/tmp/some-repo"
+        s.bufs["repo"] = "/tmp/some-repo"
 
         def boom(repo, *, destination):
             raise nomnom.NomnomError("not a git repository: /tmp/some-repo")
@@ -1145,12 +1153,12 @@ class TestPRScreen:
         # since 'd' is intercepted first, dest cycles even when on base.
         # We verify by testing base editing with non-d chars.
         s.field_cursor = 1
-        s.base_buf = ""
+        s.bufs["base"] = ""
         s.handle_key(ord("m"))
         s.handle_key(ord("a"))
         s.handle_key(ord("i"))
         s.handle_key(ord("n"))
-        assert s.base_buf == "main"
+        assert s.bufs["base"] == "main"
 
     def test_run_passes_base_to_cmd_pr(self, monkeypatch):
         called: dict = {}
@@ -1162,8 +1170,8 @@ class TestPRScreen:
             return 0
         monkeypatch.setattr(nomnom, "cmd_pr", fake_cmd_pr)
         s = nomnom.PRScreen()
-        s.repo_buf = "/tmp/r"
-        s.base_buf = "develop"
+        s.bufs["repo"] = "/tmp/r"
+        s.bufs["base"] = "develop"
         s.destination = nomnom.Destination.CLIPBOARD
         s.handle_key(10)
         assert called == {"repo": "/tmp/r", "base": "develop",
@@ -1177,8 +1185,8 @@ class TestPRScreen:
             return 0
         monkeypatch.setattr(nomnom, "cmd_pr", fake_cmd_pr)
         s = nomnom.PRScreen()
-        s.repo_buf = "/tmp/r"
-        s.base_buf = ""
+        s.bufs["repo"] = "/tmp/r"
+        s.bufs["base"] = ""
         s.handle_key(10)
         assert called["base"] is None
 
@@ -1194,7 +1202,7 @@ class TestItemScreen:
         s.field_cursor = 1  # focus id
         for ch in "v1.2.3":
             s.handle_key(ord(ch))
-        assert s.id_buf == "v1.2.3"
+        assert s.bufs["id"] == "v1.2.3"
 
     def test_diff_toggled_by_space_when_focused(self):
         s = nomnom.ItemScreen()
@@ -1209,8 +1217,8 @@ class TestItemScreen:
         monkeypatch.setattr(nomnom, "cmd_item",
                             lambda *a, **k: 0)
         s = nomnom.ItemScreen()
-        s.repo_buf = "/tmp/r"
-        s.id_buf = ""
+        s.bufs["repo"] = "/tmp/r"
+        s.bufs["id"] = ""
         s.handle_key(10)
         assert s.rc == 1
         assert "required" in s.error.lower()
@@ -1230,8 +1238,8 @@ class TestItemScreen:
             return 0
         monkeypatch.setattr(nomnom, "cmd_item", fake_cmd_item)
         s = nomnom.ItemScreen()
-        s.repo_buf = "/tmp/r"
-        s.id_buf = "42"
+        s.bufs["repo"] = "/tmp/r"
+        s.bufs["id"] = "42"
         s.include_diff = True
         s.destination = nomnom.Destination.CLIPBOARD
         s.handle_key(10)
@@ -1252,8 +1260,8 @@ class TestItemScreen:
             return 0
         monkeypatch.setattr(nomnom, "cmd_item", fake_cmd_item)
         s = nomnom.ItemScreen()
-        s.repo_buf = "/tmp/r"
-        s.id_buf = "discussion 7"
+        s.bufs["repo"] = "/tmp/r"
+        s.bufs["id"] = "discussion 7"
         s.handle_key(10)
         assert called == {"kind_or_id": "discussion", "ident": "7"}
 
@@ -4701,7 +4709,9 @@ class _MockRelay:
         return f"http://127.0.0.1:{self.port}"
 
     def cfg(self) -> dict:
-        return {"url": self.url(), "secret": self.secret}
+        # Loopback dev server: opt into private addresses so _relay_open's
+        # per-request SSRF guard allows it (the legitimate --allow-private path).
+        return {"url": self.url(), "secret": self.secret, "allow_private": True}
 
     def stop(self):
         self.server.shutdown()
@@ -5005,6 +5015,41 @@ class TestEd25519:
         assert a != b
 
 
+class TestEd25519AdversarialVectors:
+    """Re-verify the shared adversarial fixture so the CLI's verdicts stay pinned.
+
+    The same vectors are asserted against @noble/curves in nomnom-web's
+    feeds.vectors.test.ts; together they guarantee the unaudited pure-Python
+    verify and the audited library can't diverge on malleable/non-canonical input.
+    """
+
+    _FIXTURE = (
+        Path(__file__).resolve().parents[1]
+        / "nomnom-web" / "test" / "fixtures" / "feeds-vectors.json"
+    )
+
+    def test_verify_matches_recorded_verdicts(self):
+        vectors = json.loads(self._FIXTURE.read_text(encoding="utf-8"))["verify"]
+        assert vectors, "expected adversarial verify vectors in the fixture"
+        for vec in vectors:
+            got = nomnom.ed25519_verify(
+                bytes.fromhex(vec["msgHex"]),
+                bytes.fromhex(vec["sigHex"]),
+                bytes.fromhex(vec["pubHex"]),
+            )
+            assert got is vec["valid"], f"verdict drift on {vec['label']!r}"
+
+    def test_rejects_non_canonical_s(self):
+        # A signature whose scalar S >= L (here S + L) must be rejected, matching
+        # @noble/curves — proves the canonical-S check is in force.
+        seed = bytes(range(32))
+        pub = nomnom.ed25519_pub_from_seed(seed)
+        sig = nomnom.ed25519_sign(b"canon", seed)
+        s = int.from_bytes(sig[32:], "little")
+        non_canonical = sig[:32] + (s + nomnom._ED_L).to_bytes(32, "little")
+        assert not nomnom.ed25519_verify(b"canon", non_canonical, pub)
+
+
 class TestFeedKeyDerivation:
     def test_deterministic(self):
         token = "k4n2pX9qLm3T"
@@ -5064,6 +5109,23 @@ class TestFeedSeal:
         assert header["smid"] == "mem-abc"
         assert header["sik"] == sig_pub
         assert header["fs"] == len(body)
+
+    def test_seal_rejects_mismatched_sig_pub(self):
+        # feed_seal holds both key halves; a pub that doesn't match the priv
+        # must fail locally rather than produce a post every receiver rejects.
+        feed_key = nomnom._feed_key_from_token("k4n2pX9qLm3T")
+        sig_priv, _ = self._seed_and_pub()
+        _, wrong_pub = self._seed_and_pub()
+        with pytest.raises(ValueError, match="sig_pub does not match sig_priv"):
+            nomnom.feed_seal(
+                feed_key=feed_key,
+                feed_id="k4n2pX9qLm3T",
+                sender_member_id="mem-abc",
+                sender_sig_priv_hex=sig_priv,
+                sender_sig_pub_hex=wrong_pub,
+                filename="hello.txt",
+                body=b"data",
+            )
 
     def test_open_rejects_wrong_feed_key(self):
         feed_key = nomnom._feed_key_from_token("k4n2pX9qLm3T")

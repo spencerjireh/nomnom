@@ -32,19 +32,19 @@ export async function putSlot(
       return errorResponse("payload-too-large", 413);
     }
   }
-  // 409 if slot is already occupied. R2 has no native "if-not-exists" so
-  // we read first. Race window is tiny but acceptable.
-  const existing = await bucket.head(key);
-  if (existing !== null) {
-    return errorResponse("slot-occupied", 409);
-  }
   if (req.body === null) {
     return errorResponse("empty-body", 400);
   }
   const expiresAt = Math.floor(Date.now() / 1000) + SLOT_TTL_SEC;
-  await bucket.put(key, req.body, {
+  // Atomic create-if-absent: the conditional put returns null when the slot
+  // already exists, so a racing PUT gets 409 instead of clobbering.
+  const created = await bucket.put(key, req.body, {
+    onlyIf: { etagDoesNotMatch: "*" },
     customMetadata: { expires_at: String(expiresAt) },
   });
+  if (created === null) {
+    return errorResponse("slot-occupied", 409);
+  }
   return new Response(null, { status: 204 });
 }
 

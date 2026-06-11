@@ -3,7 +3,7 @@
 // `Authorization: <prefix> <ts>:<mac>` parse path are crypto-adjacent and all
 // three modules (auth.ts, feed-auth.ts, feeds.ts, tests/helpers.ts) need them.
 
-const TIMESTAMP_WINDOW_SEC = 300;
+export const TIMESTAMP_WINDOW_SEC = 300;
 
 export type AuthResult =
   | { ok: true }
