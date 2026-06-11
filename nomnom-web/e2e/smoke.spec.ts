@@ -3,10 +3,10 @@ import { mkdtempSync, truncateSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-// Offline, secret-free smoke test of the nomnom-web feed-timeline UI. We never
-// hit the relay: the app is usable with no relay (join-only), and feed state is
-// seeded into localStorage directly (shapes mirror src/state/persistence.ts)
-// instead of opening/joining over the network. See playwright.config.ts for why
+// Offline, secret-free smoke test of the nomnom-web single-channel UI. We never
+// hit the relay: the app is usable with no relay (join/receive only), and channel
+// state is seeded into localStorage directly (shapes mirror src/state/persistence.ts)
+// instead of creating/joining over the network. See playwright.config.ts for why
 // interop lives elsewhere.
 
 const MAX_PAYLOAD_BYTES = 100 * 1024 * 1024; // keep in sync with src/config.ts
@@ -26,94 +26,83 @@ const RELAY = JSON.stringify({
   url: "https://relay.spencerjireh.com",
   secret: "not-a-real-secret",
 });
-const FEEDS = JSON.stringify({
-  feeds: [
-    {
-      name: "home",
-      feed_id: "testfeedtoken00",
-      feed_token: "testfeedtoken00",
-      url: "https://relay.spencerjireh.com/f/testfeedtoken00",
-      expires_at: 4102444800, // year 2100
-      joined_at: 1700000000,
-      member_id: SELF_MEMBER,
-      members_cache: [
-        { member_id: SELF_MEMBER, identity_pubkey: SELF_SIG_PUB, name: "web-guest" },
-        { member_id: PEER_MEMBER, identity_pubkey: PEER_SIG_PUB, name: "test-peer" },
-      ],
-      last_post_ts: 0,
-      auto_save: false,
-    },
+// The single channel = one stored Feed object under nomnom:channel.
+const CHANNEL = JSON.stringify({
+  name: "channel",
+  feed_id: "testfeedtoken00",
+  feed_token: "testfeedtoken00",
+  url: "https://relay.spencerjireh.com/f/testfeedtoken00",
+  expires_at: 4102444800, // year 2100
+  joined_at: 1700000000,
+  member_id: SELF_MEMBER,
+  members_cache: [
+    { member_id: SELF_MEMBER, identity_pubkey: SELF_SIG_PUB, name: "web-guest" },
+    { member_id: PEER_MEMBER, identity_pubkey: PEER_SIG_PUB, name: "test-peer" },
   ],
+  last_post_ts: 0,
+  auto_save: false,
 });
 
 interface SeedOptions {
-  withFeed?: boolean;
+  withChannel?: boolean;
   withRelay?: boolean;
-  selectFeed?: string | null;
 }
 
-/** Seed a device. `withFeed` adds the `home` feed; `withRelay` adds a relay;
- * `selectFeed` writes the last-selected-feed pointer (drives initial pane). */
+/** Seed a device. `withChannel` adds the channel; `withRelay` adds a relay. */
 async function seed(
   page: Page,
-  { withFeed = true, withRelay = false, selectFeed = null }: SeedOptions = {},
+  { withChannel = true, withRelay = false }: SeedOptions = {},
 ): Promise<void> {
   await page.addInitScript(
-    ([identity, feeds, relay, hasFeed, hasRelay, sel]) => {
+    ([identity, channel, relay, hasChannel, hasRelay]) => {
       localStorage.setItem("nomnom:schema", "2");
       localStorage.setItem("nomnom:identity", identity as string);
-      if (hasFeed) localStorage.setItem("nomnom:feeds", feeds as string);
+      if (hasChannel) localStorage.setItem("nomnom:channel", channel as string);
       if (hasRelay) localStorage.setItem("nomnom:relay", relay as string);
-      if (sel) localStorage.setItem("nomnom:lastSelectedFeed", JSON.stringify(sel));
     },
-    [IDENTITY, FEEDS, RELAY, withFeed, withRelay, selectFeed] as const,
+    [IDENTITY, CHANNEL, RELAY, withChannel, withRelay] as const,
   );
 }
 
-test.describe("nomnom-web feed-timeline UI smoke (offline, secret-free)", () => {
-  test("with no feeds and no relay, the warm empty pane is the right pane", async ({ page }) => {
-    await seed(page, { withFeed: false });
+test.describe("nomnom-web single-channel UI smoke (offline, secret-free)", () => {
+  test("with no channel and no relay, the bootstrap pane offers paste-to-join", async ({ page }) => {
+    await seed(page, { withChannel: false });
     await page.goto("/");
 
-    await expect(page.getByRole("heading", { name: "a warm place to drop a file" })).toBeVisible();
-    await expect(page.getByText(/open a feed \(you host\)/)).toBeVisible();
-    // Without a relay, opening is gated.
-    await expect(page.getByText(/opening a feed needs a relay/)).toBeVisible();
-    // Rail still offers join even without a relay.
-    await expect(page.getByRole("button", { name: "+ join" })).toBeEnabled();
-    await expect(page.getByRole("button", { name: "+ open" })).toBeDisabled();
+    await expect(
+      page.getByRole("heading", { name: "add this device to your channel" }),
+    ).toBeVisible();
+    // The channel-secret input + join button are the primary path.
+    await expect(page.getByPlaceholder(/\/f\/<token>/)).toBeVisible();
+    await expect(page.getByRole("button", { name: "join" })).toBeDisabled(); // empty input
+    // Without a relay, creating a channel is gated.
+    await expect(page.getByText(/creating a channel needs a relay/)).toBeVisible();
+    // The rail shows there's no channel yet.
+    await expect(page.getByText("no channel yet.")).toBeVisible();
   });
 
-  test("a seeded feed appears in the rail and opens into the timeline pane", async ({ page }) => {
+  test("a seeded channel auto-opens into the timeline pane", async ({ page }) => {
     await seed(page);
     await page.goto("/");
 
-    // Rail shows the feed; nothing selected yet → empty pane on the right.
-    const feedRow = page.getByRole("button", { name: /home/ });
-    await expect(feedRow).toBeVisible();
-    await expect(page.getByRole("heading", { name: "a warm place to drop a file" })).toBeVisible();
-
-    await feedRow.click();
-
-    // Feed view header + empty timeline state.
-    await expect(page.getByRole("heading", { name: "home" })).toBeVisible();
+    // No selection step — the one channel shows immediately.
+    await expect(page.getByRole("heading", { name: "your channel" })).toBeVisible();
     await expect(page.getByText("nothing here yet.")).toBeVisible();
-    // Other-members count rendered.
-    await expect(page.getByText("1 other")).toBeVisible();
+    // Other-device count rendered.
+    await expect(page.getByText("1 other device")).toBeVisible();
 
-    // Members footer collapses by default; expanding lists members.
-    await page.getByText(/members \(2\)/).click();
+    // Devices footer collapses by default; expanding lists devices.
+    await page.getByText(/devices \(2\)/).click();
     await expect(page.getByText("test-peer")).toBeVisible();
-    await expect(page.getByLabel(/auto-save files from this feed/)).not.toBeChecked();
+    await expect(page.getByLabel(/auto-save files from this channel/)).not.toBeChecked();
   });
 
   test("the composer rejects a file over the 100 MB cap", async ({ page }) => {
-    await seed(page, { selectFeed: "home" });
+    await seed(page);
     await page.goto("/");
 
-    // Feed pre-selected via lastSelectedFeed.
-    await expect(page.getByRole("heading", { name: "home" })).toBeVisible();
-    const sendBtn = page.getByRole("button", { name: /serve it up/ });
+    await expect(page.getByRole("heading", { name: "your channel" })).toBeVisible();
+    const sendBtn = page.getByRole("button", { name: "send", exact: true });
     await expect(sendBtn).toBeDisabled(); // nothing staged yet
 
     // A sparse file just over the cap — the dropzone reads only `file.size` on
@@ -128,7 +117,7 @@ test.describe("nomnom-web feed-timeline UI smoke (offline, secret-free)", () => 
     await expect(sendBtn).toBeDisabled();
   });
 
-  test("factory reset wipes the seeded feed back to the empty pane", async ({ page }) => {
+  test("factory reset wipes the seeded channel back to the bootstrap pane", async ({ page }) => {
     await seed(page);
     await page.goto("/");
 
@@ -136,16 +125,18 @@ test.describe("nomnom-web feed-timeline UI smoke (offline, secret-free)", () => 
     await page.getByRole("button", { name: "reset this device" }).click();
     await page.getByRole("button", { name: "wipe everything" }).click();
 
-    await expect(page.getByRole("heading", { name: "a warm place to drop a file" })).toBeVisible();
-    await expect(page.getByText("no feeds yet.")).toBeVisible();
+    await expect(
+      page.getByRole("heading", { name: "add this device to your channel" }),
+    ).toBeVisible();
+    await expect(page.getByText("no channel yet.")).toBeVisible();
   });
 
-  test("lastSelectedFeed restores the feed view after a reload", async ({ page }) => {
-    await seed(page, { selectFeed: "home" });
+  test("the channel restores the timeline view after a reload", async ({ page }) => {
+    await seed(page);
     await page.goto("/");
-    await expect(page.getByRole("heading", { name: "home" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "your channel" })).toBeVisible();
 
     await page.reload();
-    await expect(page.getByRole("heading", { name: "home" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "your channel" })).toBeVisible();
   });
 });

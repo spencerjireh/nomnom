@@ -73,7 +73,7 @@ export function Settings({ onClose }: { onClose: () => void }) {
 
         <hr className="dashed" />
 
-        <p className="field-label">relay (only needed to open feeds)</p>
+        <p className="field-label">relay (only needed to create a channel)</p>
         <label className="field">
           <span className="field-label dim">url</span>
           <input value={url} onChange={(e) => setUrl(e.target.value)} />
@@ -122,8 +122,8 @@ export function Settings({ onClose }: { onClose: () => void }) {
         {confirmReset ? (
           <div className="reset-confirm">
             <p className="err">
-              this wipes your identity, all feeds and pins, and the relay passphrase from this
-              browser. you&apos;ll need to re-open or re-join feeds.
+              this wipes your identity, the channel and pins, and the relay passphrase from this
+              browser. you&apos;ll need to re-create or re-join your channel.
             </p>
             <div className="modal-actions">
               <button type="button" className="btn ghost" onClick={() => setConfirmReset(false)}>

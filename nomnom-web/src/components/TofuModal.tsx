@@ -14,10 +14,10 @@ export function TofuModal() {
     <div className="modal-backdrop" role="dialog" aria-modal="true">
       <section className="ticket modal">
         <div className="ticket-head">
-          <span>** NEW MEMBER **</span>
+          <span>** NEW DEVICE **</span>
         </div>
         <p>
-          first contact with <strong>{request.peerName}</strong> on this feed.
+          first contact with <strong>{request.peerName}</strong> on your channel.
         </p>
         <p className="kv">
           <span className="dim">fingerprint</span>{" "}
