@@ -6,7 +6,6 @@
 // carries an `id`; the worker replies with zero or more `progress` then exactly
 // one `result` or `error`.
 
-import type { Identity } from "../crypto/identity";
 import type { FeedHeader } from "../crypto/feeds";
 
 export type ProgressPhase = "xor";
@@ -28,24 +27,25 @@ export interface FeedOpenReq {
 }
 
 export interface WorkerRequests {
-  generateIdentity: { name?: string };
   feedSeal: FeedSealReq;
   feedOpen: FeedOpenReq;
 }
 
 export interface WorkerResults {
-  generateIdentity: Identity;
   feedSeal: { blob: ArrayBuffer };
   feedOpen: { header: FeedHeader; body: ArrayBuffer };
 }
 
 export type WorkerOp = keyof WorkerRequests;
 
-export interface RequestMessage<Op extends WorkerOp = WorkerOp> {
+export interface RequestEnvelope<Op extends WorkerOp> {
   id: number;
   op: Op;
   payload: WorkerRequests[Op];
 }
+
+// Distributed over WorkerOp so `switch (req.op)` narrows `req.payload`.
+export type RequestMessage = { [Op in WorkerOp]: RequestEnvelope<Op> }[WorkerOp];
 
 export type ResponseMessage =
   | { id: number; kind: "progress"; phase: ProgressPhase; fraction: number }

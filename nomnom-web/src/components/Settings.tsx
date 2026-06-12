@@ -57,7 +57,7 @@ export function Settings({ onClose }: { onClose: () => void }) {
             <button
               type="button"
               className="chip"
-              onClick={() => setName(name.trim() || identity!.name)}
+              onClick={() => setName(name.trim())}
               disabled={!name.trim() || name === identity?.name}
             >
               save

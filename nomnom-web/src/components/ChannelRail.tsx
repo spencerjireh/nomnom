@@ -2,7 +2,7 @@ import { useStore } from "../state/store";
 
 /** Left rail: brand, the single channel's status, and settings. Bootstrapping
  * (paste a secret / create a channel) lives in the main pane, not here. */
-export function FeedRail({ onOpenSettings }: { onOpenSettings: () => void }) {
+export function ChannelRail({ onOpenSettings }: { onOpenSettings: () => void }) {
   const channel = useStore((s) => s.channel);
 
   const others = channel

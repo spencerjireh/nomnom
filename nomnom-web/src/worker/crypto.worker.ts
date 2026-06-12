@@ -4,11 +4,10 @@
 
 /// <reference lib="webworker" />
 
-import { generateIdentity, feedSeal, feedOpen, hexToBytes } from "../crypto";
+import { feedSeal, feedOpen, hexToBytes } from "../crypto";
 import type {
   RequestMessage,
   ResponseMessage,
-  WorkerOp,
   WorkerResults,
   ProgressPhase,
 } from "./protocol";
@@ -24,15 +23,10 @@ function progress(id: number, phase: ProgressPhase, fraction: number): void {
 }
 
 async function handle(req: RequestMessage): Promise<{ result: unknown; transfer: Transferable[] }> {
-  const { id, op, payload } = req;
-  switch (op) {
-    case "generateIdentity": {
-      const p = payload as RequestMessage<"generateIdentity">["payload"];
-      return done<"generateIdentity">(generateIdentity(p.name));
-    }
-
+  const id = req.id;
+  switch (req.op) {
     case "feedSeal": {
-      const p = payload as RequestMessage<"feedSeal">["payload"];
+      const p = req.payload;
       const blob = await feedSeal({
         feedKey: hexToBytes(p.feedKeyHex),
         feedId: p.feedId,
@@ -49,7 +43,7 @@ async function handle(req: RequestMessage): Promise<{ result: unknown; transfer:
     }
 
     case "feedOpen": {
-      const p = payload as RequestMessage<"feedOpen">["payload"];
+      const p = req.payload;
       const { header, body } = await feedOpen({
         feedKey: hexToBytes(p.feedKeyHex),
         feedId: p.feedId,
@@ -64,17 +58,10 @@ async function handle(req: RequestMessage): Promise<{ result: unknown; transfer:
     }
 
     default: {
-      const _exhaustive: never = op;
-      throw new Error(`unknown op: ${String(_exhaustive)}`);
+      const _exhaustive: never = req;
+      throw new Error(`unknown op: ${JSON.stringify(_exhaustive)}`);
     }
   }
-}
-
-function done<Op extends WorkerOp>(result: WorkerResults[Op]): {
-  result: unknown;
-  transfer: Transferable[];
-} {
-  return { result, transfer: [] };
 }
 
 ctx.onmessage = async (e: MessageEvent<RequestMessage>) => {

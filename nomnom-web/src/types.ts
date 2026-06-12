@@ -54,27 +54,8 @@ export interface TofuRequest {
 
 export type OnTofu = (req: TofuRequest) => Promise<boolean>;
 
-/** Coarse phase for the transfer panel; `label` carries the human string. */
-export type Phase =
-  | "idle"
-  | "preparing"
-  | "encrypting"
-  | "transferring"
-  | "decrypting"
-  | "done"
-  | "error";
-
-export type OnProgress = (phase: Phase, label: string, fraction: number) => void;
-
-export interface TransferResult {
-  name?: string;
-  bytes?: number;
-  /** send: how many other members the post reaches. */
-  recipients?: number;
-  /** receive: sender display name + the downloaded file name. */
-  peerName?: string;
-  outName?: string;
-}
+/** Progress callback: overall fraction in [0, 1]. Rendered on timeline rows. */
+export type OnProgress = (fraction: number) => void;
 
 /** A row in a feed's session timeline — either a file we sent or a file we
  * received. `body` is only attached while a received file is held awaiting

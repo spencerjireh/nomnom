@@ -2,7 +2,7 @@
 // with TOFU prompts. Mirror nomnom.py cmd_open / cmd_join / _refresh_roster_with_tofu.
 // The UI layer (hooks) wires these to the store; nothing here touches React.
 
-import { FeedClient, mintFeed, type MemberCard } from "../relay/feed-client";
+import { FeedClient, mintFeed } from "../relay/feed-client";
 import { feedKeyFromToken } from "../crypto/feeds";
 import { ikFingerprint } from "../crypto/fingerprint";
 import { bytesToHexDigest } from "../crypto/hex";
@@ -25,23 +25,22 @@ export interface FeedContext {
   identity: Identity;
   feedKey: Uint8Array;
   feedKeyHex: string;
-  host: string;
   client: FeedClient;
 }
 
 export function feedContext(feed: Feed, identity: Identity): FeedContext {
   const feedKey = feedKeyFromToken(feed.feed_token);
+  const origin = new URL(feed.url).origin;
   return {
     feed,
     identity,
     feedKey,
     feedKeyHex: bytesToHexDigest(feedKey),
-    host: new URL(feed.url).origin,
-    client: new FeedClient(new URL(feed.url).origin),
+    client: new FeedClient(origin),
   };
 }
 
-function memberCard(identity: Identity, memberId: string): MemberCard {
+function memberCard(identity: Identity, memberId: string): Member {
   return { member_id: memberId, identity_pubkey: identity.sig_pub, name: identity.name };
 }
 
