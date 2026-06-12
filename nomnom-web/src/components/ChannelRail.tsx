@@ -2,7 +2,13 @@ import { useStore } from "../state/store";
 
 /** Left rail: brand, the single channel's status, and settings. Bootstrapping
  * (paste a secret / create a channel) lives in the main pane, not here. */
-export function ChannelRail({ onOpenSettings }: { onOpenSettings: () => void }) {
+export function ChannelRail({
+  onOpenSettings,
+  onCollapse,
+}: {
+  onOpenSettings: () => void;
+  onCollapse: () => void;
+}) {
   const channel = useStore((s) => s.channel);
 
   const others = channel
@@ -13,6 +19,14 @@ export function ChannelRail({ onOpenSettings }: { onOpenSettings: () => void }) 
     <aside className="rail" aria-label="channel">
       <div className="rail-brand">
         <span className="logo">NOMNOM</span>
+        <button
+          type="button"
+          className="rail-collapse chip"
+          aria-label="hide sidebar"
+          onClick={onCollapse}
+        >
+          «
+        </button>
       </div>
 
       <div className="rail-channel">

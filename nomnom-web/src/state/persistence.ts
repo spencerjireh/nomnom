@@ -17,6 +17,7 @@ const K = {
   lastSelectedFeed: "nomnom:lastSelectedFeed",
   peers: "nomnom:peers",
   schema: "nomnom:schema",
+  railCollapsed: "nomnom:railCollapsed",
 } as const;
 
 // Schema 2 = feeds v2 (Ed25519 identity). A schema-1 (legacy DH) identity is
@@ -117,6 +118,10 @@ export const persistence = {
 
   loadPeers: (): PeerStore => read<PeerStore>(K.peers) ?? {},
   savePeers: (peers: PeerStore): void => write(K.peers, peers),
+
+  // UI preference, not channel state: whether the left rail is hidden.
+  loadRailCollapsed: (): boolean => read<boolean>(K.railCollapsed) === true,
+  saveRailCollapsed: (collapsed: boolean): void => write(K.railCollapsed, collapsed),
 
   reset: (): void => {
     for (const key of Object.values(K)) {
