@@ -23,8 +23,15 @@ function tofuHooks(): TofuHooks {
   };
 }
 
-/** Send one file to every other device on the channel. */
-export async function send(payload: { name: string; data: ArrayBuffer }): Promise<void> {
+/** Send one payload to every other device on the channel. The bytes are read
+ * lazily inside the try so a failed read (e.g. a staged file deleted from disk
+ * before send) surfaces as a failed timeline row like any other send error.
+ * Never throws — all outcomes land on the row. */
+export async function send(payload: {
+  name: string;
+  size: number;
+  read: () => Promise<ArrayBuffer>;
+}): Promise<void> {
   const s = useStore.getState();
   const feed = s.channel;
   if (!s.identity || !feed) return;
@@ -33,7 +40,7 @@ export async function send(payload: { name: string; data: ArrayBuffer }): Promis
     id,
     kind: "send",
     name: payload.name,
-    bytes: payload.data.byteLength,
+    bytes: payload.size,
     at: Date.now(),
     status: "in_flight",
     progress: 0,
@@ -41,10 +48,11 @@ export async function send(payload: { name: string; data: ArrayBuffer }): Promis
   const abort = new AbortController();
   s.beginSend(abort);
   try {
+    const data = await payload.read();
     const result = await runSend({
       feed,
       identity: s.identity,
-      payload,
+      payload: { name: payload.name, data },
       hooks: tofuHooks(),
       onProgress: (f) => useStore.getState().patchTimelineEntry(id, { progress: f }),
       onRoster: (roster) => useStore.getState().patchChannel({ members_cache: roster }),
@@ -92,6 +100,7 @@ export async function receive(feed: Feed, signal: AbortSignal): Promise<void> {
             at: Date.now(),
             peerName: f.peerName,
             status: "saved",
+            body: f.body,
           });
         } else {
           useStore.getState().appendTimeline({
@@ -118,17 +127,18 @@ export async function receive(feed: Feed, signal: AbortSignal): Promise<void> {
   }
 }
 
-/** Save a held received file to disk and mark the timeline row as saved. */
+/** Save a received file to disk. The body stays in memory so view / copy /
+ * re-save keep working after the download; only discard drops the bytes. */
 export function saveHeld(id: string): void {
   const row = useStore.getState().timeline.find((r) => r.id === id);
-  if (!row || row.status !== "held" || !row.body) return;
+  if (!row || !row.body) return;
   downloadBlob(row.name, row.body);
-  useStore.getState().patchTimelineEntry(id, { status: "saved", body: undefined });
+  useStore.getState().patchTimelineEntry(id, { status: "saved" });
 }
 
-/** Drop a held received file from memory without writing it to disk. */
+/** Discard a received file: remove its row (and bytes) from the timeline. */
 export function discardHeld(id: string): void {
-  useStore.getState().patchTimelineEntry(id, { status: "discarded", body: undefined });
+  useStore.getState().removeTimelineEntry(id);
 }
 
 /** Create the channel (owner only — needs a configured relay). Throws on failure. */
