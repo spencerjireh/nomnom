@@ -759,17 +759,6 @@ class TestLauncherScreen:
         assert isinstance(result, nomnom.Screen)
 
 
-class TestPlaceholderScreen:
-    def test_q_returns_back(self):
-        s = nomnom.PlaceholderScreen("Test", "body")
-        assert s.handle_key(ord("q")) == nomnom.ScreenAction.BACK
-        assert s.handle_key(27) == nomnom.ScreenAction.BACK
-
-    def test_other_keys_continue(self):
-        s = nomnom.PlaceholderScreen("Test", "body")
-        assert s.handle_key(ord("x")) == nomnom.ScreenAction.CONTINUE
-
-
 class TestRebuildScreen:
     def _make_bundle(self, tmp_path, repo="r", files=(("a.py", "x\n"),)) -> Path:
         body = (
@@ -3452,6 +3441,25 @@ class TestCmdRebuild:
         err = capsys.readouterr().err
         assert "rebuilt 2 files in myrepo/" in err
 
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores dir modes")
+    def test_unwritable_cwd_fails_cleanly(self, tmp_path, monkeypatch, capsys):
+        src = tmp_path / "src"
+        src.mkdir()
+        bundle = self._bundle(src, {"a.py": "x\n"})
+        bundle_file = tmp_path / "bundle.txt"
+        bundle_file.write_text(bundle, encoding="utf-8")
+
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        monkeypatch.chdir(out_dir)
+        out_dir.chmod(0o500)  # no write permission
+        try:
+            rc = nomnom.cmd_rebuild(str(bundle_file), None)
+        finally:
+            out_dir.chmod(0o700)
+        assert rc == 1  # was an unhandled OSError traceback before
+        assert "cannot create" in capsys.readouterr().err
+
     def test_name_override(self, tmp_path, monkeypatch):
         src = tmp_path / "src"
         src.mkdir()
@@ -4014,7 +4022,10 @@ class TestSendDestination:
         return tmp_path, feed, posts
 
     def test_label(self):
-        assert nomnom._DESTINATION_LABELS[nomnom.Destination.SEND] == "send"
+        footer = nomnom.format_footer(
+            nomnom.Destination.SEND, True, (0, 0, 0), 120,
+        )
+        assert "dest: send" in footer
 
     def test_cycle_includes_send_when_allowed(self):
         D = nomnom.Destination
@@ -4464,6 +4475,28 @@ class TestCmdReceiveStream:
         assert "no /stream" in err  # announced the fallback
         assert (tmp_path / "from-bob.txt").read_bytes() == b"hello alice"
 
+    def test_fallback_resumes_from_persisted_cursor(self, env, monkeypatch):
+        # Regression: a mid-stream _StreamUnsupported (e.g. relay redeployed
+        # without /stream) must not rewind the long-poll fallback to the
+        # cursor captured before the stream delivered posts.
+        tmp_path, feed, _bob_post = env
+        monkeypatch.chdir(tmp_path)
+
+        def fake_stream(host, fid, fkey, *, since_fn, stop=None):
+            yield {"slot_id": "slot-1", "created_at": 5}  # persists cursor=5
+            raise nomnom._StreamUnsupported()  # reconnect hits a 404
+
+        monkeypatch.setattr(nomnom, "_relay_stream_feed_slots", fake_stream)
+        seen_since: list[int] = []
+
+        def fake_list(host, fid, fkey, *, since_ts=0, wait_ms=0):
+            seen_since.append(since_ts)
+            raise KeyboardInterrupt  # end the fallback loop immediately
+
+        monkeypatch.setattr(nomnom, "_relay_list_feed_slots", fake_list)
+        nomnom.cmd_receive()
+        assert seen_since == [5]  # was [0] before the fix: stale local cursor
+
 
 class TestJoinToken:
     def test_format_then_parse_round_trip(self):
@@ -4537,10 +4570,10 @@ class TestRelayConfig:
     def test_clear_removes_file(self, tmp_path, monkeypatch):
         monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
         nomnom._save_relay_config("https://relay.example", "x")
-        assert nomnom._relay_clear_config() is True
+        nomnom._relay_clear_config()
         assert nomnom._load_relay_config() is None
-        # second call is a no-op
-        assert nomnom._relay_clear_config() is False
+        # second call is a no-op (does not raise)
+        nomnom._relay_clear_config()
 
 class TestRelayHmac:
     def test_headers_have_expected_shape(self):
@@ -5469,8 +5502,10 @@ class TestCmdJoin:
         assert cfg["feeds"][0].feed_id == "ZZZ987654321"
 
     def test_join_rejects_malformed_secret(self, fake_feed_endpoints, capsys):
-        rc = nomnom.cmd_join(argparse.Namespace(secret="not-a-url"))
+        # Through the dispatcher: cmd_join lets NomnomError propagate there.
+        rc = nomnom._dispatch_subcommand(["join", "not-a-url"])
         assert rc == 1
+        assert "error:" in capsys.readouterr().err
 
 
 class TestCmdChannel:
