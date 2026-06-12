@@ -1,8 +1,8 @@
 import { useEffect, useState } from "react";
 import { useStore } from "../state/store";
-import { useTransfer } from "../hooks/useTransfer";
-import { FeedRail } from "./FeedRail";
-import { FeedView } from "./FeedView";
+import { receive } from "../state/actions";
+import { ChannelRail } from "./ChannelRail";
+import { ChannelView } from "./ChannelView";
 import { EmptyPane } from "./EmptyPane";
 import { Settings } from "./Settings";
 import { TofuModal } from "./TofuModal";
@@ -12,7 +12,9 @@ import { TofuModal } from "./TofuModal";
 export function Shell() {
   const identity = useStore((s) => s.identity);
   const channel = useStore((s) => s.channel);
-  const { receive } = useTransfer();
+  // Key the watch on feed_id only: roster/last_post_ts mutations on the
+  // channel object would otherwise restart the loop on every poll.
+  const channelFeedId = channel?.feed_id;
 
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [nicknameBannerDismissed, setNicknameBannerDismissed] = useState(false);
@@ -22,14 +24,13 @@ export function Shell() {
   // mint credential, which gates create() alone. So a join-only device (no relay
   // configured) still receives. Re-pairing aborts the old loop.
   useEffect(() => {
-    if (!channel) return;
+    if (!channelFeedId) return;
+    const ch = useStore.getState().channel;
+    if (!ch) return;
     const abort = new AbortController();
-    receive(channel, abort.signal);
+    receive(ch, abort.signal);
     return () => abort.abort();
-    // Key only on feed_id: roster/last_post_ts mutations would otherwise restart
-    // the loop on every poll.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [channel?.feed_id]);
+  }, [channelFeedId]);
 
   if (!identity) return null;
 
@@ -38,7 +39,7 @@ export function Shell() {
 
   return (
     <main className={channel ? "shell has-selection" : "shell"}>
-      <FeedRail onOpenSettings={() => setSettingsOpen(true)} />
+      <ChannelRail onOpenSettings={() => setSettingsOpen(true)} />
 
       <div className="shell-pane">
         {channel ? (
@@ -67,7 +68,7 @@ export function Shell() {
                 </button>
               </div>
             )}
-            <FeedView feed={channel} />
+            <ChannelView channel={channel} />
           </>
         ) : (
           <EmptyPane onNeedRelay={() => setSettingsOpen(true)} />

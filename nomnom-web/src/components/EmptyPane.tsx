@@ -1,6 +1,6 @@
 import { useState } from "react";
-import { useStore } from "../state/store";
-import { useTransfer } from "../hooks/useTransfer";
+import { useStore, useSending } from "../state/store";
+import { openChannel, joinChannel } from "../state/actions";
 import { friendlyRelayMessage } from "../relay/errors";
 
 /** Bootstrap pane shown when this device has no channel yet: paste a secret to
@@ -8,7 +8,7 @@ import { friendlyRelayMessage } from "../relay/errors";
  * the channel. */
 export function EmptyPane({ onNeedRelay }: { onNeedRelay: () => void }) {
   const relay = useStore((s) => s.relay);
-  const { open, join, sending } = useTransfer();
+  const sending = useSending();
 
   const [secret, setSecret] = useState("");
   const [working, setWorking] = useState<null | "open" | "join">(null);
@@ -20,7 +20,7 @@ export function EmptyPane({ onNeedRelay }: { onNeedRelay: () => void }) {
     setError(null);
     setWorking("join");
     try {
-      await join(secret.trim());
+      await joinChannel(secret.trim());
       setSecret("");
     } catch (e) {
       setError(friendlyRelayMessage(e));
@@ -33,7 +33,7 @@ export function EmptyPane({ onNeedRelay }: { onNeedRelay: () => void }) {
     setError(null);
     setWorking("open");
     try {
-      await open();
+      await openChannel();
     } catch (e) {
       setError(friendlyRelayMessage(e));
     } finally {

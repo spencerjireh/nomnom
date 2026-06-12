@@ -355,4 +355,21 @@ describe("legacy /slots/:id (unchanged)", () => {
     const get2Res = await SELF.fetch(get2);
     expect(get2Res.status).toBe(404);
   });
+
+  it("rejects a malformed slot id with 400", async () => {
+    const req = await signedHmacRequest("GET", "/slots/bad!id");
+    const res = await SELF.fetch(req);
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as { error: string }).error).toBe("bad-slot-id");
+  });
+});
+
+describe("malformed ids", () => {
+  it("rejects a malformed feed id with 400 (before auth)", async () => {
+    // The feed-id grammar check runs before signature verification, so no
+    // auth header is needed to exercise it.
+    const res = await SELF.fetch(`${BASE}/feeds/x/meta`);
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as { error: string }).error).toBe("bad-feed-id");
+  });
 });

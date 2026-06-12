@@ -62,7 +62,7 @@ export async function verifyFeedKey(
     missing: "missing-feed-mac",
     bad: "bad-feed-mac",
   });
-  if ("ok" in parsed) return parsed;
+  if (!parsed.ok) return parsed;
 
   let feedKey: Uint8Array;
   try {

@@ -5,7 +5,7 @@ import { cryptoClient } from "../worker/cryptoClient";
 import { feedContext, refreshRoster, type TofuHooks } from "./feed-actions";
 import { randomToken } from "../util/ids";
 import { MAX_PAYLOAD_BYTES } from "../config";
-import type { Feed, Identity, Member, OnProgress, TransferResult } from "../types";
+import type { Feed, Identity, Member, OnProgress } from "../types";
 
 export interface SendParams {
   feed: Feed;
@@ -17,7 +17,8 @@ export interface SendParams {
   signal: AbortSignal;
 }
 
-export async function runSend(p: SendParams): Promise<TransferResult> {
+/** Returns the number of other members the post reaches. */
+export async function runSend(p: SendParams): Promise<{ recipients: number }> {
   const byteLength = p.payload.data.byteLength; // capture before the buffer transfers
   if (byteLength === 0) {
     // A transferred/detached ArrayBuffer reads as length 0 on the main thread
@@ -30,12 +31,11 @@ export async function runSend(p: SendParams): Promise<TransferResult> {
   }
   const ctx = feedContext(p.feed, p.identity);
 
-  p.onProgress("preparing", "refreshing roster", 0);
+  p.onProgress(0);
   const roster = await refreshRoster(ctx, p.hooks, p.signal);
   p.onRoster?.(roster);
   const others = roster.filter((m) => m.member_id !== p.feed.member_id);
 
-  p.onProgress("encrypting", "encrypting", 0);
   const blob = await cryptoClient.feedSeal(
     {
       feedKeyHex: ctx.feedKeyHex,
@@ -46,11 +46,11 @@ export async function runSend(p: SendParams): Promise<TransferResult> {
       filename: p.payload.name,
       data: p.payload.data,
     },
-    (_phase, fraction) => p.onProgress("encrypting", "encrypting", fraction),
+    (_phase, fraction) => p.onProgress(fraction),
   );
 
-  p.onProgress("transferring", "broadcasting", 0.95);
+  p.onProgress(0.95);
   await ctx.client.putSlot(ctx.feed.feed_id, ctx.feedKey, randomToken(12), new Uint8Array(blob), p.signal);
-  p.onProgress("done", "done", 1);
-  return { name: p.payload.name, bytes: byteLength, recipients: others.length };
+  p.onProgress(1);
+  return { recipients: others.length };
 }

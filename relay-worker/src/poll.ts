@@ -4,7 +4,8 @@
 // setTimeout idle does not count against Workers CPU time, so a 30s
 // long-poll fits comfortably under the free tier wall-clock cap.
 
-const MAX_BUDGET_MS = 30_000;
+import { pollDeadline, sleep } from "./http";
+
 const POLL_INTERVAL_MS = 500;
 
 export async function pollSlot(
@@ -12,7 +13,7 @@ export async function pollSlot(
   key: string,
   budgetMs: number,
 ): Promise<R2ObjectBody | null> {
-  const deadline = Date.now() + Math.min(Math.max(budgetMs, 0), MAX_BUDGET_MS);
+  const deadline = pollDeadline(budgetMs);
   while (true) {
     const obj = await bucket.get(key);
     if (obj) return obj;
@@ -20,8 +21,4 @@ export async function pollSlot(
     if (remaining <= 0) return null;
     await sleep(Math.min(POLL_INTERVAL_MS, remaining));
   }
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }

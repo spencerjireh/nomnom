@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
 import { useStore } from "../state/store";
-import { useTransfer } from "../hooks/useTransfer";
+import { saveHeld, discardHeld } from "../state/actions";
 import { fmtSize, clock } from "../util/format";
 import { looksLikeText, decodePreview, decodeText, PREVIEW_CAP_BYTES } from "../textPreview";
 import type { TimelineEntry } from "../types";
@@ -9,7 +9,6 @@ import type { TimelineEntry } from "../types";
  * held receives show [save] / [discard]; everything else is a static row. */
 export function Timeline() {
   const rows = useStore((s) => s.timeline);
-  const { saveHeld, discardHeld } = useTransfer();
 
   if (rows.length === 0) {
     return (

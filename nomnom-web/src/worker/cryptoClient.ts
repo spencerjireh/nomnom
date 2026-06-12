@@ -4,7 +4,7 @@
 // transfer runs at a time.
 
 import type {
-  RequestMessage,
+  RequestEnvelope,
   ResponseMessage,
   WorkerOp,
   WorkerRequests,
@@ -13,7 +13,6 @@ import type {
   FeedSealReq,
   FeedOpenReq,
 } from "./protocol";
-import type { Identity } from "../crypto/identity";
 
 type ProgressFn = (phase: ProgressPhase, fraction: number) => void;
 
@@ -69,7 +68,7 @@ class CryptoClient {
         reject,
         onProgress: opts.onProgress,
       });
-      const msg: RequestMessage<Op> = { id, op, payload };
+      const msg: RequestEnvelope<Op> = { id, op, payload };
       try {
         worker.postMessage(msg, opts.transfer ?? []);
       } catch (err) {
@@ -90,10 +89,6 @@ class CryptoClient {
       this.worker = null;
     }
     this.failAll(new Error("cancelled"));
-  }
-
-  generateIdentity(name?: string): Promise<Identity> {
-    return this.call("generateIdentity", { name });
   }
 
   async feedSeal(req: FeedSealReq, onProgress?: ProgressFn): Promise<ArrayBuffer> {

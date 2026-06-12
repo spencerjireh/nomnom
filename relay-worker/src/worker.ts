@@ -22,7 +22,7 @@
 
 import { verifyHmac } from "./auth";
 import { verifyFeedKey } from "./feed-auth";
-import { errorResponse } from "./http";
+import { errorResponse, parseSinceTs } from "./http";
 import {
   closeFeed,
   deleteMember,
@@ -36,9 +36,9 @@ import {
   putMember,
   validateFeedId,
   validateMemberId,
-  validateSlotId as validateFeedSlotId,
+  validateSlotId,
 } from "./feeds";
-import { deleteSlot, getSlot, putSlot, validateSlotId } from "./slots";
+import { deleteSlot, getSlot, putSlot } from "./slots";
 import { FeedNotifier } from "./feed-notifier";
 
 export { FeedNotifier };
@@ -86,12 +86,6 @@ function parseWaitMs(url: URL): number {
   return Number.isFinite(n) && n > 0 ? n : 0;
 }
 
-function parseSinceTs(url: URL): number {
-  const s = url.searchParams.get("since") ?? "0";
-  const n = Number.parseInt(s, 10);
-  return Number.isFinite(n) && n >= 0 ? n : 0;
-}
-
 // A matched /feeds/:id/* route. `guard` (optional) validates a path capture and
 // short-circuits with an error before any method handler runs. `Allow` for 405s
 // is derived from `methods`, so it can't drift from the registered handlers.
@@ -118,7 +112,10 @@ async function routeFeed(
       re: /^\/members$/,
       methods: {
         GET: () =>
-          listMembers(bucket, feedId, parseWaitMs(url), parseSinceTs(url), ctx),
+          listMembers(
+            bucket, feedId, parseWaitMs(url),
+            parseSinceTs(url.searchParams.get("since")), ctx,
+          ),
       },
     },
     {
@@ -138,13 +135,16 @@ async function routeFeed(
       re: /^\/slots$/,
       methods: {
         GET: () =>
-          listFeedSlots(bucket, feedId, parseWaitMs(url), parseSinceTs(url), ctx),
+          listFeedSlots(
+            bucket, feedId, parseWaitMs(url),
+            parseSinceTs(url.searchParams.get("since")), ctx,
+          ),
       },
     },
     {
       re: /^\/slots\/([^/]+)$/,
       guard: (m) =>
-        validateFeedSlotId(m[1]) ? null : errorResponse("bad-slot-id", 400),
+        validateSlotId(m[1]) ? null : errorResponse("bad-slot-id", 400),
       methods: {
         PUT: (m) => putFeedSlot(bucket, feedId, m[1], req, env.FEED_NOTIFIER, ctx),
         GET: (m) => getFeedSlot(bucket, feedId, m[1], parseWaitMs(url), ctx),
@@ -174,7 +174,9 @@ async function streamFeed(env: Env, feedId: string, url: URL): Promise<Response>
       `&since=${encodeURIComponent(since)}`,
   );
   if (res.status !== 200 || res.body === null) {
-    return new Response(res.body, { status: res.status });
+    // Pass the DO's error through unchanged (withCors copies headers into a
+    // fresh Response, so immutability is not a concern).
+    return res;
   }
   // Pipe the DO stream through a local TransformStream so a client cancel is
   // absorbed here instead of surfacing as an unhandled rejection from the DO
@@ -230,7 +232,7 @@ async function route(
     const feedId = feedMatch[1];
     const subpath = feedMatch[2] ?? "";
     if (!validateFeedId(feedId)) {
-      return errorResponse("bad-feed-id", 403);
+      return errorResponse("bad-feed-id", 400);
     }
     const auth = await verifyFeedKey(req, feedId);
     if (!auth.ok) {
@@ -248,7 +250,7 @@ async function route(
     }
     const slotId = slotMatch[1];
     if (!validateSlotId(slotId)) {
-      return errorResponse("bad-slot-id", 403);
+      return errorResponse("bad-slot-id", 400);
     }
     if (req.method === "PUT") return await putSlot(env.BUCKET, slotId, req);
     if (req.method === "GET") {

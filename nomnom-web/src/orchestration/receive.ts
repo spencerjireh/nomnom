@@ -6,11 +6,12 @@
 // Mirrors nomnom.py cmd_receive.
 
 import { cryptoClient } from "../worker/cryptoClient";
-import { feedContext, refreshRoster, type TofuHooks } from "./feed-actions";
+import { feedContext, refreshRoster, type FeedContext, type TofuHooks } from "./feed-actions";
 import { RELAY_WAIT_MS } from "../config";
 import { StreamUnsupportedError } from "../relay/errors";
+import { sleep } from "../util/sleep";
 import type { FeedHeader } from "../crypto/feeds";
-import type { Feed, Identity, Member, OnProgress } from "../types";
+import type { Feed, Identity, Member } from "../types";
 
 export interface ReceivedFile {
   name: string;
@@ -23,17 +24,18 @@ export interface ReceiveParams {
   feed: Feed;
   identity: Identity;
   hooks: TofuHooks;
-  onProgress: OnProgress;
   onFile: (f: ReceivedFile) => void;
   /** Persist forward progress (last_post_ts). */
   onAdvance: (lastPostTs: number) => void;
   onRoster?: (roster: Member[]) => void;
   signal: AbortSignal;
+  /** Test seam: pre-built context (key + client). Defaults to feedContext(feed, identity). */
+  ctx?: FeedContext;
 }
 
 /** Watch until aborted; returns the number of files received. */
 export async function runReceive(p: ReceiveParams): Promise<number> {
-  const ctx = feedContext(p.feed, p.identity);
+  const ctx = p.ctx ?? feedContext(p.feed, p.identity);
   let lastTs = p.feed.last_post_ts;
   let roster: Member[] = p.feed.members_cache ?? [];
   let count = 0;
@@ -138,6 +140,9 @@ export async function runReceive(p: ReceiveParams): Promise<number> {
   };
 
   // Long-poll fallback used when the relay has no /stream endpoint.
+  // Self-healing like rosterLoop: a transient relay/network error backs off
+  // and retries — it must never reject, or the watch would die for the rest
+  // of the session while the roster loop polls on as an orphan.
   const longPollLoop = async () => {
     while (!p.signal.aborted) {
       let slots;
@@ -147,9 +152,10 @@ export async function runReceive(p: ReceiveParams): Promise<number> {
           waitMs: RELAY_WAIT_MS,
           signal: p.signal,
         });
-      } catch (e) {
+      } catch {
         if (p.signal.aborted) break;
-        throw e;
+        await sleep(RELAY_WAIT_MS, p.signal);
+        continue;
       }
       for (const entry of slots) {
         if (p.signal.aborted) break;
@@ -158,39 +164,32 @@ export async function runReceive(p: ReceiveParams): Promise<number> {
     }
   };
 
+  // Same self-healing contract for the SSE path: streamSlotEvents reconnects
+  // internally on transport errors, but a throw from the consumer body
+  // (processSlot's callbacks) would otherwise escape and wedge the watch.
   const slotLoop = async () => {
-    p.onProgress("transferring", "watching feed", 0);
-    try {
-      for await (const entry of ctx.client.streamSlotEvents(
-        ctx.feed.feed_id,
-        ctx.feedKey,
-        { getSince: () => lastTs, signal: p.signal },
-      )) {
-        await processSlot(entry.slot_id, entry.created_at ?? 0);
+    while (!p.signal.aborted) {
+      try {
+        for await (const entry of ctx.client.streamSlotEvents(
+          ctx.feed.feed_id,
+          ctx.feedKey,
+          { getSince: () => lastTs, signal: p.signal },
+        )) {
+          await processSlot(entry.slot_id, entry.created_at ?? 0);
+        }
+        return; // the generator only returns cleanly on abort
+      } catch (e) {
+        if (p.signal.aborted) return;
+        if (e instanceof StreamUnsupportedError) {
+          // Relay predates /stream — long-poll for the rest of the session.
+          await longPollLoop();
+          return;
+        }
+        await sleep(RELAY_WAIT_MS, p.signal);
       }
-    } catch (e) {
-      if (p.signal.aborted) return;
-      if (!(e instanceof StreamUnsupportedError)) throw e;
-      // Relay predates /stream — long-poll for the rest of the session.
-      await longPollLoop();
     }
   };
 
   await Promise.all([rosterLoop(), slotLoop()]);
   return count;
-}
-
-function sleep(ms: number, signal: AbortSignal): Promise<void> {
-  return new Promise((resolve) => {
-    if (signal.aborted) return resolve();
-    const t = setTimeout(resolve, ms);
-    signal.addEventListener(
-      "abort",
-      () => {
-        clearTimeout(t);
-        resolve();
-      },
-      { once: true },
-    );
-  });
 }

@@ -14,7 +14,7 @@
 // signed URL — keeping each connection's `?auth` timestamp inside the relay's
 // ±300s window (EventSource auto-reconnects to the same, eventually-stale URL).
 
-import { errorResponse } from "./http";
+import { errorResponse, parseSinceTs } from "./http";
 import { TIMESTAMP_WINDOW_SEC } from "./crypto-util";
 import { readSlotsSince } from "./slot-index";
 
@@ -71,7 +71,7 @@ export class FeedNotifier {
 
   private async handleConnect(url: URL): Promise<Response> {
     const feedId = url.searchParams.get("feed") ?? "";
-    const sinceTs = parseSince(url.searchParams.get("since"));
+    const sinceTs = parseSinceTs(url.searchParams.get("since"));
 
     // `start` runs synchronously during construction, so `conn` is set before
     // we return. Subscribe BEFORE replaying the backlog so a post arriving
@@ -156,9 +156,4 @@ export class FeedNotifier {
       // already closed/errored
     }
   }
-}
-
-function parseSince(s: string | null): number {
-  const n = Number.parseInt(s ?? "0", 10);
-  return Number.isFinite(n) && n >= 0 ? n : 0;
 }

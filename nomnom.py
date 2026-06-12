@@ -34,7 +34,7 @@ import tempfile
 import threading
 import time
 import urllib.parse
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import NamedTuple, NoReturn, Tuple, TypeVar
@@ -727,14 +727,6 @@ class Destination(enum.IntEnum):
     SEND = 3
 
 
-_DESTINATION_LABELS = {
-    Destination.FILE: "file",
-    Destination.CLIPBOARD: "clipboard",
-    Destination.STDOUT: "stdout",
-    Destination.SEND: "send",
-}
-
-
 _E = TypeVar("_E", bound=enum.IntEnum)
 
 
@@ -764,14 +756,6 @@ class Verb(enum.IntEnum):
     COMMIT = 1
     PR = 2
     ITEM = 3
-
-
-_VERB_LABELS = {
-    Verb.BUNDLE: "bundle",
-    Verb.COMMIT: "commit",
-    Verb.PR: "pr",
-    Verb.ITEM: "item",
-}
 
 
 def cycle_verb(v: Verb, allowed: tuple[Verb, ...] | None = None) -> Verb:
@@ -811,8 +795,8 @@ def format_footer(
     left = f"selected: {files} files"
     stats = f" | {_fmt_size(total_bytes)} {_fmt_tokens(approx_tokens)}"
     right = (
-        f"verb: {_VERB_LABELS[verb]}  "
-        f"dest: {_DESTINATION_LABELS[dest]}  "
+        f"verb: {verb.name.lower()}  "
+        f"dest: {dest.name.lower()}  "
         f"tree: {'on' if include_tree else 'off'}"
     )
     full_left = left + stats
@@ -863,7 +847,8 @@ def render_preview(
     if size > PREVIEW_MAX_BYTES:
         return [_clip(f"(too large to preview, {_fmt_size(size)})", max_cols)]
     try:
-        raw = path.read_bytes()[: min(8192, max_lines * max_cols * 2)]
+        with open(path, "rb") as f:
+            raw = f.read(min(8192, max_lines * max_cols * 2))
     except OSError:
         return [_clip("(unreadable)", max_cols)]
     text = raw.decode("utf-8", errors="replace")
@@ -1431,6 +1416,38 @@ def pick_target_dir(cwd: Path, name: str) -> Path:
     return _unique_path(cwd / name, start=1)
 
 
+def _write_bundle_files(
+    target: Path, files: list[tuple[str, str]],
+) -> tuple[int, str | None]:
+    """Create `target` and write the parsed bundle files into it.
+
+    Returns (files_written, error). On error, writing stops; partial output
+    may remain. Shared by cmd_rebuild and the TUI RebuildScreen so OSError
+    handling and the path-escape re-check stay in lock-step.
+    """
+    target_resolved = target.resolve()
+    try:
+        target.mkdir(parents=True)
+    except OSError as e:
+        return 0, f"cannot create {target}: {e}"
+    written = 0
+    for rel, content in files:
+        dest = (target / rel).resolve()
+        # Belt-and-braces: even after _validate_rebuild_path, confirm the
+        # resolved write target is inside the freshly created folder.
+        try:
+            dest.relative_to(target_resolved)
+        except ValueError:
+            return written, f"refusing to write outside target: {rel!r}"
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text(content, encoding="utf-8")
+        except OSError as e:
+            return written, f"cannot write {dest}: {e}"
+        written += 1
+    return written, None
+
+
 # ---------- git/gh helpers ----------
 
 GIT_BUNDLE_WARN_BYTES = 200_000
@@ -1560,7 +1577,6 @@ def _emit_git_bundle(
     tree: str | None,
     destination: Destination,
     *,
-    interactive: bool = True,
     item_id: str | None = None,
 ) -> int:
     output = render_git_bundle(repo_name, kind, branch_label, sections, tree)
@@ -3205,25 +3221,10 @@ def cmd_rebuild(bundle_path: str | None, name: str | None) -> int:
 
     cwd = Path.cwd()
     target = pick_target_dir(cwd, folder_name)
-    target_resolved = target.resolve()
-    target.mkdir(parents=True)
-
-    written = 0
-    for rel, content in files:
-        dest = (target / rel).resolve()
-        # Belt-and-braces: even after _validate_rebuild_path, confirm the
-        # resolved write target is inside the freshly created folder.
-        try:
-            dest.relative_to(target_resolved)
-        except ValueError:
-            print(
-                f"error: refusing to write outside target: {rel!r}",
-                file=sys.stderr,
-            )
-            return 1
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_text(content, encoding="utf-8")
-        written += 1
+    written, err = _write_bundle_files(target, files)
+    if err is not None:
+        print(f"error: {err}", file=sys.stderr)
+        return 1
 
     try:
         rel_target: Path | str = target.relative_to(cwd)
@@ -4198,17 +4199,7 @@ class Feed:
     last_post_ts: int = 0
 
     def to_dict(self) -> dict:
-        return {
-            "name": self.name,
-            "feed_id": self.feed_id,
-            "feed_token": self.feed_token,
-            "url": self.url,
-            "expires_at": self.expires_at,
-            "joined_at": self.joined_at,
-            "member_id": self.member_id,
-            "members_cache": list(self.members_cache),
-            "last_post_ts": self.last_post_ts,
-        }
+        return asdict(self)
 
     @classmethod
     def from_dict(cls, d: dict) -> Feed:
@@ -4348,6 +4339,15 @@ def _add_or_replace_feed(config: dict, feed: Feed) -> dict:
     return config
 
 
+def _persist_members_cache(feed: Feed) -> None:
+    """Write feed.members_cache through to the stored copy in feeds.json."""
+    cfg = _load_feeds_config()
+    existing = _find_feed(cfg, feed.name)
+    if existing is not None:
+        existing.members_cache = feed.members_cache
+        _save_feeds_config(cfg)
+
+
 # ---------- Relay transport ----------
 # nomnom moves files through a Cloudflare Worker the user deploys to their
 # own account. The Worker is intentionally dumb: it stores HMAC-authenticated
@@ -4461,14 +4461,9 @@ def _save_relay_config(url: str, secret: str, *, allow_private: bool = False) ->
     _atomic_write_text(_relay_config_path(), json.dumps(config, indent=2))
 
 
-def _relay_clear_config() -> bool:
-    try:
+def _relay_clear_config() -> None:
+    with contextlib.suppress(OSError):
         _relay_config_path().unlink()
-        return True
-    except FileNotFoundError:
-        return False
-    except OSError:
-        return False
 
 
 # --- join token ---
@@ -4769,7 +4764,8 @@ def _raise_feed_error(status: int, body: bytes) -> NoReturn:
         raise NomnomError(
             "relay rejected feed-key signature. the feed URL may be wrong or stale.",
         )
-    if status == 403:
+    # Malformed ids arrive as 400 (older relays sent 403); both stay specific.
+    if status in (400, 403):
         raise NomnomError(f"relay refused feed request: {reason or '(no detail)'}")
     if status == 404:
         raise NomnomError("feed not found on relay")
@@ -5042,7 +5038,8 @@ def _raise_relay_error(status: int, body: bytes) -> NoReturn:
             "relay rejected authentication (wrong secret?). "
             "run `nomnom relay test` to diagnose.",
         )
-    if status == 403:
+    # Malformed ids arrive as 400 (older relays sent 403); both stay specific.
+    if status in (400, 403):
         raise NomnomError(f"relay refused slot id: {reason or '(no detail)'}")
     if status == 409:
         raise NomnomError("relay slot already occupied")
@@ -5060,7 +5057,7 @@ def _relay_self_test(relay: dict) -> tuple[int, str]:
     """End-to-end check: /health, then a round-trip PUT + GET on a random slot."""
     if not _relay_health(relay):
         return 1, "relay /health unreachable (URL wrong, or worker not deployed)"
-    slot = "selftest-" + secrets.token_urlsafe(16).rstrip("=")[:32]
+    slot = "selftest-" + secrets.token_urlsafe(16)
     blob = secrets.token_bytes(1024)
     start = time.monotonic()
     try:
@@ -5219,11 +5216,7 @@ def _feed_send_bytes(
     slot_id = secrets.token_urlsafe(12)
     _relay_put_feed_slot(host, target.feed_id, feed_key, slot_id, blob)
     # Persist the cache refresh.
-    cfg = _load_feeds_config()
-    existing = _find_feed(cfg, target.name)
-    if existing is not None:
-        existing.members_cache = roster
-        _save_feeds_config(cfg)
+    _persist_members_cache(target)
     lines.append(
         f"sent {filename!r} ({len(data)} bytes) to your channel "
         f"({len(others)} device(s)).",
@@ -5280,11 +5273,8 @@ def cmd_send(path: str, *, trust_new: bool = False) -> int:
     target = _resolve_target_feed()
     if target is None:
         return 1
-    try:
-        lines = _feed_send_bytes(target, data, p.name, trust_new=trust_new)
-    except NomnomError as e:
-        sys.stderr.write(f"error: {e}\n")
-        return 1
+    # NomnomError propagates to the dispatcher, which prints + returns 1.
+    lines = _feed_send_bytes(target, data, p.name, trust_new=trust_new)
     for ln in lines:
         sys.stderr.write(ln + "\n")
     return 0
@@ -5339,18 +5329,38 @@ def _receive_one_post(
     return (filename, len(body), sender_name, str(out))
 
 
+def _receive_and_report(
+    *, feed: Feed, host: str, feed_key: bytes, slot_id: str,
+) -> bool:
+    """Fetch/verify/write one post and narrate to stderr. True iff a file landed.
+
+    Shared by the SSE and long-poll receive paths so tamper handling
+    (raise -> warn + skip) stays identical between them.
+    """
+    try:
+        res = _receive_one_post(
+            feed=feed, host=host, feed_key=feed_key, slot_id=slot_id,
+        )
+    except NomnomError as e:
+        sys.stderr.write(f"warning: {e}\n")
+        return False
+    if res is None:
+        return False
+    filename, nbytes, sender, out_path = res
+    sys.stderr.write(
+        f"received {filename!r} ({nbytes} bytes) from {sender} -> {out_path}\n",
+    )
+    sys.stderr.flush()
+    return True
+
+
 def _receive_refresh_roster(
     feed: Feed, host: str, feed_key: bytes, trust_new: bool,
 ) -> None:
     """Refresh the roster (running TOFU prompts) and persist it onto `feed`."""
     roster = _refresh_roster_with_tofu(feed, host, feed_key, trust_new=trust_new)
     if roster is not None:
-        feed.members_cache = roster
-        cfg = _load_feeds_config()
-        existing = _find_feed(cfg, feed.name)
-        if existing is not None:
-            existing.members_cache = roster
-            _save_feeds_config(cfg)
+        _persist_members_cache(feed)
 
 
 def _receive_persist_ts(feed: Feed, last_ts: int) -> None:
@@ -5388,20 +5398,9 @@ def _cmd_receive_stream(
                 continue
             # Refresh before each post so a just-joined sender resolves + TOFUs.
             _receive_refresh_roster(target, host, feed_key, trust_new)
-            try:
-                res = _receive_one_post(
-                    feed=target, host=host, feed_key=feed_key, slot_id=slot_id,
-                )
-            except NomnomError as e:
-                sys.stderr.write(f"warning: {e}\n")
-                res = None
-            if res is not None:
-                filename, nbytes, sender, out_path = res
-                sys.stderr.write(
-                    f"received {filename!r} ({nbytes} bytes) "
-                    f"from {sender} -> {out_path}\n",
-                )
-                sys.stderr.flush()
+            if _receive_and_report(
+                feed=target, host=host, feed_key=feed_key, slot_id=slot_id,
+            ):
                 received_any = True
             if created_at > last_ts:
                 last_ts = created_at
@@ -5443,6 +5442,12 @@ def cmd_receive(*, once: bool = False, trust_new: bool = False) -> int:
                 "note: relay has no /stream endpoint; using long-poll.\n",
             )
             sys.stderr.flush()
+            # The stream path persisted its cursor into feeds.json, not into
+            # our local `target`; re-read so the long-poll resumes where the
+            # stream left off instead of replaying already-received posts.
+            ch = _the_channel()
+            if ch is not None:
+                last_ts = ch.last_post_ts
             # fall through to the long-poll loop below
     while True:
         # Roster refresh + TOFU prompts before each slot long-poll. Up to a
@@ -5466,31 +5471,19 @@ def cmd_receive(*, once: bool = False, trust_new: bool = False) -> int:
                 return 0 if received_any else 1
             continue
         # Iterate in chronological order; the Worker already sorts by created_at.
-        # Fetch/verify/write goes through the same _receive_one_post the stream
-        # path uses, so tamper handling (raise → warn + skip) is identical.
         for entry in slots:
             slot_id = entry.get("slot_id")
             created_at = int(entry.get("created_at") or 0)
-            res = None
+            landed = False
             if slot_id:
-                try:
-                    res = _receive_one_post(
-                        feed=target, host=host, feed_key=feed_key, slot_id=slot_id,
-                    )
-                except NomnomError as e:
-                    sys.stderr.write(f"warning: {e}\n")
-                    res = None
-                if res is not None:
-                    filename, nbytes, sender, out_path = res
-                    sys.stderr.write(
-                        f"received {filename!r} ({nbytes} bytes) "
-                        f"from {sender} -> {out_path}\n",
-                    )
-                    sys.stderr.flush()
+                landed = _receive_and_report(
+                    feed=target, host=host, feed_key=feed_key, slot_id=slot_id,
+                )
+                if landed:
                     received_any = True
             last_ts = max(last_ts, created_at)
             _receive_persist_ts(target, last_ts)
-            if once and res is not None:
+            if once and landed:
                 return 0
 
 
@@ -5596,10 +5589,7 @@ def _cmd_relay_init_interactive(*, allow_private: bool = False) -> dict | None:
         return None
     sys.stderr.write(f"saved to {_relay_config_path()} ({msg})\n")
     sys.stderr.write("\non the Worker side, run (if you haven't already):\n")
-    sys.stderr.write(
-        f"  echo {secret!r} | npx wrangler secret put NOMNOM_HMAC_SECRET\n"
-        "  npx wrangler deploy\n",
-    )
+    sys.stderr.write(_wrangler_deploy_hint(secret))
     return candidate
 
 
@@ -5647,13 +5637,10 @@ def cmd_init(args) -> int:
         "identity_pubkey": ident["sig_pub"],
         "name": ident["name"],
     }
-    try:
-        result = _relay_mint_feed(
-            relay, ttl_seconds=_PERMANENT_TTL_SEC, member_card=card,
-        )
-    except NomnomError as e:
-        sys.stderr.write(f"error: {e}\n")
-        return 1
+    # NomnomError propagates to the dispatcher, which prints + returns 1.
+    result = _relay_mint_feed(
+        relay, ttl_seconds=_PERMANENT_TTL_SEC, member_card=card,
+    )
 
     feed_id = str(result.get("feed_id") or "")
     if not feed_id:
@@ -5704,11 +5691,7 @@ def _refresh_channel_roster(feed: Feed) -> list[dict]:
     host, _ = _parse_feed_url(feed.url)
     members = _relay_list_members(host, feed.feed_id, feed_key).get("members") or []
     feed.members_cache = members
-    cfg = _load_feeds_config()
-    existing = _find_feed(cfg, feed.name)
-    if existing is not None:
-        existing.members_cache = members
-        _save_feeds_config(cfg)
+    _persist_members_cache(feed)
     return members
 
 
@@ -5783,11 +5766,8 @@ def cmd_join(args) -> int:
     credential for /feeds/:id/* endpoints. Replaces any channel already
     configured on this device, so re-pairing is just running this again.
     """
-    try:
-        feed = _join_channel(args.secret)
-    except NomnomError as e:
-        sys.stderr.write(f"error: {e}\n")
-        return 1
+    # NomnomError propagates to the dispatcher, which prints + returns 1.
+    feed = _join_channel(args.secret)
     sys.stderr.write(
         f"joined the channel ({len(feed.members_cache)} device(s)).\n",
     )
@@ -6195,45 +6175,9 @@ def _launcher_open(verb: str):
         return BundleScreen()
     if verb == "Receive":
         return ReceiveScreen()
-    return PlaceholderScreen(
-        verb,
-        f"`nomnom {verb.lower()}` works from the shell.",
-    )
-
-
-class PlaceholderScreen(Screen):
-    help_lines = ["Esc / q     back to launcher"]
-
-    def __init__(self, title: str, body: str) -> None:
-        self.title = title
-        self.body = body
-
-    def render(self, stdscr) -> None:  # pragma: no cover - curses I/O
-        theme = _setup_theme()
-        h, w = stdscr.getmaxyx()
-        try:
-            stdscr.addstr(0, 0, f" {self.title} ".ljust(max(1, w - 1)), theme["filter"])
-        except curses.error:
-            pass
-        for i, line in enumerate(_wrap(self.body, max(10, w - 4))):
-            row = 2 + i
-            if row >= h - 1:
-                break
-            try:
-                stdscr.addstr(row, 2, line, 0)
-            except curses.error:
-                pass
-        try:
-            stdscr.addstr(
-                h - 1, 0, "esc/q:back  ?:help"[: max(1, w - 1)], theme["dim"],
-            )
-        except curses.error:
-            pass
-
-    def handle_key(self, ch: int, stdscr=None):
-        if ch in (ord("q"), 3, 27):
-            return ScreenAction.BACK
-        return ScreenAction.CONTINUE
+    raise AssertionError(
+        f"unmapped launcher tile: {verb!r}",
+    )  # every tile in LauncherScreen.tiles is handled above
 
 
 class ReceiveScreen(Screen):
@@ -6267,10 +6211,7 @@ class ReceiveScreen(Screen):
         self._thread: "threading.Thread | None" = None
         self._stream_failed = False  # relay lacks /stream → cooperative long-poll
         if self.feed is None:
-            self.error = (
-                "no channel yet. run `nomnom init` (first device) or "
-                "`nomnom join <secret>` (other devices)."
-            )
+            self.error = _no_channel_hint()
             return
         try:
             self.feed_key = _feed_key_from_token(self.feed.feed_token)
@@ -6355,11 +6296,11 @@ class ReceiveScreen(Screen):
     def _handle_slot(self, slot_id: str) -> None:  # pragma: no cover - curses I/O
         """Fetch/verify/write one slot. Caller wraps this in `_tui_tofu` +
         redirect_stderr so prompts modal correctly and narration stays off-screen."""
-        roster = _refresh_roster_with_tofu(
+        # Updates self.feed.members_cache in place (TUI intentionally doesn't
+        # persist per-slot; ReceiveScreen persists the cursor separately).
+        _refresh_roster_with_tofu(
             self.feed, self.host, self.feed_key, trust_new=False,
         )
-        if roster is not None:
-            self.feed.members_cache = roster
         try:
             res = _receive_one_post(
                 feed=self.feed, host=self.host,
@@ -6376,11 +6317,7 @@ class ReceiveScreen(Screen):
             self.status = f"received {filename!r}"
 
     def _persist_ts(self) -> None:  # pragma: no cover - curses I/O
-        cfg_now = _load_feeds_config()
-        existing = _find_feed(cfg_now, self.feed.name)
-        if existing is not None and existing.last_post_ts != self.last_ts:
-            existing.last_post_ts = self.last_ts
-            _save_feeds_config(cfg_now)
+        _receive_persist_ts(self.feed, self.last_ts)
 
     def _poll_once(self, stdscr) -> ScreenAction:  # pragma: no cover - curses I/O
         """Cooperative long-poll fallback when the relay has no /stream."""
@@ -6507,33 +6444,16 @@ class RebuildScreen(Screen):
 
     def _write(self) -> None:
         assert self.target is not None
-        target_resolved = self.target.resolve()
-        try:
-            self.target.mkdir(parents=True)
-        except OSError as e:
-            self.error = f"cannot create {self.target}: {e}"
+        written, err = _write_bundle_files(self.target, self.files)
+        if err is not None:
+            self.error = err
             self.step = "done"
             return
-        for rel, content in self.files:
-            dest = (self.target / rel).resolve()
-            try:
-                dest.relative_to(target_resolved)
-            except ValueError:
-                self.error = f"refusing to write outside target: {rel!r}"
-                self.step = "done"
-                return
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            try:
-                dest.write_text(content, encoding="utf-8")
-            except OSError as e:
-                self.error = f"cannot write {dest}: {e}"
-                self.step = "done"
-                return
         try:
             shown = self.target.relative_to(Path.cwd())
         except ValueError:
             shown = self.target
-        self.message = f"wrote {len(self.files)} files into {shown}"
+        self.message = f"wrote {written} files into {shown}"
         self.step = "done"
 
     def render(self, stdscr) -> None:  # pragma: no cover - curses I/O
@@ -7098,7 +7018,6 @@ class BundleScreen(Screen):
             rc, lines = _emit_bundle(
                 repo_name, root, selected, result.include_tree,
                 result.destination,
-                interactive=False,
             )
         captured = (err_buf.getvalue() + out_buf.getvalue()).rstrip("\n")
         self.messages = list(lines)
@@ -7258,7 +7177,7 @@ class _GitContextScreen(Screen):
 
     def _field_value(self, fid: str) -> str:
         if fid == "dest":
-            return _DESTINATION_LABELS[self.destination]
+            return self.destination.name.lower()
         if fid in self._TEXT_FIDS:
             return self.bufs.get(fid, "") or self._PLACEHOLDERS.get(fid, "")
         return ""
@@ -8091,8 +8010,6 @@ def _emit_bundle(
     selected: list[str],
     include_tree: bool,
     destination: Destination,
-    *,
-    interactive: bool = True,
 ) -> tuple[int, list[str]]:
     """Render the bundle and dispatch to the chosen destination.
 
@@ -8203,9 +8120,9 @@ def _run_picker_verb(result: PickResult, root: Path, *, include_diff: bool) -> i
 
 
 def main() -> int:
-    # Trip any pin-store migration up front so the notice lands on stderr
-    # before either entry point claims the terminal (curses or CLI).
-    _load_known_peers()
+    # The notice helper loads the pin store, tripping any migration up front
+    # so its message lands on stderr before either entry point claims the
+    # terminal (curses or CLI).
     _maybe_print_v2_migration_notice()
 
     if len(sys.argv) >= 2 and sys.argv[1] in _RETIRED_VERBS:

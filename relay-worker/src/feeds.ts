@@ -22,12 +22,20 @@
 //   /feeds/:id/*                 — feed-key signature (URL token IS the credential)
 
 import { pollSlot } from "./poll";
-import { errorResponse, jsonResponse, sleep } from "./http";
+import {
+  MAX_BODY_BYTES,
+  errorResponse,
+  jsonResponse,
+  pollDeadline,
+  rejectBody,
+  sleep,
+} from "./http";
 import { urlsafeBase64Encode } from "./crypto-util";
 import {
   LIST_BATCH_SIZE,
   SLOT_HEAD_CONCURRENCY,
   SlotIndex,
+  headCreatedAts,
   parseTs,
 } from "./slot-index";
 
@@ -49,12 +57,10 @@ const MIN_TTL_SEC = 60; // 1 minute (sanity floor)
 const TOUCH_THROTTLE_SEC = 86_400; // 1 day
 const MAX_MEMBER_CARD_BYTES = 4096;
 const MAX_MEMBER_NAME_LEN = 128;
-const MAX_BODY_BYTES = 256 * 1024 * 1024; // 256 MB
 const MAX_MEMBER_COUNT = 64; // bound roster size per feed
 
 const MEMBER_POLL_INTERVAL_MS = 1000;
 const SLOT_LIST_POLL_INTERVAL_MS = 1000;
-const MAX_BUDGET_MS = 30_000;
 
 function byteLength(s: string): number {
   return new TextEncoder().encode(s).length;
@@ -74,13 +80,30 @@ export function validateSlotId(id: string): boolean {
 
 // ---------- POST /feeds ----------
 
+interface CardBody {
+  member_id: string;
+  identity_pubkey: string;
+  name: string;
+}
+
 interface MintBody {
   ttl_seconds?: number;
-  member_card: {
-    member_id: string;
-    identity_pubkey: string;
-    name: string;
-  };
+  member_card: CardBody;
+}
+
+// Shape + member-id grammar check shared by mintFeed and putMember.
+// `expectMemberId` additionally pins the body's member_id to the URL capture.
+function isValidCard(card: unknown, expectMemberId?: string): card is CardBody {
+  if (typeof card !== "object" || card === null) return false;
+  const c = card as Partial<CardBody>;
+  return (
+    typeof c.member_id === "string" &&
+    validateMemberId(c.member_id) &&
+    (expectMemberId === undefined || c.member_id === expectMemberId) &&
+    typeof c.identity_pubkey === "string" &&
+    typeof c.name === "string" &&
+    c.name.length <= MAX_MEMBER_NAME_LEN
+  );
 }
 
 export async function mintFeed(
@@ -97,14 +120,7 @@ export async function mintFeed(
 
   const ttl = clampTtl(body.ttl_seconds);
   const card = body.member_card;
-  if (
-    !card ||
-    typeof card.member_id !== "string" ||
-    !validateMemberId(card.member_id) ||
-    typeof card.identity_pubkey !== "string" ||
-    typeof card.name !== "string" ||
-    card.name.length > MAX_MEMBER_NAME_LEN
-  ) {
+  if (!isValidCard(card)) {
     return errorResponse("bad-member-card", 400);
   }
   const cardJson = JSON.stringify(card);
@@ -234,19 +250,13 @@ export async function putMember(
   if (byteLength(text) > MAX_MEMBER_CARD_BYTES) {
     return errorResponse("member-card-too-large", 413);
   }
-  let card: { member_id?: string; identity_pubkey?: string; name?: string };
+  let card: unknown;
   try {
     card = JSON.parse(text);
   } catch {
     return errorResponse("bad-json", 400);
   }
-  if (
-    typeof card.member_id !== "string" ||
-    card.member_id !== memberId ||
-    typeof card.identity_pubkey !== "string" ||
-    typeof card.name !== "string" ||
-    card.name.length > MAX_MEMBER_NAME_LEN
-  ) {
+  if (!isValidCard(card, memberId)) {
     return errorResponse("bad-member-card", 400);
   }
 
@@ -303,7 +313,7 @@ export async function listMembers(
   const live = await ensureFeedLive(bucket, feedId, ctx);
   if (!live.ok) return live.res;
 
-  const deadline = Date.now() + Math.min(Math.max(waitMs, 0), MAX_BUDGET_MS);
+  const deadline = pollDeadline(waitMs);
   // Cache parsed cards across long-poll iterations keyed by R2 key.
   // Member cards are immutable per (member_id, joined_at) tuple, so once a key
   // is in this map we never need to re-fetch its body. Per iteration we issue
@@ -322,21 +332,24 @@ export async function listMembers(
     for (const k of cards.keys()) {
       if (!currentKeys.has(k)) cards.delete(k);
     }
-    // Fetch bodies only for keys we haven't seen yet.
+    // Fetch bodies only for keys we haven't seen yet, chunked like the slot
+    // head scans to respect the Workers subrequest budget (up to
+    // MAX_MEMBER_COUNT + 1 members on the first iteration).
     const newObjs = list.objects.filter((o) => !cards.has(o.key));
-    if (newObjs.length > 0) {
-      const bodies = await Promise.all(newObjs.map((o) => bucket.get(o.key)));
-      for (let i = 0; i < newObjs.length; i++) {
-        const body = bodies[i];
+    for (let i = 0; i < newObjs.length; i += SLOT_HEAD_CONCURRENCY) {
+      const slice = newObjs.slice(i, i + SLOT_HEAD_CONCURRENCY);
+      const bodies = await Promise.all(slice.map((o) => bucket.get(o.key)));
+      for (let j = 0; j < slice.length; j++) {
+        const body = bodies[j];
         if (body === null) continue;
         const joinedAt = parseTs(body.customMetadata?.created_at) ?? 0;
-        let parsed: { member_id: string; identity_pubkey: string; name: string };
+        let parsed: CardBody;
         try {
           parsed = JSON.parse(await body.text());
         } catch {
           continue;
         }
-        cards.set(newObjs[i].key, {
+        cards.set(slice[j].key, {
           member_id: parsed.member_id,
           identity_pubkey: parsed.identity_pubkey,
           name: parsed.name,
@@ -371,16 +384,8 @@ export async function putFeedSlot(
   const live = await ensureFeedLive(bucket, feedId, ctx);
   if (!live.ok) return live.res;
 
-  const lenHdr = req.headers.get("Content-Length");
-  if (lenHdr !== null) {
-    const len = Number.parseInt(lenHdr, 10);
-    if (Number.isFinite(len) && len > MAX_BODY_BYTES) {
-      return errorResponse("payload-too-large", 413);
-    }
-  }
-  if (req.body === null) {
-    return errorResponse("empty-body", 400);
-  }
+  const rejected = rejectBody(req, MAX_BODY_BYTES);
+  if (rejected) return rejected;
   const key = `feeds/${feedId}/slots/${slotId}`;
   const now = Math.floor(Date.now() / 1000);
   const expiresAt = live.expiresAt ?? now + DEFAULT_TTL_SEC;
@@ -461,7 +466,7 @@ export async function listFeedSlots(
   // so the per-request subrequest count stays well under the free-tier cap. The
   // liveness gate above is connect-time only; a feed closed mid-poll keeps
   // serving until the deadline, which is acceptable for ~permanent channels.
-  const deadline = Date.now() + Math.min(Math.max(waitMs, 0), MAX_BUDGET_MS);
+  const deadline = pollDeadline(waitMs);
   // Cache slot created_at across long-poll iterations keyed by R2 key. Slots
   // are immutable once written; bucket.head returns the same created_at on
   // every call. Per iteration we issue ONE bucket.list to discover NEW keys
@@ -478,14 +483,8 @@ export async function listFeedSlots(
       if (!currentKeys.has(k)) seen.delete(k);
     }
     // Head only the new keys, chunked to respect the Workers subrequest cap.
-    for (let i = 0; i < newObjs.length; i += SLOT_HEAD_CONCURRENCY) {
-      const slice = newObjs.slice(i, i + SLOT_HEAD_CONCURRENCY);
-      const heads = await Promise.all(slice.map((o) => bucket.head(o.key)));
-      for (let j = 0; j < slice.length; j++) {
-        const createdAt = parseTs(heads[j]?.customMetadata?.created_at);
-        if (createdAt === null) continue;
-        seen.set(slice[j].key, createdAt);
-      }
+    for (const [key, createdAt] of await headCreatedAts(bucket, newObjs)) {
+      seen.set(key, createdAt);
     }
 
     const fresh: SlotIndex[] = [];
@@ -575,7 +574,8 @@ function maybeTouchFeed(
   if (ctx) ctx.waitUntil(work);
 }
 
-async function touchFeedMeta(bucket: R2Bucket, feedId: string): Promise<void> {
+// Exported for tests.
+export async function touchFeedMeta(bucket: R2Bucket, feedId: string): Promise<void> {
   const key = `feeds/${feedId}/meta`;
   const obj = await bucket.get(key);
   if (obj === null) return;
@@ -594,7 +594,11 @@ async function touchFeedMeta(bucket: R2Bucket, feedId: string): Promise<void> {
   if (expiresAt === null) return;
   const customMetadata: Record<string, string> = { expires_at: String(expiresAt) };
   if (createdAt !== null) customMetadata.created_at = String(createdAt);
+  // Conditional on the etag we read: if anything (extendFeed, another touch)
+  // rewrote meta since our get, R2 returns null and the touch is dropped —
+  // same fate as any other swallowed touch error.
   await bucket.put(key, body, {
+    onlyIf: { etagMatches: obj.etag },
     customMetadata,
     httpMetadata: { contentType: "application/json" },
   });

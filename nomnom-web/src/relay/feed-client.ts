@@ -15,15 +15,9 @@ import { feedAuthHeader } from "../crypto/feed-auth";
 import { feedRequestMac } from "../crypto/feeds";
 import { relayAuthHeader } from "../crypto/relay-auth";
 import { STREAM_RECONNECT_MS, STREAM_UNSUPPORTED_RETRIES } from "../config";
-import type { RelayConfig } from "../types";
+import { sleep } from "../util/sleep";
+import type { Member, RelayConfig } from "../types";
 import { RelayError, StreamUnsupportedError } from "./errors";
-
-export interface MemberCard {
-  member_id: string;
-  identity_pubkey: string;
-  name: string;
-  joined_at?: number;
-}
 
 export interface MintResult {
   feed_id: string;
@@ -65,7 +59,7 @@ function stripTrailingSlash(u: string): string {
 export async function mintFeed(
   relay: RelayConfig,
   ttlSeconds: number,
-  memberCard: MemberCard,
+  memberCard: Member,
   signal?: AbortSignal,
 ): Promise<MintResult> {
   const path = "/feeds";
@@ -112,7 +106,7 @@ export class FeedClient {
     feedId: string,
     feedKey: Uint8Array,
     memberId: string,
-    card: MemberCard,
+    card: Member,
     signal?: AbortSignal,
   ): Promise<void> {
     const res = await this.send(feedKey, "PUT", `/feeds/${feedId}/members/${memberId}`, {
@@ -137,11 +131,11 @@ export class FeedClient {
     feedId: string,
     feedKey: Uint8Array,
     opts: { sinceTs?: number; waitMs?: number; signal?: AbortSignal } = {},
-  ): Promise<MemberCard[]> {
+  ): Promise<Member[]> {
     const path = `/feeds/${feedId}/members${qs({ wait: opts.waitMs, since: opts.sinceTs })}`;
     const res = await this.send(feedKey, "GET", path, { signal: opts.signal });
     if (res.status === 200) {
-      const parsed = (await res.json()) as { members?: MemberCard[] };
+      const parsed = (await res.json()) as { members?: Member[] };
       return parsed.members ?? [];
     }
     throw new RelayError(res.status, (await safeReason(res)) || "list-members-failed");
@@ -300,21 +294,6 @@ export class FeedClient {
       await sleep(STREAM_RECONNECT_MS, signal);
     }
   }
-}
-
-function sleep(ms: number, signal?: AbortSignal): Promise<void> {
-  return new Promise((resolve) => {
-    if (signal?.aborted) return resolve();
-    const t = setTimeout(resolve, ms);
-    signal?.addEventListener(
-      "abort",
-      () => {
-        clearTimeout(t);
-        resolve();
-      },
-      { once: true },
-    );
-  });
 }
 
 async function safeReason(res: Response): Promise<string> {

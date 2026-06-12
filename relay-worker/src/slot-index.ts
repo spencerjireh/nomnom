@@ -1,6 +1,7 @@
-// Shared slot-index scan used by the /feeds/:id/slots long-poll (first pass) and
-// the SSE notifier's backlog replay. Both list `feeds/<id>/slots/`, head each
-// object for its `created_at`, keep those newer than a cursor, and sort ascending.
+// Slot-index helpers. `headCreatedAts` (the chunked created_at head scan) is
+// shared by the /feeds/:id/slots long-poll and the SSE notifier's backlog
+// replay; `readSlotsSince` (one-shot scan, cursor filter, ascending sort) is
+// used only by the notifier.
 
 export const LIST_BATCH_SIZE = 1000;
 // Cap on concurrent R2 head sub-requests. Workers free tier allows 50
@@ -19,8 +20,25 @@ export function parseTs(s: string | undefined): number | null {
   return Number.isFinite(n) ? n : null;
 }
 
-// One-shot scan of all slots written after `sinceTs`, sorted ascending. Heads
-// are issued in chunks of SLOT_HEAD_CONCURRENCY to respect the subrequest cap.
+// Head `objs` in chunks of SLOT_HEAD_CONCURRENCY (subrequest budget),
+// returning key -> created_at for objects with a parseable created_at.
+export async function headCreatedAts(
+  bucket: R2Bucket,
+  objs: { key: string }[],
+): Promise<Map<string, number>> {
+  const out = new Map<string, number>();
+  for (let i = 0; i < objs.length; i += SLOT_HEAD_CONCURRENCY) {
+    const slice = objs.slice(i, i + SLOT_HEAD_CONCURRENCY);
+    const heads = await Promise.all(slice.map((o) => bucket.head(o.key)));
+    for (let j = 0; j < slice.length; j++) {
+      const ts = parseTs(heads[j]?.customMetadata?.created_at);
+      if (ts !== null) out.set(slice[j].key, ts);
+    }
+  }
+  return out;
+}
+
+// One-shot scan of all slots written after `sinceTs`, sorted ascending.
 export async function readSlotsSince(
   bucket: R2Bucket,
   feedId: string,
@@ -28,15 +46,11 @@ export async function readSlotsSince(
 ): Promise<SlotIndex[]> {
   const prefix = `feeds/${feedId}/slots/`;
   const list = await bucket.list({ prefix, limit: LIST_BATCH_SIZE });
+  const createdAts = await headCreatedAts(bucket, list.objects);
   const fresh: SlotIndex[] = [];
-  for (let i = 0; i < list.objects.length; i += SLOT_HEAD_CONCURRENCY) {
-    const slice = list.objects.slice(i, i + SLOT_HEAD_CONCURRENCY);
-    const heads = await Promise.all(slice.map((o) => bucket.head(o.key)));
-    for (let j = 0; j < slice.length; j++) {
-      const createdAt = parseTs(heads[j]?.customMetadata?.created_at);
-      if (createdAt === null || createdAt <= sinceTs) continue;
-      fresh.push({ slot_id: slice[j].key.slice(prefix.length), created_at: createdAt });
-    }
+  for (const [key, createdAt] of createdAts) {
+    if (createdAt <= sinceTs) continue;
+    fresh.push({ slot_id: key.slice(prefix.length), created_at: createdAt });
   }
   fresh.sort((a, b) => a.created_at - b.created_at);
   return fresh;

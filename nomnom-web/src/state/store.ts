@@ -16,32 +16,20 @@ import {
   type Feed,
   type Identity,
   type PeerStore,
-  type Phase,
   type RelayConfig,
   type TimelineEntry,
   type TofuRequest,
-  type TransferResult,
 } from "../types";
 
-export type TransferKind = "send" | "receive";
-
+/** Explicit user-driven send in flight. Per-file progress/errors live on the
+ * timeline rows; this slice only gates the composer and owns the abort. */
 interface TransferSlice {
-  kind: TransferKind | null;
-  phase: Phase;
-  label: string;
-  progress: number; // 0..1
-  error: string | null;
-  result: TransferResult | null;
+  sending: boolean;
   abort: AbortController | null;
 }
 
 const IDLE_TRANSFER: TransferSlice = {
-  kind: null,
-  phase: "idle",
-  label: "",
-  progress: 0,
-  error: null,
-  result: null,
+  sending: false,
   abort: null,
 };
 
@@ -71,11 +59,8 @@ interface Store {
   forgetPeer: (peerId: string) => void;
   renamePeer: (peerId: string, nickname: string) => void;
 
-  beginTransfer: (kind: TransferKind, abort: AbortController) => void;
-  updateProgress: (phase: Phase, label: string, progress: number) => void;
-  finishTransfer: (result: TransferResult) => void;
-  failTransfer: (message: string) => void;
-  resetTransfer: () => void;
+  beginSend: (abort: AbortController) => void;
+  endSend: () => void;
 
   // timeline
   appendTimeline: (entry: TimelineEntry) => void;
@@ -86,6 +71,10 @@ interface Store {
 
   factoryReset: () => void;
 }
+
+/** True while an explicit user-driven send is in flight. The ambient receive
+ * watch never sets this — it must not lock the composer. */
+export const useSending = (): boolean => useStore((s) => s.transfer.sending);
 
 export const useStore = create<Store>((set, get) => {
   const persistChannel = () => persistence.saveChannel(get().channel);
@@ -191,21 +180,9 @@ export const useStore = create<Store>((set, get) => {
 
     // --- transfer ---
 
-    beginTransfer: (kind, abort) =>
-      set({ transfer: { ...IDLE_TRANSFER, kind, phase: "preparing", abort } }),
+    beginSend: (abort) => set({ transfer: { sending: true, abort } }),
 
-    updateProgress: (phase, label, progress) =>
-      set((s) => ({ transfer: { ...s.transfer, phase, label, progress } })),
-
-    finishTransfer: (result) =>
-      set((s) => ({
-        transfer: { ...s.transfer, phase: "done", label: "done", progress: 1, result, abort: null },
-      })),
-
-    failTransfer: (message) =>
-      set((s) => ({ transfer: { ...s.transfer, phase: "error", error: message, abort: null } })),
-
-    resetTransfer: () => set({ transfer: IDLE_TRANSFER }),
+    endSend: () => set({ transfer: IDLE_TRANSFER }),
 
     // --- timeline ---
 

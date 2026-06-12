@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { useStore } from "../state/store";
-import { useTransfer } from "../hooks/useTransfer";
+import { useSending } from "../state/store";
+import { leaveChannel } from "../state/actions";
 import { Fingerprint } from "./Fingerprint";
 import { expiry } from "../util/format";
 import type { Feed } from "../types";
@@ -8,17 +9,17 @@ import type { Feed } from "../types";
 /** Collapsible footer under the timeline: device list, auto-save toggle, copy
  * the channel secret, leave. Pure channel metadata — kept out of the timeline
  * so transfers stay the visual focus. */
-export function MembersFooter({ feed }: { feed: Feed }) {
+export function MembersFooter({ channel }: { channel: Feed }) {
   const setAutoSave = useStore((s) => s.setAutoSave);
-  const { leave, sending } = useTransfer();
+  const sending = useSending();
   const [copied, setCopied] = useState(false);
   const [confirmLeave, setConfirmLeave] = useState(false);
 
-  const members = feed.members_cache ?? [];
+  const members = channel.members_cache ?? [];
 
   async function copyUrl() {
     try {
-      await navigator.clipboard.writeText(feed.url);
+      await navigator.clipboard.writeText(channel.url);
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
     } catch {
@@ -30,7 +31,7 @@ export function MembersFooter({ feed }: { feed: Feed }) {
     <details className="members-footer">
       <summary>
         devices ({members.length}){" "}
-        <span className="dim small">· {expiry(feed.expires_at)}</span>
+        <span className="dim small">· {expiry(channel.expires_at)}</span>
       </summary>
 
       <div className="members-grid">
@@ -38,7 +39,7 @@ export function MembersFooter({ feed }: { feed: Feed }) {
           {members.map((m) => (
             <li key={m.member_id} className="member small">
               <span>{m.name || "(no name)"}</span>
-              {m.member_id === feed.member_id && <span className="dim"> · you</span>}{" "}
+              {m.member_id === channel.member_id && <span className="dim"> · you</span>}{" "}
               <Fingerprint hex={m.identity_pubkey} />
             </li>
           ))}
@@ -47,7 +48,7 @@ export function MembersFooter({ feed }: { feed: Feed }) {
         <label className="member-toggle">
           <input
             type="checkbox"
-            checked={feed.auto_save}
+            checked={channel.auto_save}
             onChange={(e) => setAutoSave(e.target.checked)}
           />
           <span>auto-save files from this channel</span>
@@ -58,7 +59,7 @@ export function MembersFooter({ feed }: { feed: Feed }) {
         </label>
 
         <div className="member-url">
-          <code className="feed-url">{feed.url}</code>
+          <code className="feed-url">{channel.url}</code>
           <button type="button" className="chip" onClick={copyUrl}>
             {copied ? "copied!" : "copy secret"}
           </button>
@@ -73,7 +74,7 @@ export function MembersFooter({ feed }: { feed: Feed }) {
             <button
               type="button"
               className="chip danger"
-              onClick={() => leave()}
+              onClick={() => leaveChannel()}
               disabled={sending}
             >
               leave
