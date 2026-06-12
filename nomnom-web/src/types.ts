@@ -58,15 +58,15 @@ export type OnTofu = (req: TofuRequest) => Promise<boolean>;
 export type OnProgress = (fraction: number) => void;
 
 /** A row in a feed's session timeline — either a file we sent or a file we
- * received. `body` is only attached while a received file is held awaiting
- * [save]/[discard]; saving or discarding drops the reference. */
+ * received. `body` stays attached across held → saved so view/copy/re-save
+ * keep working after a download; discarding removes the whole row (and with
+ * it the bytes). */
 export type TimelineKind = "send" | "receive";
 export type TimelineStatus =
   | "in_flight"   // send: still encrypting/uploading
   | "served"      // send: delivered
   | "saved"       // receive: written to Downloads (or already-trusted auto-save)
   | "held"        // receive: decrypted, waiting for the user to save or discard
-  | "discarded"   // receive: user discarded a held file
   | "failed";     // send: error
 
 export interface TimelineEntry {
@@ -80,7 +80,7 @@ export interface TimelineEntry {
   recipients?: number; // send only
   progress?: number;   // 0..1, for in_flight sends
   error?: string;      // failed sends
-  body?: ArrayBuffer;  // only present while status === "held"
+  body?: ArrayBuffer;  // receive only; present from "held" through "saved"
 }
 
 /** The synthetic global pin id for an Ed25519 identity (matches CLI `_feed_peer_id`). */

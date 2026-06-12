@@ -83,6 +83,19 @@ describe("timeline actions", () => {
     s.patchTimelineEntry("e1", { status: "saved", body: undefined });
     expect(store.useStore.getState().timeline.find((r) => r.id === "e1")?.status).toBe("saved");
   });
+
+  it("removes an entry by id and leaves the rest", () => {
+    const s = store.useStore.getState();
+    s.setChannel(makeFeed("channel"));
+    s.appendTimeline(entry("e1"));
+    s.appendTimeline(entry("e2"));
+
+    s.removeTimelineEntry("e1");
+    expect(store.useStore.getState().timeline.map((r) => r.id)).toEqual(["e2"]);
+
+    s.removeTimelineEntry("nope"); // unknown id is a no-op
+    expect(store.useStore.getState().timeline).toHaveLength(1);
+  });
 });
 
 describe("channel set/patch/leave", () => {

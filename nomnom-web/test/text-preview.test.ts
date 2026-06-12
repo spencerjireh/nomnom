@@ -3,7 +3,14 @@
 // needs a DOM and lives outside this node-env suite; these are the pure parts.
 
 import { describe, expect, it } from "vitest";
-import { looksLikeText, decodePreview, decodeText, PREVIEW_CAP_BYTES } from "../src/textPreview";
+import {
+  looksLikeText,
+  looksLikeMarkdown,
+  decodePreview,
+  decodeText,
+  PREVIEW_CAP_BYTES,
+  FULL_VIEW_CAP_BYTES,
+} from "../src/textPreview";
 
 function buf(bytes: number[]): ArrayBuffer {
   return new Uint8Array(bytes).buffer;
@@ -58,6 +65,34 @@ describe("decodePreview", () => {
     const { text, truncated } = decodePreview(utf8(big));
     expect(truncated).toBe(true);
     expect(text.length).toBe(PREVIEW_CAP_BYTES);
+  });
+
+  it("honors a caller-supplied cap (the full-screen viewer's)", () => {
+    const big = "x".repeat(PREVIEW_CAP_BYTES + 1000);
+    const { truncated } = decodePreview(utf8(big), FULL_VIEW_CAP_BYTES);
+    expect(truncated).toBe(false);
+  });
+});
+
+describe("looksLikeMarkdown", () => {
+  it("trusts a .md or .markdown filename outright", () => {
+    expect(looksLikeMarkdown("notes.md", "just plain prose")).toBe(true);
+    expect(looksLikeMarkdown("notes.MARKDOWN", "just plain prose")).toBe(true);
+  });
+
+  it("needs two distinct constructs when the name is not decisive", () => {
+    expect(
+      looksLikeMarkdown("message.txt", "# Title\n\n- one\n- two\n"),
+    ).toBe(true);
+    expect(
+      looksLikeMarkdown("message.txt", "```js\nlet x = 1\n```\nsee [docs](https://x.dev)"),
+    ).toBe(true);
+  });
+
+  it("does not flag prose with a single incidental construct", () => {
+    expect(looksLikeMarkdown("message.txt", "meet at 5pm **sharp** ok")).toBe(false);
+    expect(looksLikeMarkdown("message.txt", "the #1 fan of - dashes - everywhere")).toBe(false);
+    expect(looksLikeMarkdown("config.yaml", "key: value\nother: thing\n")).toBe(false);
   });
 });
 

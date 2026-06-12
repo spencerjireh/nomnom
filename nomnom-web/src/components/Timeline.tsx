@@ -2,11 +2,19 @@ import { useMemo, useState } from "react";
 import { useStore } from "../state/store";
 import { saveHeld, discardHeld } from "../state/actions";
 import { fmtSize, clock } from "../util/format";
-import { looksLikeText, decodePreview, decodeText, PREVIEW_CAP_BYTES } from "../textPreview";
+import {
+  looksLikeText,
+  looksLikeMarkdown,
+  decodePreview,
+  decodeText,
+  PREVIEW_CAP_BYTES,
+} from "../textPreview";
+import { ViewerOverlay, MarkdownBody } from "./Viewer";
 import type { TimelineEntry } from "../types";
 
 /** The channel's session timeline. In-flight sends show an inline progress bar;
- * held receives show [save] / [discard]; everything else is a static row. */
+ * received rows keep their bytes (and the view / copy / save actions) until
+ * discarded — discard removes the row entirely. */
 export function Timeline() {
   const rows = useStore((s) => s.timeline);
 
@@ -40,14 +48,21 @@ function Row({
   onDiscard: (id: string) => void;
 }) {
   const [expanded, setExpanded] = useState(false);
+  const [viewerOpen, setViewerOpen] = useState(false);
+  const [renderMd, setRenderMd] = useState(false);
   const [copied, setCopied] = useState<"idle" | "ok" | "err">("idle");
 
-  // Decode the held body once, only if it sniffs as text. Re-runs when the body
-  // is cleared by save/discard, dropping the preview and collapsing the slip.
+  // Decode the body once, only if it sniffs as text. The body survives saving,
+  // so the preview (and the actions it gates) stays available until discard.
   const preview = useMemo(() => {
-    if (row.status !== "held" || !row.body || !looksLikeText(row.body)) return null;
+    if (!row.body || !looksLikeText(row.body)) return null;
     return decodePreview(row.body);
-  }, [row.status, row.body]);
+  }, [row.body]);
+
+  const isMarkdown = useMemo(
+    () => (preview ? looksLikeMarkdown(row.name, preview.text) : false),
+    [row.name, preview],
+  );
 
   async function copyText() {
     if (!row.body) return;
@@ -91,7 +106,6 @@ function Row({
         )}
         {row.status === "served" && <span className="row-stamp"> ✓ served</span>}
         {row.status === "saved" && <span className="row-stamp"> ✓ saved</span>}
-        {row.status === "discarded" && <span className="row-stamp dim"> discarded</span>}
         {row.status === "failed" && (
           <span className="row-stamp err">
             {" "}
@@ -101,11 +115,29 @@ function Row({
       </div>
       {expanded && preview && (
         <div className="row-slip">
-          <pre className="row-slip-text">{preview.text}</pre>
+          <div className="row-slip-tools">
+            {isMarkdown && (
+              <button
+                type="button"
+                className={renderMd ? "chip active" : "chip"}
+                onClick={() => setRenderMd((r) => !r)}
+              >
+                {renderMd ? "raw" : "render md"}
+              </button>
+            )}
+            <button type="button" className="chip" onClick={() => setViewerOpen(true)}>
+              full screen ⤢
+            </button>
+          </div>
+          {renderMd && isMarkdown ? (
+            <MarkdownBody text={preview.text} />
+          ) : (
+            <pre className="row-slip-text">{preview.text}</pre>
+          )}
           {preview.truncated && (
             <p className="row-slip-note dim small">
-              showing the first {Math.round(PREVIEW_CAP_BYTES / 1024)} KB · copy takes the whole
-              file
+              showing the first {Math.round(PREVIEW_CAP_BYTES / 1024)} KB · full screen shows
+              more, copy takes the whole file
             </p>
           )}
           {copied !== "idle" && (
@@ -126,7 +158,7 @@ function Row({
           />
         </div>
       )}
-      {row.status === "held" && (
+      {row.body && (
         <div className="row-held-actions">
           {preview && (
             <button
@@ -138,7 +170,7 @@ function Row({
             </button>
           )}
           <button type="button" className="chip" onClick={() => onSave(row.id)}>
-            save to downloads
+            {row.status === "saved" ? "save again" : "save to downloads"}
           </button>
           <button
             type="button"
@@ -148,6 +180,17 @@ function Row({
             discard
           </button>
         </div>
+      )}
+      {viewerOpen && row.body && (
+        <ViewerOverlay
+          name={row.name}
+          bytes={row.bytes}
+          body={row.body}
+          isMarkdown={isMarkdown}
+          rendered={renderMd}
+          onToggleRendered={() => setRenderMd((r) => !r)}
+          onClose={() => setViewerOpen(false)}
+        />
       )}
     </>
   );

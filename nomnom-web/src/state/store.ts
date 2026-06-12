@@ -65,6 +65,7 @@ interface Store {
   // timeline
   appendTimeline: (entry: TimelineEntry) => void;
   patchTimelineEntry: (id: string, patch: Partial<TimelineEntry>) => void;
+  removeTimelineEntry: (id: string) => void;
 
   requestTofu: (request: TofuRequest) => Promise<boolean>;
   resolveTofu: (ok: boolean) => void;
@@ -193,6 +194,9 @@ export const useStore = create<Store>((set, get) => {
       set((s) => ({
         timeline: s.timeline.map((r) => (r.id === id ? { ...r, ...patch } : r)),
       })),
+
+    removeTimelineEntry: (id) =>
+      set((s) => ({ timeline: s.timeline.filter((r) => r.id !== id) })),
 
     requestTofu: (request) =>
       new Promise<boolean>((resolve) => {

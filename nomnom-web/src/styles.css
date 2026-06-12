@@ -343,7 +343,7 @@ body {
   gap: 6px;
 }
 
-/* inline text preview: the held row grows a torn-off receipt slip */
+/* inline text preview: the row grows a torn-off receipt slip */
 
 .row-view-toggle {
   appearance: none;
@@ -391,6 +391,14 @@ body {
   margin: 8px 0 0;
 }
 
+/* slip toolbar: render-markdown toggle + full-screen, left-aligned so the
+ * copied stamp can land top-right without collisions */
+.row-slip-tools {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
 /* copy feedback: a rubber stamp slammed askew over the slip corner */
 .row-copied-stamp {
   position: absolute;
@@ -416,9 +424,120 @@ body {
   border-color: var(--ketchup-dark);
 }
 
-.row-discarded .row-name {
-  text-decoration: line-through;
+/* --- full-screen viewer --- */
+
+.viewer-backdrop {
+  padding: clamp(12px, 3vw, 32px);
+}
+
+.viewer {
+  width: 100%;
+  max-width: 920px;
+  height: 100%;
+  background: var(--paper-lit);
+  border: 1.5px solid var(--line);
+  box-shadow: 0 10px 22px rgba(43, 30, 12, 0.18);
+  padding: 16px 20px 18px;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.viewer-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding-bottom: 10px;
+  margin-bottom: 10px;
+  border-bottom: 2px dashed var(--line);
+}
+
+.viewer-tools {
+  margin-left: auto;
+  display: flex;
+  gap: 6px;
+}
+
+.viewer-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+
+.viewer-text {
+  max-height: none;
+  overflow: visible;
+}
+
+/* --- rendered markdown --- */
+
+.md-body {
+  font-size: 0.92rem;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+
+.md-body > :first-child {
+  margin-top: 0;
+}
+
+.md-body h1,
+.md-body h2,
+.md-body h3,
+.md-body h4,
+.md-body h5,
+.md-body h6 {
+  color: var(--ketchup);
+  line-height: 1.3;
+  margin: 1.1em 0 0.4em;
+}
+
+.md-body h1,
+.md-body h2 {
+  padding-bottom: 4px;
+  border-bottom: 1.5px dashed var(--line);
+}
+
+.md-body pre {
+  background: rgba(43, 38, 32, 0.07);
+  border: 1px dashed var(--line);
+  padding: 10px 12px;
+  overflow: auto;
+  font-size: 0.84rem;
+}
+
+.md-body pre code {
+  background: none;
+  padding: 0;
+}
+
+.md-body blockquote {
+  margin: 0.6em 0;
+  padding: 2px 0 2px 12px;
+  border-left: 3px solid var(--mustard);
   color: var(--ink-dim);
+}
+
+.md-body table {
+  border-collapse: collapse;
+  margin: 0.6em 0;
+}
+
+.md-body th,
+.md-body td {
+  border: 1px dashed var(--line);
+  padding: 4px 10px;
+  text-align: left;
+}
+
+.md-body a {
+  color: var(--ketchup);
+}
+
+.md-body hr {
+  border: none;
+  border-top: 2px dashed var(--line);
 }
 
 /* --- composer --- */
@@ -576,10 +695,38 @@ textarea:focus {
 
 /* --- file drop --- */
 
-.filedrop-tabs {
+.filedrop {
   display: flex;
-  gap: 6px;
-  margin-bottom: 10px;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.staged-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.staged-file {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+
+.staged-file .row-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.staged-remove {
+  margin-left: auto;
+  padding: 0 7px;
+  line-height: 1.4;
 }
 
 .dropzone {
