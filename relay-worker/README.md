@@ -46,10 +46,10 @@ curl https://nomnom-relay.your-subdomain.workers.dev/health
 
 ### Required: R2 lifecycle rule
 
-The Worker writes a `customMetadata.expires_at` timestamp on every slot and refuses to serve expired ones, but objects orphaned by an abandoned sender accumulate until something deletes them. Add a one-day lifecycle rule so the bucket cleans itself:
+Objects orphaned by an abandoned sender (and stale slots/roster cards) accumulate until something deletes them. Add a **30-day** expiry rule so the bucket cleans itself:
 
 ```sh
-npx wrangler r2 bucket lifecycle add nomnom-relay nomnom-cleanup --expire-days 1 --force
+npx wrangler r2 bucket lifecycle add nomnom-relay nomnom-cleanup --expire-days 30 --force
 ```
 
 Verify:
@@ -58,7 +58,9 @@ Verify:
 npx wrangler r2 bucket lifecycle list nomnom-relay
 ```
 
-This is belt-and-suspenders for the 5-minute protocol TTL. Without it, abandoned slots sit indefinitely.
+R2 lifecycle expires objects by **age since last write**, not last access. To keep a permanent channel alive while it's in use — rather than purging it 30 days after minting — the Worker re-writes the channel's `meta` object on every operation (throttled to once/day; see `maybeTouchFeed` in `src/feeds.ts`). That turns the rule into **"purge after ~30 days of inactivity"**: an actively-used channel never ages out, an abandoned one is reclaimed after a month. Sent files (slots) and stale roster cards age out on the same 30-day clock, which doubles as the offline-catch-up window — a device idle for under a month still finds its pending posts.
+
+> Earlier deployments used a 1-day rule, which physically purged permanent channels after ~1 day despite their multi-year logical TTL. If you provisioned the bucket then, run the `add` above (after `lifecycle remove nomnom-relay --name nomnom-cleanup`) to replace it.
 
 ## Onboarding other devices
 
