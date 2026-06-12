@@ -68,7 +68,8 @@ export async function hmacSha256Hex(
  * window. Both auth schemes use the same envelope; only the prefix and the error
  * reason strings differ.
  *
- * Returns `{ tsStr, macHex }` on success, or an `AuthResult` failure on any of:
+ * Returns `{ ok: true, tsStr, macHex }` on success, or an `AuthResult` failure
+ * on any of:
  *   - header missing or wrong prefix       → 401 `missing-<...>`
  *   - malformed `<ts>:<mac>`                → 401 `bad-<...>`
  *   - timestamp drifts > ±TIMESTAMP_WINDOW  → 401 `clock-skew`
@@ -77,7 +78,9 @@ export function parseSignedAuth(
   header: string,
   prefix: string,
   badReason: { missing: string; bad: string },
-): { tsStr: string; macHex: string } | Extract<AuthResult, { ok: false }> {
+):
+  | { ok: true; tsStr: string; macHex: string }
+  | Extract<AuthResult, { ok: false }> {
   if (!header.startsWith(prefix)) {
     return { ok: false, status: 401, reason: badReason.missing };
   }
@@ -96,5 +99,5 @@ export function parseSignedAuth(
   if (Math.abs(now - ts) > TIMESTAMP_WINDOW_SEC) {
     return { ok: false, status: 401, reason: "clock-skew" };
   }
-  return { tsStr, macHex };
+  return { ok: true, tsStr, macHex };
 }

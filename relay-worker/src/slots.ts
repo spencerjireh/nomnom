@@ -9,32 +9,18 @@
 // objects older than 30 days so orphans (sender abandons after PUT, etc.)
 // don't accumulate. See relay-worker/README.md for the dashboard step.
 
-import { errorResponse } from "./http";
+import { MAX_BODY_BYTES, errorResponse, rejectBody } from "./http";
 import { pollSlot } from "./poll";
 
 const SLOT_TTL_SEC = 300; // 5 minutes from PUT to expiry
-const MAX_BODY_BYTES = 256 * 1024 * 1024; // 256 MB (free tier caps at 100 MB at the edge)
-const SLOT_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
-
-export function validateSlotId(slotId: string): boolean {
-  return SLOT_ID_RE.test(slotId);
-}
 
 export async function putSlot(
   bucket: R2Bucket,
   key: string,
   req: Request,
 ): Promise<Response> {
-  const lenHdr = req.headers.get("Content-Length");
-  if (lenHdr !== null) {
-    const len = Number.parseInt(lenHdr, 10);
-    if (Number.isFinite(len) && len > MAX_BODY_BYTES) {
-      return errorResponse("payload-too-large", 413);
-    }
-  }
-  if (req.body === null) {
-    return errorResponse("empty-body", 400);
-  }
+  const rejected = rejectBody(req, MAX_BODY_BYTES);
+  if (rejected) return rejected;
   const expiresAt = Math.floor(Date.now() / 1000) + SLOT_TTL_SEC;
   // Atomic create-if-absent: the conditional put returns null when the slot
   // already exists, so a racing PUT gets 409 instead of clobbering.
@@ -65,13 +51,8 @@ export async function getSlot(
       return errorResponse("expired", 410);
     }
   }
-  // Delete-on-read. We have to fully read the body first before delete
-  // since R2's delete is independent of any open handle to the object.
-  // Stream the body directly into the Response and run the delete after
-  // the body is finished via ctx.waitUntil from the caller... but slots.ts
-  // doesn't have ctx. So we delete eagerly and stream the in-flight body.
-  // This is safe: bucket.delete only removes the key from the index; the
-  // object body we've already opened is still readable.
+  // Delete-on-read. Deleting before streaming is safe: R2 delete only unlinks
+  // the key; the already-opened body handle stays readable.
   await bucket.delete(key);
   return new Response(obj.body, {
     status: 200,

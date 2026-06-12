@@ -28,7 +28,7 @@ export async function verifyHmac(
     missing: "missing-mac",
     bad: "bad-mac",
   });
-  if ("ok" in parsed) return parsed;
+  if (!parsed.ok) return parsed;
   const url = new URL(req.url);
   const msg = `${req.method}\n${url.pathname}\n${parsed.tsStr}`;
   const expected = await hmacSha256Hex(secret, msg);
