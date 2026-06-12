@@ -48,6 +48,7 @@ body {
 /* --- two-pane shell --- */
 
 .shell {
+  position: relative; /* anchors the floating rail-expand handle */
   min-height: 100%;
   max-width: 1100px;
   margin: 0 auto;
@@ -56,6 +57,31 @@ body {
   gap: 28px;
   padding: clamp(20px, 5vh, 56px) clamp(16px, 4vw, 36px);
   align-items: start;
+}
+
+/* Collapsible rail — desktop only; under 680px the drill-down rules own the
+ * rail's visibility and the collapse/expand chips are hidden. */
+.rail-expand {
+  display: none;
+  position: absolute;
+  top: clamp(20px, 5vh, 56px);
+  left: clamp(16px, 4vw, 36px);
+}
+
+@media (min-width: 681px) {
+  .shell.rail-collapsed {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .shell.rail-collapsed .rail {
+    display: none;
+  }
+  .shell.rail-collapsed .rail-expand {
+    display: inline-flex;
+  }
+  /* keep the pane's first line clear of the floating handle */
+  .shell.rail-collapsed .shell-pane {
+    padding-left: 34px;
+  }
 }
 
 .shell-pane {
@@ -75,6 +101,10 @@ body {
 }
 
 .rail-brand {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
   padding: 0 6px 6px;
   border-bottom: 2px dashed var(--line);
 }
@@ -951,6 +981,9 @@ hr.dashed {
   .rail {
     position: static;
     max-height: none;
+  }
+  .rail-collapse {
+    display: none;
   }
   /* When a feed is selected, hide the rail and show the back button. */
   .shell.has-selection .rail {

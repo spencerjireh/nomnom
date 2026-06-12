@@ -117,6 +117,27 @@ test.describe("nomnom-web single-channel UI smoke (offline, secret-free)", () =>
     await expect(sendBtn).toBeDisabled();
   });
 
+  test("the rail collapses, persists across reload, and expands again", async ({ page }) => {
+    await seed(page);
+    await page.goto("/");
+    await expect(page.getByRole("heading", { name: "your channel" })).toBeVisible();
+
+    const rail = page.getByRole("complementary", { name: "channel" });
+    await expect(rail).toBeVisible();
+
+    await page.getByRole("button", { name: "hide sidebar" }).click();
+    await expect(rail).toBeHidden();
+    await expect(page.getByRole("button", { name: "show sidebar" })).toBeVisible();
+
+    // The preference survives a reload.
+    await page.reload();
+    await expect(page.getByRole("heading", { name: "your channel" })).toBeVisible();
+    await expect(rail).toBeHidden();
+
+    await page.getByRole("button", { name: "show sidebar" }).click();
+    await expect(rail).toBeVisible();
+  });
+
   test("factory reset wipes the seeded channel back to the bootstrap pane", async ({ page }) => {
     await seed(page);
     await page.goto("/");

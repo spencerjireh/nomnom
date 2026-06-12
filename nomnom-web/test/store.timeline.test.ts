@@ -207,3 +207,15 @@ describe("persistence migration", () => {
     expect(persistence.loadChannel()?.auto_save).toBe(true);
   });
 });
+
+describe("rail collapsed preference", () => {
+  it("defaults to false, round-trips, and is wiped by reset", () => {
+    expect(persistence.loadRailCollapsed()).toBe(false);
+
+    persistence.saveRailCollapsed(true);
+    expect(persistence.loadRailCollapsed()).toBe(true);
+
+    persistence.reset();
+    expect(persistence.loadRailCollapsed()).toBe(false);
+  });
+});
