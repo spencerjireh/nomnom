@@ -47,8 +47,6 @@ export function ChannelView({ channel }: { channel: Feed }) {
         </span>
       </header>
 
-      <Timeline />
-
       <div className="feed-composer">
         <FileDrop
           key={composerKey}
@@ -68,6 +66,8 @@ export function ChannelView({ channel }: { channel: Feed }) {
             : "send"}
         </button>
       </div>
+
+      <Timeline />
 
       <MembersFooter channel={channel} />
     </section>
