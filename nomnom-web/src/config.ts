@@ -26,3 +26,9 @@ export const MAX_PAYLOAD_BYTES = 100 * 1024 * 1024;
 // mints with a multi-year TTL to match the relay Worker's raised cap.
 export const CHANNEL_NAME = "channel";
 export const PERMANENT_TTL_SECONDS = 3650 * 86_400; // ~10 years
+
+// On load, the timeline is rebuilt by re-fetching the channel's still-live posts
+// from the relay (nothing is persisted locally). This bounds how far back the
+// rebuild sweeps — matching the relay's ~30-day slot retention, so we don't try
+// to fetch posts the relay has already purged. Older history simply isn't shown.
+export const HISTORY_MAX_AGE_DAYS = 30;

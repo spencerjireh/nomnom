@@ -84,6 +84,20 @@ describe("timeline actions", () => {
     expect(store.useStore.getState().timeline.find((r) => r.id === "e1")?.status).toBe("saved");
   });
 
+  it("setTimeline replaces the whole timeline wholesale (idempotent rebuild)", () => {
+    const s = store.useStore.getState();
+    s.setChannel(makeFeed("channel"));
+    s.appendTimeline(entry("stale"));
+
+    const rebuilt = [entry("r2", { at: 2 }), entry("r1", { at: 1 })];
+    s.setTimeline(rebuilt);
+    expect(store.useStore.getState().timeline.map((r) => r.id)).toEqual(["r2", "r1"]);
+
+    // Running it again with the same rows is a no-op in effect (no duplication).
+    s.setTimeline(rebuilt);
+    expect(store.useStore.getState().timeline.map((r) => r.id)).toEqual(["r2", "r1"]);
+  });
+
   it("removes an entry by id and leaves the rest", () => {
     const s = store.useStore.getState();
     s.setChannel(makeFeed("channel"));

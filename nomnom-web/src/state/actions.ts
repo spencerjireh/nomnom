@@ -8,6 +8,7 @@
 import { useStore } from "./store";
 import { runSend } from "../orchestration/send";
 import { runReceive } from "../orchestration/receive";
+import { runHistory } from "../orchestration/history";
 import { openFeed, joinFeed, leaveFeed, type TofuHooks } from "../orchestration/feed-actions";
 import { friendlyRelayMessage } from "../relay/errors";
 import { CHANNEL_NAME, PERMANENT_TTL_SECONDS } from "../config";
@@ -78,13 +79,33 @@ export async function send(payload: {
 export async function receive(feed: Feed, signal: AbortSignal): Promise<void> {
   const s = useStore.getState();
   if (!s.identity) return;
-  // Identity is pinned for the watch's lifetime: it's this device's own
-  // signing key, which only changes via factoryReset — and that aborts the
-  // watch (via the signal), so a fresh receive() picks up the new identity.
+  const identity = s.identity;
+
+  // Phase 1: rebuild the session timeline from the relay's still-live posts, so a
+  // refresh restores history (sent + received) instead of starting blank. Runs
+  // once per mount; the live watch below resumes after the newest rebuilt post.
+  let resumeFrom = feed.last_post_ts;
+  try {
+    const { rows, maxCursor } = await runHistory({ feed, identity, signal });
+    if (signal.aborted) return; // StrictMode unmount / re-pair — don't clobber
+    useStore.getState().setTimeline(rows);
+    resumeFrom = Math.max(feed.last_post_ts, maxCursor);
+    useStore.getState().patchChannel({ last_post_ts: resumeFrom });
+  } catch (e) {
+    if (signal.aborted) return;
+    // runHistory is best-effort and already swallows relay errors; a throw here
+    // is unexpected. Surface it but still fall through to the live watch.
+    console.warn("nomnom: history rebuild failed:", friendlyRelayMessage(e));
+  }
+
+  // Phase 2: live watch. Identity is pinned for the watch's lifetime: it's this
+  // device's own signing key, which only changes via factoryReset — and that
+  // aborts the watch (via the signal), so a fresh receive() picks up the new
+  // identity.
   try {
     await runReceive({
-      feed,
-      identity: s.identity,
+      feed: { ...feed, last_post_ts: resumeFrom },
+      identity,
       hooks: tofuHooks(),
       onFile: (f) => {
         // Re-resolve auto_save each time — it may have flipped mid-watch.
