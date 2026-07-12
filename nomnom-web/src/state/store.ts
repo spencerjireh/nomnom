@@ -66,6 +66,8 @@ interface Store {
   appendTimeline: (entry: TimelineEntry) => void;
   patchTimelineEntry: (id: string, patch: Partial<TimelineEntry>) => void;
   removeTimelineEntry: (id: string) => void;
+  /** Replace the whole timeline (used by the load-time history rebuild). */
+  setTimeline: (rows: TimelineEntry[]) => void;
 
   requestTofu: (request: TofuRequest) => Promise<boolean>;
   resolveTofu: (ok: boolean) => void;
@@ -197,6 +199,11 @@ export const useStore = create<Store>((set, get) => {
 
     removeTimelineEntry: (id) =>
       set((s) => ({ timeline: s.timeline.filter((r) => r.id !== id) })),
+
+    // Wholesale replace — the rebuild computes the full list from the relay and
+    // swaps it in atomically, so a React StrictMode double-mount is idempotent
+    // (unlike per-row appends). In-memory only, like the rest of the timeline.
+    setTimeline: (rows) => set({ timeline: rows }),
 
     requestTofu: (request) =>
       new Promise<boolean>((resolve) => {
