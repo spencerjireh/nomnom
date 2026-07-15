@@ -3498,6 +3498,87 @@ class TestEmitPickerResult:
         assert banner == "no files selected."
 
 
+class TestRunPickerLoop:
+    """Orchestration of the picker home loop with `_picker_ui` mocked: emit +
+    state carry, PICKER_MORE dispatch + rescan, and clean exit on None."""
+
+    def test_emit_carry_more_dispatch_rescan_and_exit(self, monkeypatch):
+        first = nomnom.PickResult(
+            selected={"a.py"},
+            destination=nomnom.Destination.CLIPBOARD,
+            include_tree=False,
+            verb=nomnom.Verb.PR,
+        )
+        seq = [first, nomnom.PICKER_MORE, None]
+        picker_calls: list = []
+        drove: list = []
+        scans: list = []
+        modals: list = []
+
+        def fake_picker(stdscr, nodes, **kw):
+            picker_calls.append((list(nodes), kw))
+            return seq.pop(0)
+
+        monkeypatch.setattr(nomnom, "_picker_ui", fake_picker)
+        monkeypatch.setattr(nomnom, "_is_inside_git_repo", lambda root: True)
+        monkeypatch.setattr(
+            nomnom, "_emit_picker_result",
+            lambda s, r, root: (["wrote /x"], "", "wrote /x"),
+        )
+        monkeypatch.setattr(nomnom, "_result_modal",
+                            lambda s, m, e: modals.append((m, e)))
+        monkeypatch.setattr(nomnom, "_more_menu", lambda s: "Extensions")
+        monkeypatch.setattr(nomnom, "_open_more_verb", lambda name: f"screen:{name}")
+        monkeypatch.setattr(nomnom, "_drive_screens",
+                            lambda s, screen: drove.append(screen))
+        monkeypatch.setattr(nomnom, "_scan_to_nodes",
+                            lambda root: (scans.append(root) or (["NEW"], ["file"])))
+
+        nomnom._run_picker_loop(object(), Path("/repo"), ["OLD"])
+
+        assert len(picker_calls) == 3  # emit(first) → more → None(exit)
+        # First call seeds the Bundle default with no banner.
+        assert picker_calls[0][1]["initial_verb"] == nomnom.Verb.BUNDLE
+        assert picker_calls[0][1]["banner"] is None
+        # Second call carries dest/tree/verb from `first` and the emit banner.
+        k2 = picker_calls[1][1]
+        assert k2["initial_destination"] == nomnom.Destination.CLIPBOARD
+        assert k2["initial_include_tree"] is False
+        assert k2["initial_verb"] == nomnom.Verb.PR
+        assert k2["banner"] == "wrote /x"
+        assert modals == []  # single-line success → no modal
+        # The more-menu drove Extensions and rescanned; 3rd call sees new nodes.
+        assert drove == ["screen:Extensions"]
+        assert len(scans) == 1
+        assert picker_calls[2][0] == ["NEW"]
+        assert picker_calls[2][1]["banner"] is None
+
+    def test_error_result_opens_modal(self, monkeypatch):
+        first = nomnom.PickResult(
+            selected={"a.py"},
+            destination=nomnom.Destination.SEND,
+            include_tree=True,
+        )
+        seq = [first, None]
+        modals: list = []
+        monkeypatch.setattr(nomnom, "_picker_ui",
+                            lambda stdscr, nodes, **kw: seq.pop(0))
+        monkeypatch.setattr(nomnom, "_is_inside_git_repo", lambda root: False)
+        monkeypatch.setattr(
+            nomnom, "_emit_picker_result",
+            lambda s, r, root: (["line1", "boom"], "boom", "boom"),
+        )
+        monkeypatch.setattr(nomnom, "_result_modal",
+                            lambda s, m, e: modals.append((m, e)))
+
+        nomnom._run_picker_loop(object(), Path("/repo"), ["OLD"])
+
+        assert len(modals) == 1
+        msgs, err = modals[0]
+        assert err == "boom"
+        assert msgs == ["line1", "boom"]
+
+
 class TestRetiredVerbs:
     """`nomnom pair` and friends print a helpful migration message."""
 

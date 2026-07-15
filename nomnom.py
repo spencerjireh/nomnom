@@ -1820,6 +1820,12 @@ def register_values(
 
     parsed[target_name] = target
     _write_block(p, src_lines, start, end, _emit_block(parsed))
+    # Rewriting the running file doesn't reload the module, so sync the live
+    # global too — otherwise the in-session scan/display keeps the old
+    # patterns (e.g. a just-added secret pattern wouldn't take effect until
+    # restart). Only when we wrote our own source, never a test/other path.
+    if p == SELF_PATH:
+        globals()[target_name] = target
     result.wrote = True
     return result
 
@@ -6160,7 +6166,7 @@ def _more_menu(stdscr) -> str | None:  # pragma: no cover - curses I/O
     while True:
         body = [" more ".center(50, "─"), ""]
         for i, verb in enumerate(_MORE_VERBS):
-            marker = "›" if i == cursor else " "
+            marker = ">" if i == cursor else " "
             body.append(f" {marker} {verb:<12} {_MORE_DESCS[verb]}")
         body.extend(["", "─" * 50, "  j/k: move   enter: open   esc: back"])
         _draw_overlay(stdscr, body)
@@ -6265,10 +6271,12 @@ def _run_picker_loop(stdscr, root: Path, nodes: list[Node]) -> None:  # pragma: 
             choice = _more_menu(stdscr)
             if choice is not None:
                 _drive_screens(stdscr, _open_more_verb(choice))
-                # Receive/Rebuild write files into cwd; rescan so they show up
-                # in the picker. Keep the old nodes if the rescan comes back
-                # empty (would otherwise busy-loop on an empty list).
-                if choice in ("Receive", "Rebuild"):
+                # Rescan so the picker reflects filesystem/exclude changes the
+                # excursion made: Receive/Rebuild write files into cwd;
+                # Extensions can add secret/binary patterns that must drop
+                # files from the next bundle. Keep the old nodes if the rescan
+                # comes back empty (would otherwise busy-loop on an empty list).
+                if choice in ("Receive", "Rebuild", "Extensions"):
                     fresh, files = _scan_to_nodes(root)
                     if files:
                         nodes = fresh
