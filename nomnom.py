@@ -1504,6 +1504,14 @@ class NomnomError(Exception):
     entry points to render the message in a modal."""
 
 
+class NomnomTransportError(NomnomError):
+    """A transient relay/network failure fetching a resource — the operation
+    might succeed on retry. The receive loops use this to distinguish "couldn't
+    fetch this slot right now" (leave the cursor put and retry) from a permanent
+    rejection like tamper or a 404 (advance past it). Being a NomnomError, it is
+    still caught by the CLI dispatcher's generic handler."""
+
+
 def _require_git_repo(root: Path) -> None:
     rc, _, _ = _run(["git", "rev-parse", "--show-toplevel"], root)
     if rc != 0:
@@ -4936,15 +4944,27 @@ def _relay_get_feed_slot(
     host: str, feed_id: str, feed_key: bytes, slot_id: str,
     *, wait_ms: int = 0,
 ) -> bytes | None:
-    status, data = _feed_request(
-        host, feed_key, "GET",
-        f"/feeds/{feed_id}/slots/{slot_id}{_qs(wait=wait_ms)}",
-    )
+    # 200 -> bytes, 404 -> None (slot gone; a permanent, advance-safe outcome).
+    # Everything else — a network error or a non-404 status — is a transient
+    # fetch failure for THIS slot: surface it as NomnomTransportError so the
+    # receive loops leave their cursor put and retry, mirroring the web client
+    # (which never advances on a slot GET error). Advancing here would silently
+    # and permanently drop an unread post.
+    try:
+        status, data = _feed_request(
+            host, feed_key, "GET",
+            f"/feeds/{feed_id}/slots/{slot_id}{_qs(wait=wait_ms)}",
+        )
+    except NomnomError as e:
+        raise NomnomTransportError(str(e)) from e
     if status == 200:
         return data
     if status == 404:
         return None
-    _raise_feed_error(status, data)
+    try:
+        _raise_feed_error(status, data)
+    except NomnomError as e:
+        raise NomnomTransportError(str(e)) from e
 
 
 def _relay_list_feed_slots(
@@ -5376,11 +5396,17 @@ def _receive_and_report(
 
     Shared by the SSE and long-poll receive paths so tamper handling
     (raise -> warn + skip) stays identical between them.
+
+    Propagates NomnomTransportError (a transient fetch failure) so the caller can
+    leave its cursor put and retry; a permanent rejection (tamper/spoof) is warned
+    and swallowed (returns False), which the caller treats as advance-safe.
     """
     try:
         res = _receive_one_post(
             feed=feed, host=host, feed_key=feed_key, slot_id=slot_id,
         )
+    except NomnomTransportError:
+        raise
     except NomnomError as e:
         sys.stderr.write(f"warning: {e}\n")
         return False
@@ -5438,9 +5464,17 @@ def _cmd_receive_stream(
                 continue
             # Refresh before each post so a just-joined sender resolves + TOFUs.
             _receive_refresh_roster(target, host, feed_key, trust_new)
-            if _receive_and_report(
-                feed=target, host=host, feed_key=feed_key, slot_id=slot_id,
-            ):
+            try:
+                landed = _receive_and_report(
+                    feed=target, host=host, feed_key=feed_key, slot_id=slot_id,
+                )
+            except NomnomTransportError as e:
+                # Transport hiccup fetching this slot — do NOT advance the cursor
+                # or we'd permanently drop an unread post. Leaving last_ts put
+                # lets the next event re-surface it.
+                sys.stderr.write(f"warning: {e}\n")
+                continue
+            if landed:
                 received_any = True
             if created_at > last_ts:
                 last_ts = created_at
@@ -5516,9 +5550,16 @@ def cmd_receive(*, once: bool = False, trust_new: bool = False) -> int:
             created_at = int(entry.get("created_at") or 0)
             landed = False
             if slot_id:
-                landed = _receive_and_report(
-                    feed=target, host=host, feed_key=feed_key, slot_id=slot_id,
-                )
+                try:
+                    landed = _receive_and_report(
+                        feed=target, host=host, feed_key=feed_key, slot_id=slot_id,
+                    )
+                except NomnomTransportError as e:
+                    # Transport hiccup fetching this slot — leave the cursor put
+                    # so the next long-poll re-lists it instead of skipping it
+                    # forever. Advancing here would permanently drop the post.
+                    sys.stderr.write(f"warning: {e}\n")
+                    continue
                 if landed:
                     received_any = True
             last_ts = max(last_ts, created_at)

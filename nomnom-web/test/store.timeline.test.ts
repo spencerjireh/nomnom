@@ -84,18 +84,37 @@ describe("timeline actions", () => {
     expect(store.useStore.getState().timeline.find((r) => r.id === "e1")?.status).toBe("saved");
   });
 
-  it("setTimeline replaces the whole timeline wholesale (idempotent rebuild)", () => {
+  it("rebuildTimeline replaces relay-derived rows (idempotent rebuild)", () => {
     const s = store.useStore.getState();
     s.setChannel(makeFeed("channel"));
     s.appendTimeline(entry("stale"));
 
     const rebuilt = [entry("r2", { at: 2 }), entry("r1", { at: 1 })];
-    s.setTimeline(rebuilt);
+    s.rebuildTimeline(rebuilt);
     expect(store.useStore.getState().timeline.map((r) => r.id)).toEqual(["r2", "r1"]);
 
     // Running it again with the same rows is a no-op in effect (no duplication).
-    s.setTimeline(rebuilt);
+    s.rebuildTimeline(rebuilt);
     expect(store.useStore.getState().timeline.map((r) => r.id)).toEqual(["r2", "r1"]);
+  });
+
+  it("rebuildTimeline preserves a concurrent in-flight (or failed) send row", () => {
+    const s = store.useStore.getState();
+    s.setChannel(makeFeed("channel"));
+    // A user send started while the async history sweep was in flight.
+    s.appendTimeline(entry("sending", { kind: "send", status: "in_flight", peerName: undefined }));
+    s.appendTimeline(entry("bad", { kind: "send", status: "failed", peerName: undefined }));
+    // A received row that the rebuild WILL reconstruct — safe to drop.
+    s.appendTimeline(entry("old-received"));
+
+    const rebuilt = [entry("r2", { at: 2 }), entry("r1", { at: 1 })];
+    s.rebuildTimeline(rebuilt);
+
+    const ids = store.useStore.getState().timeline.map((r) => r.id);
+    // Live-only send rows survive newest-first (append prepends, so "bad" — added
+    // last — leads) above the rebuilt history; the reconstructable received row
+    // is replaced by the rebuild.
+    expect(ids).toEqual(["bad", "sending", "r2", "r1"]);
   });
 
   it("removes an entry by id and leaves the rest", () => {
@@ -231,5 +250,61 @@ describe("rail collapsed preference", () => {
 
     persistence.reset();
     expect(persistence.loadRailCollapsed()).toBe(false);
+  });
+});
+
+describe("tofu prompt queue", () => {
+  const alice = { peerName: "alice", sigPub: "PUB1", fingerprint: "fp1" };
+  const bob = { peerName: "bob", sigPub: "PUB2", fingerprint: "fp2" };
+
+  it("shares one prompt across concurrent requests for the same identity", async () => {
+    const s = store.useStore.getState();
+    const p1 = s.requestTofu(alice);
+    const p2 = s.requestTofu(alice); // same sigPub, concurrent — must not orphan
+    expect(store.useStore.getState().tofu?.request.sigPub).toBe("PUB1");
+
+    s.resolveTofu(true);
+    expect(await p1).toBe(true);
+    expect(await p2).toBe(true);
+    expect(store.useStore.getState().tofu).toBeNull();
+  });
+
+  it("a second concurrent request never orphans its promise (composer unlock)", async () => {
+    // Before the fix, the second requestTofu overwrote the first's resolver, so
+    // the first await hung forever — runSend's finally/endSend never ran and the
+    // composer stayed disabled. Both must settle.
+    const s = store.useStore.getState();
+    const pSend = s.requestTofu(alice);
+    const pLoop = s.requestTofu(alice);
+    s.resolveTofu(true);
+    await expect(Promise.all([pSend, pLoop])).resolves.toEqual([true, true]);
+  });
+
+  it("queues distinct identities and resolves them in FIFO order", async () => {
+    const s = store.useStore.getState();
+    const p1 = s.requestTofu(alice);
+    const p2 = s.requestTofu(bob);
+    expect(store.useStore.getState().tofu?.request.sigPub).toBe("PUB1");
+
+    s.resolveTofu(true);
+    expect(await p1).toBe(true);
+    // The next prompt is now surfaced to the modal.
+    expect(store.useStore.getState().tofu?.request.sigPub).toBe("PUB2");
+
+    s.resolveTofu(false);
+    expect(await p2).toBe(false);
+    expect(store.useStore.getState().tofu).toBeNull();
+  });
+
+  it("leaveChannel drains all pending prompts (resolve false)", async () => {
+    const s = store.useStore.getState();
+    s.setChannel(makeFeed("channel"));
+    const p1 = s.requestTofu(alice);
+    const p2 = s.requestTofu(bob);
+
+    s.leaveChannel();
+    expect(await p1).toBe(false);
+    expect(await p2).toBe(false);
+    expect(store.useStore.getState().tofu).toBeNull();
   });
 });

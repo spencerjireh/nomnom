@@ -9,7 +9,8 @@ import { useStore } from "./store";
 import { runSend } from "../orchestration/send";
 import { runReceive } from "../orchestration/receive";
 import { runHistory } from "../orchestration/history";
-import { openFeed, joinFeed, leaveFeed, type TofuHooks } from "../orchestration/feed-actions";
+import { openFeed, joinFeed, leaveFeed, feedContext, type TofuHooks } from "../orchestration/feed-actions";
+import { cryptoClient } from "../worker/cryptoClient";
 import { friendlyRelayMessage } from "../relay/errors";
 import { CHANNEL_NAME, PERMANENT_TTL_SECONDS } from "../config";
 import { downloadBlob } from "../util/dom";
@@ -88,7 +89,7 @@ export async function receive(feed: Feed, signal: AbortSignal): Promise<void> {
   try {
     const { rows, maxCursor } = await runHistory({ feed, identity, signal });
     if (signal.aborted) return; // StrictMode unmount / re-pair — don't clobber
-    useStore.getState().setTimeline(rows);
+    useStore.getState().rebuildTimeline(rows);
     resumeFrom = Math.max(feed.last_post_ts, maxCursor);
     useStore.getState().patchChannel({ last_post_ts: resumeFrom });
   } catch (e) {
@@ -148,13 +149,45 @@ export async function receive(feed: Feed, signal: AbortSignal): Promise<void> {
   }
 }
 
-/** Save a received file to disk. The body stays in memory so view / copy /
- * re-save keep working after the download; only discard drops the bytes. */
-export function saveHeld(id: string): void {
-  const row = useStore.getState().timeline.find((r) => r.id === id);
-  if (!row || !row.body) return;
-  downloadBlob(row.name, row.body);
-  useStore.getState().patchTimelineEntry(id, { status: "saved" });
+/** Save a received file to disk. Live-received rows keep their body in memory,
+ * so save is instant. History-rebuilt rows carry only a slot_id (the rebuild
+ * doesn't hold every retained file in memory at once); those fetch + decrypt the
+ * slot on demand, download it, and attach the body so view / copy / re-save then
+ * work without another round-trip. Surfaces a row error if the slot has expired
+ * off the relay. Never throws. */
+export async function saveHeld(id: string): Promise<void> {
+  const s = useStore.getState();
+  const row = s.timeline.find((r) => r.id === id);
+  if (!row) return;
+
+  // Body already in memory (live receipt, or a previously-saved rebuilt row).
+  if (row.body) {
+    downloadBlob(row.name, row.body);
+    useStore.getState().patchTimelineEntry(id, { status: "saved", error: undefined });
+    return;
+  }
+
+  // Rebuilt row — lazily fetch + decrypt by slot_id.
+  const feed = s.channel;
+  if (!row.slot_id || !s.identity || !feed) return;
+  try {
+    const ctx = feedContext(feed, s.identity);
+    const raw = await ctx.client.getSlot(feed.feed_id, ctx.feedKey, row.slot_id);
+    if (raw === null) throw new Error("this file is no longer on the relay (expired)");
+    const opened = await cryptoClient.feedOpen({
+      feedKeyHex: ctx.feedKeyHex,
+      feedId: feed.feed_id,
+      blob: raw,
+    });
+    downloadBlob(row.name, opened.body);
+    useStore.getState().patchTimelineEntry(id, {
+      status: "saved",
+      body: opened.body,
+      error: undefined,
+    });
+  } catch (e) {
+    useStore.getState().patchTimelineEntry(id, { error: friendlyRelayMessage(e) });
+  }
 }
 
 /** Discard a received file: remove its row (and bytes) from the timeline. */

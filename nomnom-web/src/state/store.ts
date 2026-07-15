@@ -66,8 +66,9 @@ interface Store {
   appendTimeline: (entry: TimelineEntry) => void;
   patchTimelineEntry: (id: string, patch: Partial<TimelineEntry>) => void;
   removeTimelineEntry: (id: string) => void;
-  /** Replace the whole timeline (used by the load-time history rebuild). */
-  setTimeline: (rows: TimelineEntry[]) => void;
+  /** Swap in the load-time history rebuild, preserving any live-only rows (an
+   * in-flight or failed user send) the relay can't reconstruct. */
+  rebuildTimeline: (rows: TimelineEntry[]) => void;
 
   requestTofu: (request: TofuRequest) => Promise<boolean>;
   resolveTofu: (ok: boolean) => void;
@@ -81,6 +82,32 @@ export const useSending = (): boolean => useStore((s) => s.transfer.sending);
 
 export const useStore = create<Store>((set, get) => {
   const persistChannel = () => persistence.saveChannel(get().channel);
+
+  // Pending first-contact prompts, FIFO. The store exposes only the HEAD as
+  // `tofu` (what the modal renders); the rest wait their turn. Two concurrent
+  // refreshRoster callers (a user send + the ambient roster loop) used to race
+  // on a single slot — the second overwrote the first and orphaned its resolver,
+  // hanging the send and permanently disabling the composer. Now every awaiter
+  // for the same identity shares one entry, and different identities queue.
+  type TofuEntry = {
+    request: TofuRequest;
+    resolvers: Array<(ok: boolean) => void>;
+  };
+  let tofuQueue: TofuEntry[] = [];
+  const headTofu = (): Store["tofu"] =>
+    tofuQueue.length === 0
+      ? null
+      : {
+          request: tofuQueue[0].request,
+          resolve: (ok: boolean) => get().resolveTofu(ok),
+        };
+  // Resolve (with `ok`) and clear every pending prompt — used when the channel
+  // goes away so awaiting roster refreshes don't dangle.
+  const drainTofu = (ok: boolean) => {
+    const pending = tofuQueue;
+    tofuQueue = [];
+    for (const e of pending) for (const r of e.resolvers) r(ok);
+  };
 
   return {
     identity: null,
@@ -137,10 +164,10 @@ export const useStore = create<Store>((set, get) => {
     setAutoSave: (autoSave) => get().patchChannel({ auto_save: autoSave }),
 
     leaveChannel: () => {
-      // Resolve any open first-contact prompt so an awaiting roster refresh
-      // doesn't hang forever once its channel is gone.
-      get().tofu?.resolve(false);
-      set({ channel: null, timeline: [] });
+      // Resolve every open first-contact prompt so awaiting roster refreshes
+      // don't hang forever once their channel is gone.
+      drainTofu(false);
+      set({ channel: null, timeline: [], tofu: null });
       persistChannel();
     },
 
@@ -200,36 +227,54 @@ export const useStore = create<Store>((set, get) => {
     removeTimelineEntry: (id) =>
       set((s) => ({ timeline: s.timeline.filter((r) => r.id !== id) })),
 
-    // Wholesale replace — the rebuild computes the full list from the relay and
-    // swaps it in atomically, so a React StrictMode double-mount is idempotent
-    // (unlike per-row appends). In-memory only, like the rest of the timeline.
-    setTimeline: (rows) => set({ timeline: rows }),
+    // The rebuild computes the full history from the relay and swaps it in
+    // near-atomically. But a user-driven send appended while the async sweep was
+    // in flight lives ONLY in this timeline (its slot wasn't in the relay list
+    // yet, and its client-generated id has no relay twin), so a wholesale
+    // replace would silently drop it. Keep those live-only rows — in-flight and
+    // failed sends — above the rebuilt history; everything else is relay-derived
+    // and safe to replace. In-memory only, like the rest of the timeline.
+    rebuildTimeline: (rows) =>
+      set((s) => {
+        const liveOnly = s.timeline.filter(
+          (r) =>
+            r.kind === "send" &&
+            (r.status === "in_flight" || r.status === "failed"),
+        );
+        return { timeline: [...liveOnly, ...rows] };
+      }),
 
     requestTofu: (request) =>
       new Promise<boolean>((resolve) => {
-        set({
-          tofu: {
-            request,
-            resolve: (ok) => {
-              set({ tofu: null });
-              resolve(ok);
-            },
-          },
-        });
+        const existing = tofuQueue.find(
+          (e) => e.request.sigPub === request.sigPub,
+        );
+        if (existing) {
+          // Already prompting (or queued) for this identity — share its outcome
+          // instead of opening a second modal and orphaning this resolver.
+          existing.resolvers.push(resolve);
+          return;
+        }
+        tofuQueue.push({ request, resolvers: [resolve] });
+        set({ tofu: headTofu() });
       }),
 
     resolveTofu: (ok) => {
-      const t = get().tofu;
-      if (t) t.resolve(ok);
+      const head = tofuQueue.shift();
+      if (!head) return;
+      // Advance the modal to the next prompt first, then settle the awaiters.
+      set({ tofu: headTofu() });
+      for (const r of head.resolvers) r(ok);
     },
 
     factoryReset: () => {
       // Tear down any in-flight transfer first so its abort controller and
       // worker thread don't leak past the reset.
       get().transfer.abort?.abort();
-      // Resolve a pending TOFU prompt so a receive-side roster refresh awaiting
-      // it doesn't dangle (the transfer slice doesn't cover receive-side TOFU).
-      get().tofu?.resolve(false);
+      // Resolve every pending TOFU prompt so a receive-side roster refresh
+      // awaiting one doesn't dangle (the transfer slice doesn't cover
+      // receive-side TOFU).
+      drainTofu(false);
       cryptoClient.cancel();
       persistence.reset();
       const identity = generateIdentity();

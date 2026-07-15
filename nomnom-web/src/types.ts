@@ -81,6 +81,9 @@ export interface TimelineEntry {
   progress?: number;   // 0..1, for in_flight sends
   error?: string;      // failed sends
   body?: ArrayBuffer;  // receive only; present from "held" through "saved"
+  slot_id?: string;    // receive only; set on history-rebuilt rows so their body
+                       // can be re-fetched + decrypted lazily on save (the
+                       // rebuild doesn't keep every body in memory at once)
 }
 
 /** The synthetic global pin id for an Ed25519 identity (matches CLI `_feed_peer_id`). */

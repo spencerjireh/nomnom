@@ -107,7 +107,10 @@ describe("runHistory", () => {
     expect(recv.status).toBe("held");
     expect(recv.peerName).toBe("bob");
     expect(recv.bytes).toBe(3);
-    expect(recv.body?.byteLength).toBe(3);
+    // Rebuilt receive rows keep only the slot_id (body fetched lazily on save),
+    // so a refresh doesn't hold every retained file in memory at once.
+    expect(recv.body).toBeUndefined();
+    expect(recv.slot_id).toBe("s2");
     const sent = rows[1];
     expect(sent.status).toBe("served");
     expect(sent.body).toBeUndefined();

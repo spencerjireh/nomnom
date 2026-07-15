@@ -75,6 +75,11 @@ function Row({
     window.setTimeout(() => setCopied("idle"), 1400);
   }
 
+  // A received file the user can act on: either its bytes are in memory (live
+  // receipt / already-saved) or it was rebuilt from history and carries a
+  // slot_id we can re-fetch on save.
+  const hasFile = row.kind === "receive" && (!!row.body || !!row.slot_id);
+
   const arrow = row.kind === "receive" ? "←" : "→";
   const peer =
     row.kind === "receive"
@@ -111,6 +116,9 @@ function Row({
             {" "}
             failed{row.error ? `: ${row.error}` : ""}
           </span>
+        )}
+        {row.kind === "receive" && row.error && (
+          <span className="row-stamp err"> · {row.error}</span>
         )}
       </div>
       {expanded && preview && (
@@ -158,7 +166,7 @@ function Row({
           />
         </div>
       )}
-      {row.body && (
+      {hasFile && (
         <div className="row-held-actions">
           {preview && (
             <button

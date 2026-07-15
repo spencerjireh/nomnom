@@ -4140,6 +4140,86 @@ class TestCmdReceiveFeed:
         assert rc == 1
         assert "no transfer" in capsys.readouterr().err
 
+    def test_relay_get_feed_slot_maps_5xx_to_transient(self, monkeypatch):
+        monkeypatch.setattr(
+            nomnom, "_feed_request", lambda *a, **k: (503, b'{"error":"boom"}'),
+        )
+        with pytest.raises(nomnom.NomnomTransportError):
+            nomnom._relay_get_feed_slot("h", "fid", b"k" * 32, "slot-1")
+
+    def test_relay_get_feed_slot_maps_network_error_to_transient(self, monkeypatch):
+        def boom(*a, **k):
+            raise nomnom.NomnomError("relay request failed: connection reset")
+
+        monkeypatch.setattr(nomnom, "_feed_request", boom)
+        with pytest.raises(nomnom.NomnomTransportError):
+            nomnom._relay_get_feed_slot("h", "fid", b"k" * 32, "slot-1")
+
+    def test_relay_get_feed_slot_404_is_none(self, monkeypatch):
+        monkeypatch.setattr(nomnom, "_feed_request", lambda *a, **k: (404, b""))
+        assert nomnom._relay_get_feed_slot("h", "fid", b"k" * 32, "slot-1") is None
+
+    def test_receive_and_report_propagates_transient(self, monkeypatch):
+        def boom(*a, **k):
+            raise nomnom.NomnomTransportError("relay returned HTTP 503")
+
+        monkeypatch.setattr(nomnom, "_relay_get_feed_slot", boom)
+        feed = nomnom.Feed(
+            name="home", feed_id="tok", feed_token="tok",
+            url="https://relay.example.com/f/tok",
+            expires_at=2_000_000_000, joined_at=1_700_000_000,
+            member_id="a" * 32, members_cache=[],
+        )
+        with pytest.raises(nomnom.NomnomTransportError):
+            nomnom._receive_and_report(
+                feed=feed, host="h", feed_key=b"k" * 32, slot_id="s",
+            )
+
+    def test_receive_and_report_swallows_permanent(self, monkeypatch, capsys):
+        # A tamper/decode failure raises a plain NomnomError inside
+        # _receive_one_post — permanent, so it's warned and swallowed (False),
+        # which the loops treat as advance-safe.
+        monkeypatch.setattr(
+            nomnom, "_relay_get_feed_slot", lambda *a, **k: b"not-a-feed-blob",
+        )
+        feed = nomnom.Feed(
+            name="home", feed_id="tok", feed_token="tok",
+            url="https://relay.example.com/f/tok",
+            expires_at=2_000_000_000, joined_at=1_700_000_000,
+            member_id="a" * 32, members_cache=[],
+        )
+        landed = nomnom._receive_and_report(
+            feed=feed, host="h", feed_key=b"k" * 32, slot_id="s",
+        )
+        assert landed is False
+        assert "warning" in capsys.readouterr().err
+
+    def test_receive_retries_after_transient_error(self, env, capsys, monkeypatch):
+        # A transient slot fetch must NOT advance the cursor past the post; the
+        # next poll re-lists it and it lands on retry (vs. the old bug that
+        # advanced unconditionally and dropped it forever).
+        tmp_path, feed, slots = env
+        monkeypatch.chdir(tmp_path)
+        real_body = slots[0]["body"]
+        calls = {"n": 0}
+
+        def flaky_get_slot(host, fid, fkey, slot_id, *, wait_ms=0):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise nomnom.NomnomTransportError("relay returned HTTP 503")
+            return real_body
+
+        monkeypatch.setattr(nomnom, "_relay_get_feed_slot", flaky_get_slot)
+        rc = nomnom.cmd_receive(once=True)
+        assert rc == 0
+        # The post was retried, not skipped.
+        assert (tmp_path / "from-bob.txt").read_bytes() == b"hello alice"
+        err = capsys.readouterr().err
+        assert "warning" in err
+        # The persisted cursor only advanced once the post actually landed.
+        ch = nomnom._the_channel()
+        assert ch is not None and ch.last_post_ts == 1
+
 
 class _FakeStreamResp:
     def __init__(self, status, chunks):
