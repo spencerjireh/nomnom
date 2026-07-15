@@ -25,10 +25,12 @@ export function TofuModal() {
         </p>
         <p className="dim small">verify this out-of-band with them if it matters.</p>
         <div className="modal-actions">
-          <button type="button" className="btn ghost" onClick={() => resolveTofu(false)}>
+          {/* Pass the rendered identity so a stale double-click can't settle the
+              next queued prompt with this decision. */}
+          <button type="button" className="btn ghost" onClick={() => resolveTofu(false, request.sigPub)}>
             not now
           </button>
-          <button type="button" className="btn primary" onClick={() => resolveTofu(true)}>
+          <button type="button" className="btn primary" onClick={() => resolveTofu(true, request.sigPub)}>
             trust &amp; pin
           </button>
         </div>

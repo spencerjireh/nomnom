@@ -98,23 +98,23 @@ describe("timeline actions", () => {
     expect(store.useStore.getState().timeline.map((r) => r.id)).toEqual(["r2", "r1"]);
   });
 
-  it("rebuildTimeline preserves a concurrent in-flight (or failed) send row", () => {
+  it("rebuildTimeline preserves a concurrent in-flight send but drops failed/received rows", () => {
     const s = store.useStore.getState();
     s.setChannel(makeFeed("channel"));
     // A user send started while the async history sweep was in flight.
     s.appendTimeline(entry("sending", { kind: "send", status: "in_flight", peerName: undefined }));
+    // A failed send is NOT kept: if it committed the rebuild reconstructs it as
+    // served (keeping it would duplicate); if not, the post is genuinely absent.
     s.appendTimeline(entry("bad", { kind: "send", status: "failed", peerName: undefined }));
-    // A received row that the rebuild WILL reconstruct — safe to drop.
+    // A received row the rebuild WILL reconstruct — safe to drop.
     s.appendTimeline(entry("old-received"));
 
     const rebuilt = [entry("r2", { at: 2 }), entry("r1", { at: 1 })];
     s.rebuildTimeline(rebuilt);
 
     const ids = store.useStore.getState().timeline.map((r) => r.id);
-    // Live-only send rows survive newest-first (append prepends, so "bad" — added
-    // last — leads) above the rebuilt history; the reconstructable received row
-    // is replaced by the rebuild.
-    expect(ids).toEqual(["bad", "sending", "r2", "r1"]);
+    // Only the in-flight send survives (above the rebuilt history).
+    expect(ids).toEqual(["sending", "r2", "r1"]);
   });
 
   it("removes an entry by id and leaves the rest", () => {
@@ -304,6 +304,36 @@ describe("tofu prompt queue", () => {
 
     s.leaveChannel();
     expect(await p1).toBe(false);
+    expect(await p2).toBe(false);
+    expect(store.useStore.getState().tofu).toBeNull();
+  });
+
+  it("re-pairing to a different channel drains pending prompts", async () => {
+    const s = store.useStore.getState();
+    s.setChannel(makeFeed("channel"));
+    const p1 = s.requestTofu(alice);
+
+    s.setChannel(makeFeed("channel", { feed_id: "id-other" }));
+    // The old channel's prompt must not carry into the new channel.
+    expect(await p1).toBe(false);
+    expect(store.useStore.getState().tofu).toBeNull();
+  });
+
+  it("a stale second resolve can't settle the next queued identity", async () => {
+    const s = store.useStore.getState();
+    const p1 = s.requestTofu(alice);
+    const p2 = s.requestTofu(bob);
+
+    // The modal rendered alice; a real decision + a stale double-click both carry
+    // alice's sigPub. Only the first settles alice; the second is ignored, so
+    // bob's prompt is NOT decided by the stray click.
+    s.resolveTofu(true, alice.sigPub);
+    s.resolveTofu(true, alice.sigPub); // stale — head is now bob
+    expect(await p1).toBe(true);
+    expect(store.useStore.getState().tofu?.request.sigPub).toBe("PUB2");
+
+    // bob is still pending and only resolves with its own decision.
+    s.resolveTofu(false, bob.sigPub);
     expect(await p2).toBe(false);
     expect(store.useStore.getState().tofu).toBeNull();
   });

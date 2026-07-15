@@ -179,7 +179,11 @@ export async function saveHeld(id: string): Promise<void> {
       feedId: feed.feed_id,
       blob: raw,
     });
-    downloadBlob(row.name, opened.body);
+    // The user may have discarded the row during the fetch/decrypt — don't
+    // download or patch a row that's gone (or was replaced).
+    const current = useStore.getState().timeline.find((r) => r.id === id);
+    if (!current || current.slot_id !== row.slot_id) return;
+    downloadBlob(current.name, opened.body);
     useStore.getState().patchTimelineEntry(id, {
       status: "saved",
       body: opened.body,

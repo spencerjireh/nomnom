@@ -71,7 +71,9 @@ interface Store {
   rebuildTimeline: (rows: TimelineEntry[]) => void;
 
   requestTofu: (request: TofuRequest) => Promise<boolean>;
-  resolveTofu: (ok: boolean) => void;
+  /** Resolve the current prompt. `forSigPub` (the identity the caller rendered)
+   * guards against a stale rapid click settling the next queued identity. */
+  resolveTofu: (ok: boolean, forSigPub?: string) => void;
 
   factoryReset: () => void;
 }
@@ -148,9 +150,16 @@ export const useStore = create<Store>((set, get) => {
     // --- channel ---
 
     setChannel: (feed) => {
-      // Re-pairing to a different channel clears the previous timeline.
+      // Re-pairing to a different channel clears the previous timeline AND any
+      // pending first-contact prompts, so a stale prompt from the old channel
+      // can't apply its trust decision in the new one.
       const replacing = get().channel?.feed_id !== feed.feed_id;
-      set({ channel: feed, timeline: replacing ? [] : get().timeline });
+      if (replacing) drainTofu(false);
+      set({
+        channel: feed,
+        timeline: replacing ? [] : get().timeline,
+        tofu: replacing ? null : get().tofu,
+      });
       persistChannel();
     },
 
@@ -231,15 +240,16 @@ export const useStore = create<Store>((set, get) => {
     // near-atomically. But a user-driven send appended while the async sweep was
     // in flight lives ONLY in this timeline (its slot wasn't in the relay list
     // yet, and its client-generated id has no relay twin), so a wholesale
-    // replace would silently drop it. Keep those live-only rows — in-flight and
-    // failed sends — above the rebuilt history; everything else is relay-derived
-    // and safe to replace. In-memory only, like the rest of the timeline.
+    // replace would silently drop it. Keep those in-flight send rows above the
+    // rebuilt history; everything else is relay-derived and safe to replace.
+    // A *failed* send is deliberately NOT kept: if its PUT never committed the
+    // post is genuinely absent, and if it did commit the rebuild already
+    // reconstructs it as a served row — keeping it would duplicate that post.
+    // In-memory only, like the rest of the timeline.
     rebuildTimeline: (rows) =>
       set((s) => {
         const liveOnly = s.timeline.filter(
-          (r) =>
-            r.kind === "send" &&
-            (r.status === "in_flight" || r.status === "failed"),
+          (r) => r.kind === "send" && r.status === "in_flight",
         );
         return { timeline: [...liveOnly, ...rows] };
       }),
@@ -259,9 +269,14 @@ export const useStore = create<Store>((set, get) => {
         set({ tofu: headTofu() });
       }),
 
-    resolveTofu: (ok) => {
-      const head = tofuQueue.shift();
+    resolveTofu: (ok, forSigPub) => {
+      const head = tofuQueue[0];
       if (!head) return;
+      // Guard against a stale rapid second click (double-click / key repeat)
+      // resolving the NEXT identity with one intended decision: the modal passes
+      // the sigPub it rendered, so if the head has already advanced, ignore.
+      if (forSigPub !== undefined && head.request.sigPub !== forSigPub) return;
+      tofuQueue.shift();
       // Advance the modal to the next prompt first, then settle the awaiters.
       set({ tofu: headTofu() });
       for (const r of head.resolvers) r(ok);
