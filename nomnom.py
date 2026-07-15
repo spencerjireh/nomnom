@@ -821,6 +821,13 @@ class PickResult(NamedTuple):
     item_id: str | None = None
 
 
+# Sentinel returned by `_picker_ui` (only when `allow_more=True`) to signal the
+# user pressed `m` for the "more" overlay. Keeps the return contract as
+# None=cancel/quit, PickResult=emit, PICKER_MORE=excursion — without perturbing
+# PickResult's value-compared shape.
+PICKER_MORE = object()
+
+
 PREVIEW_MAX_BYTES = 2_000_000
 PREVIEW_MIN_TERMINAL_WIDTH = 100
 
@@ -876,15 +883,25 @@ def _picker_ui(
     initial_include_tree: bool = True,
     allow_stdout: bool = True,
     allow_git_verbs: bool = False,
-) -> PickResult | None:
+    allow_more: bool = False,
+    banner: str | None = None,
+    initial_verb: Verb = Verb.BUNDLE,
+):
     """Run the picker loop on an existing `stdscr`.
 
-    `pick()` calls this through `curses.wrapper`. The launcher TUI calls it
-    directly, since `curses.wrapper` cannot nest. `allow_stdout=False`
-    drops STDOUT from the `d` cycle — meaningless when curses owns the
-    terminal. `allow_git_verbs=True` enables the `v` verb cycle through
-    Commit/PR/Item in addition to the default Bundle; non-git
-    directories should leave it False so the cycle collapses to Bundle."""
+    Returns a `PickResult` (Enter), `None` (q / cancel), or the `PICKER_MORE`
+    sentinel (only when `allow_more=True` and the user pressed `m`).
+
+    `pick()` calls this through `curses.wrapper`. The interactive picker loop
+    (`_run_picker_loop`) calls it directly, since `curses.wrapper` cannot nest.
+    `allow_stdout=False` drops STDOUT from the `d` cycle — meaningless when
+    curses owns the terminal. `allow_git_verbs=True` enables the `v` verb cycle
+    through Commit/PR/Item in addition to the default Bundle; non-git
+    directories should leave it False so the cycle collapses to Bundle.
+    `allow_more=True` enables the `m` key (returns `PICKER_MORE`). `banner` is a
+    transient one-line status (e.g. "bundled → …") drawn above the footer.
+    `initial_verb` seeds the `v` cycle so the loop can carry the verb forward
+    (snapped back to Bundle when git verbs are unavailable)."""
     if not nodes:
         dest = initial_destination
         if not allow_stdout and dest == Destination.STDOUT:
@@ -910,13 +927,19 @@ def _picker_ui(
     cancelled = False
     destination = initial_destination
     include_tree = initial_include_tree
-    verb = Verb.BUNDLE
+    # Snap a carried-over verb back to Bundle when git verbs aren't available
+    # (e.g. re-entering the picker in a non-git dir).
+    verb = initial_verb if initial_verb in verb_allowed else Verb.BUNDLE
     item_kind: str | None = None
     item_id: str | None = None
     preview_visible = root is not None
 
     curses.curs_set(0)
     stdscr.keypad(True)
+    # Force blocking getch. A prior "more" excursion (e.g. ReceiveScreen) may
+    # have left a non-blocking timeout set; without this the re-entered picker
+    # would spin at 100% CPU. No-op on the one-shot `pick()` path.
+    stdscr.timeout(-1)
     try:
         curses.mousemask(
             curses.BUTTON1_CLICKED | curses.BUTTON1_DOUBLE_CLICKED
@@ -1071,15 +1094,23 @@ def _picker_ui(
                 stdscr.addstr(filter_buf[: max(0, w - 3)], theme["filter"])
             except curses.error:
                 pass
+        elif banner:
+            # Transient "last action" notice; shares row h-2 with the filter
+            # input, so only drawn when the filter is inactive and empty.
+            try:
+                stdscr.addstr(h - 2, 0, banner[: max(1, w - 1)], theme["filter"])
+            except curses.error:
+                pass
+        more_hint = "  m:more" if allow_more else ""
         if len(verb_allowed) > 1:
             status = (
                 "space:toggle  /:filter  v:verb  d:dest  t:tree  p:preview  "
-                "s:sort  a:toggle-visible  enter:run  q:quit"
+                "s:sort  a:toggle-visible  enter:run" + more_hint + "  q:quit"
             )
         else:
             status = (
                 "space:toggle  /:filter  d:dest  t:tree  p:preview  "
-                "s:sort  a:toggle-visible  enter:write  q:quit"
+                "s:sort  a:toggle-visible  enter:write" + more_hint + "  q:quit"
             )
         try:
             stdscr.addstr(h - 1, 0, status[: w - 1], theme["dim"])
@@ -1170,6 +1201,8 @@ def _picker_ui(
             preview_visible = not preview_visible
         elif ch == ord("v"):
             verb = cycle_verb(verb, verb_allowed)
+        elif ch == ord("m") and allow_more:
+            return PICKER_MORE
         elif ch in (10, 13):
             if verb == Verb.ITEM:
                 if root is None:
@@ -1208,7 +1241,8 @@ def pick(
 ) -> PickResult | None:
     """CLI entry: run `_picker_ui` under its own `curses.wrapper`.
 
-    The launcher TUI calls `_picker_ui` directly (curses.wrapper can't nest).
+    The interactive picker loop (`_run_picker_loop`) calls `_picker_ui`
+    directly instead (curses.wrapper can't nest).
     `allow_git_verbs=True` enables the `v` verb cycle through Commit/PR/Item
     in the footer; callers should pass True only when `root` is a git repo.
     """
@@ -6010,7 +6044,7 @@ _TUI_TOFU_HANDLER = None
 
 
 def _in_tui() -> bool:
-    """True while `run_app` (the curses launcher) owns the terminal.
+    """True while the curses TUI (the picker loop or a Screen) owns the terminal.
 
     Helpers that would otherwise call `input()` or write raw stderr can
     branch on this to avoid corrupting the curses display.
@@ -6051,133 +6085,207 @@ def _tofu_modal(stdscr, card: dict) -> bool:  # pragma: no cover - curses I/O
     return _modal_yn(stdscr, default=False)
 
 
-def run_app(initial: Screen) -> None:  # pragma: no cover - curses I/O
-    """Drive a stack of Screen instances until empty or QUIT."""
-    def _loop(stdscr):
-        curses.curs_set(0)
-        stdscr.keypad(True)
-        stack: list[Screen] = [initial]
-        while stack:
-            current = stack[-1]
-            stdscr.erase()
-            current.render(stdscr)
-            stdscr.refresh()
-            ch = stdscr.getch()
-            if ch == curses.KEY_RESIZE:
-                continue
-            if ch == -1:
-                # Non-blocking getch timed out; the active screen set its own
-                # poll interval and gets an idle tick to do work (e.g. the
-                # receiver long-polls; a progress bar just redraws).
-                result = current.on_idle(stdscr)
-            elif ch == ord("?"):
-                show_help_modal(stdscr, current.help_lines)
-                continue
-            else:
-                result = current.handle_key(ch, stdscr)
-            if isinstance(result, Screen):
-                stack.append(result)
-            elif result == ScreenAction.BACK:
-                stack.pop()
-            elif result == ScreenAction.QUIT:
-                return
+def _drive_screens(stdscr, initial: Screen) -> None:  # pragma: no cover - curses I/O
+    """Drive a stack of Screen instances on an existing `stdscr` until the
+    stack empties (BACK past the root) or a screen returns QUIT.
 
-    global _TUI_ACTIVE
-    _TUI_ACTIVE = True
-    try:
-        curses.wrapper(_loop)
-    finally:
-        _TUI_ACTIVE = False
+    Runs without its own `curses.wrapper`, so `_run_picker_loop` can call it
+    from inside its own wrapper for a "more" excursion (curses.wrapper cannot
+    nest)."""
+    curses.curs_set(0)
+    stdscr.keypad(True)
+    stack: list[Screen] = [initial]
+    while stack:
+        current = stack[-1]
+        stdscr.erase()
+        current.render(stdscr)
+        stdscr.refresh()
+        ch = stdscr.getch()
+        if ch == curses.KEY_RESIZE:
+            continue
+        if ch == -1:
+            # Non-blocking getch timed out; the active screen set its own
+            # poll interval and gets an idle tick to do work (e.g. the
+            # receiver long-polls; a progress bar just redraws).
+            result = current.on_idle(stdscr)
+        elif ch == ord("?"):
+            show_help_modal(stdscr, current.help_lines)
+            continue
+        else:
+            result = current.handle_key(ch, stdscr)
+        if isinstance(result, Screen):
+            stack.append(result)
+        elif result == ScreenAction.BACK:
+            stack.pop()
+        elif result == ScreenAction.QUIT:
+            return
 
 
-class LauncherScreen(Screen):
-    title = "nomnom"
-    help_lines = [
-        "j/k or ↑/↓   move",
-        "Enter        open selected verb",
-        "q            quit",
-    ]
+# Verbs the file picker can't reach on its own (Bundle/Send are the picker's
+# `d` destinations; Commit/PR/Item are its `v` verb cycle). These live behind
+# the picker's `m` "more" overlay.
+_MORE_VERBS: tuple[str, ...] = ("Receive", "Channel", "Rebuild", "Extensions")
 
-    def __init__(self) -> None:
-        self.cursor = 0
-        self.tiles: list[tuple[str, str]] = [
-            ("Bundle",     "Pick files and write a bundle .txt"),
-            ("Send",       "Pick files (or v: commit/pr/item), send to your channel"),
-            ("Receive",    "Watch your channel for incoming files"),
-            ("Channel",    "Show the channel secret + devices; add this device"),
-            ("Commit",     "Bundle staged/unstaged diffs + recent commits"),
-            ("PR",         "Bundle commits since base + diff for an LLM"),
-            ("Item",       "Bundle a github item (pr/issue/commit/release/run/job)"),
-            ("Rebuild",    "Reconstruct a file tree from a bundle .txt"),
-            ("Extensions", "Edit the text/binary/name/secret lists"),
-        ]
-
-    def render(self, stdscr) -> None:  # pragma: no cover - curses I/O
-        theme = _setup_theme()
-        h, w = stdscr.getmaxyx()
-        header = " nomnom — feed your repo to the LLM "
-        try:
-            stdscr.addstr(0, 0, header.ljust(max(1, w - 1)), theme["filter"])
-        except curses.error:
-            pass
-        for i, (label, desc) in enumerate(self.tiles):
-            row = 2 + i
-            if row >= h - 1:
-                break
-            attr = theme["cursor"] if i == self.cursor else theme["dim"]
-            line = f"  {label:<12}  {desc}"
-            try:
-                stdscr.addstr(row, 0, line[: max(1, w - 1)], attr)
-            except curses.error:
-                pass
-        try:
-            stdscr.addstr(
-                h - 1, 0,
-                "j/k:move  enter:open  ?:help  q:quit"[: max(1, w - 1)],
-                theme["dim"],
-            )
-        except curses.error:
-            pass
-
-    def handle_key(self, ch: int, stdscr=None):
-        if ch in (curses.KEY_DOWN, ord("j")):
-            self.cursor = (self.cursor + 1) % len(self.tiles)
-            return ScreenAction.CONTINUE
-        if ch in (curses.KEY_UP, ord("k")):
-            self.cursor = (self.cursor - 1) % len(self.tiles)
-            return ScreenAction.CONTINUE
-        if ch in (ord("q"), 3, 27):
-            return ScreenAction.QUIT
-        if ch in (10, 13):
-            return _launcher_open(self.tiles[self.cursor][0])
-        return ScreenAction.CONTINUE
+_MORE_DESCS: dict[str, str] = {
+    "Receive":    "Watch your channel for incoming files",
+    "Channel":    "Show the channel secret + devices; add this device",
+    "Rebuild":    "Reconstruct a file tree from a bundle .txt",
+    "Extensions": "Edit the text/binary/name/secret lists",
+}
 
 
-def _launcher_open(verb: str):
-    """Map a launcher tile label to a Screen to push."""
-    if verb == "Extensions":
-        return ExtensionsScreen()
-    if verb == "Channel":
-        return ChannelScreen()
-    if verb == "Rebuild":
-        return RebuildScreen()
-    if verb == "Bundle":
-        return BundleScreen()
-    if verb == "Commit":
-        return CommitScreen()
-    if verb == "PR":
-        return PRScreen()
-    if verb == "Item":
-        return ItemScreen()
-    if verb == "Send":
-        # Send is a destination, not a separate flow: open the picker, then
-        # cycle the destination to "send" (v cycles bundle/commit/pr/item).
-        return BundleScreen()
-    if verb == "Receive":
+def _open_more_verb(name: str) -> Screen:
+    """Map a `_MORE_VERBS` label to the Screen to drive."""
+    if name == "Receive":
         return ReceiveScreen()
+    if name == "Channel":
+        return ChannelScreen()
+    if name == "Rebuild":
+        return RebuildScreen()
+    if name == "Extensions":
+        return ExtensionsScreen()
     raise AssertionError(
-        f"unmapped launcher tile: {verb!r}",
-    )  # every tile in LauncherScreen.tiles is handled above
+        f"unmapped more-menu verb: {name!r}",
+    )  # every label in _MORE_VERBS is handled above
+
+
+def _more_menu(stdscr) -> str | None:  # pragma: no cover - curses I/O
+    """Centered overlay listing `_MORE_VERBS`. Returns the chosen label on
+    Enter, or None on Esc/q. Modeled on `_prompt_item_id`."""
+    cursor = 0
+    try:
+        stdscr.timeout(-1)
+    except curses.error:
+        pass
+    while True:
+        body = [" more ".center(50, "─"), ""]
+        for i, verb in enumerate(_MORE_VERBS):
+            marker = "›" if i == cursor else " "
+            body.append(f" {marker} {verb:<12} {_MORE_DESCS[verb]}")
+        body.extend(["", "─" * 50, "  j/k: move   enter: open   esc: back"])
+        _draw_overlay(stdscr, body)
+        ch = stdscr.getch()
+        if ch == -1:
+            continue
+        if ch in (27, 3, ord("q")):
+            return None
+        if ch in (curses.KEY_DOWN, ord("j")):
+            cursor = (cursor + 1) % len(_MORE_VERBS)
+        elif ch in (curses.KEY_UP, ord("k")):
+            cursor = (cursor - 1) % len(_MORE_VERBS)
+        elif ch in (10, 13):
+            return _MORE_VERBS[cursor]
+
+
+def _scan_to_nodes(root: Path) -> tuple[list[Node], list[ScanItem]]:
+    """Scan `root` into picker nodes with the bundle defaults (gitignore
+    honored, secrets skipped). Returns (nodes, file_items); callers treat an
+    empty `file_items` as "nothing to pick". Shared by the bare-picker entry
+    and the post-excursion rescan so their scan behavior can't drift."""
+    gi = load_gitignore(root)
+    items = scan_repo(root, gi, skip_secrets=True)
+    file_items = [it for it in items if not it.is_dir]
+    if not file_items:
+        return [], []
+    stats = collect_stats(root, items)
+    return build_tree(items, stats=stats), file_items
+
+
+def _emit_picker_result(stdscr, result: PickResult, root: Path):
+    """Run the picker's chosen action (bundle emit or git verb) with stdout/
+    stderr captured so curses keeps the screen. Returns (messages, error,
+    banner): `messages` = captured status lines, `error` = non-empty on
+    failure, `banner` = a one-line notice for the next picker render.
+
+    stdout/stderr are redirected so the handlers' progress prints don't
+    corrupt the display; `_tui_tofu` hosts any first-contact SEND prompt as a
+    modal since those streams can't host `input()`."""
+    repo_name = root.name
+    if result.verb == Verb.BUNDLE and not result.selected:
+        return [], "", "no files selected."
+
+    messages: list[str] = []
+    error = ""
+    out_buf = io.StringIO()
+    err_buf = io.StringIO()
+    rc = 0
+    try:
+        with _tui_tofu(stdscr), \
+             contextlib.redirect_stdout(out_buf), \
+             contextlib.redirect_stderr(err_buf):
+            if result.verb == Verb.BUNDLE:
+                rc, lines = _emit_bundle(
+                    repo_name, root, sorted(result.selected),
+                    result.include_tree, result.destination,
+                )
+                messages = list(lines)
+            else:
+                rc = _run_picker_verb(result, root, include_diff=False)
+    except NomnomError as e:
+        error = str(e)
+    captured = (err_buf.getvalue() + out_buf.getvalue()).rstrip("\n")
+    if captured:
+        messages += captured.splitlines()
+    if rc != 0 and not error and messages:
+        error = messages[-1]
+    banner = error or (messages[-1] if messages else "done.")
+    return messages, error, banner
+
+
+def _result_modal(stdscr, messages: list[str], error: str) -> None:  # pragma: no cover - curses I/O
+    """Blocking modal showing an action's full (possibly multi-line) output.
+
+    The picker's status row only fits one line, so failures and multi-line
+    notices get the whole message here rather than a truncated one-liner."""
+    title = " error " if error else " result "
+    body = [title.center(50, "─"), *messages, "─" * 50, " press any key to continue "]
+    _draw_overlay(stdscr, body)
+    _modal_wait_key(stdscr)
+
+
+def _run_picker_loop(stdscr, root: Path, nodes: list[Node]) -> None:  # pragma: no cover - curses I/O
+    """Interactive home: run the file picker, emit on Enter, and loop back
+    into the picker with the selection intact. `q` exits; `m` opens the "more"
+    overlay and drives the chosen Screen, then returns to the picker."""
+    destination = Destination.FILE
+    include_tree = True
+    verb = Verb.BUNDLE
+    banner: str | None = None
+    allow_git = _is_inside_git_repo(root)
+    while True:
+        result = _picker_ui(
+            stdscr, nodes, root=root,
+            initial_destination=destination, initial_include_tree=include_tree,
+            allow_stdout=False, allow_git_verbs=allow_git,
+            allow_more=True, banner=banner, initial_verb=verb,
+        )
+        if result is None:  # q → quit the app
+            return
+        if result is PICKER_MORE:
+            choice = _more_menu(stdscr)
+            if choice is not None:
+                _drive_screens(stdscr, _open_more_verb(choice))
+                # Receive/Rebuild write files into cwd; rescan so they show up
+                # in the picker. Keep the old nodes if the rescan comes back
+                # empty (would otherwise busy-loop on an empty list).
+                if choice in ("Receive", "Rebuild"):
+                    fresh, files = _scan_to_nodes(root)
+                    if files:
+                        nodes = fresh
+            banner = None
+            # The next _picker_ui call re-asserts timeout/keypad/curs_set on
+            # entry, so no terminal-state fixups are needed here.
+            continue
+        messages, error, banner = _emit_picker_result(stdscr, result, root)
+        # Surface multi-line output / failures in full; the one-line banner
+        # alone would truncate them to the last line.
+        if error or len(messages) > 1:
+            _result_modal(stdscr, messages or [banner], error)
+        # Destination/tree/verb reset inside _picker_ui each call; carry them
+        # forward so a second action doesn't silently revert to file/bundle.
+        destination = result.destination
+        include_tree = result.include_tree
+        verb = result.verb
 
 
 class ReceiveScreen(Screen):
@@ -6194,7 +6302,7 @@ class ReceiveScreen(Screen):
     title = "Receive"
     help_lines = [
         "watching your channel; files land in the current directory",
-        "esc / q     stop and return to the launcher",
+        "esc / q     stop and return to the picker",
     ]
     _POLL_MS = 700
 
@@ -6396,13 +6504,13 @@ class RebuildScreen(Screen):
     Step 1 ('input'): user types a bundle path. Enter parses it.
     Step 2 ('preview'): tree of files to write + target dir; Enter writes,
                         Esc returns to step 1.
-    Step 3 ('done'):    write succeeded or failed; Esc back to launcher."""
+    Step 3 ('done'):    write succeeded or failed; Esc back to the picker."""
 
     title = "Rebuild"
     help_lines = [
         "type a bundle path; enter to parse",
         "in preview: enter to write, esc to re-enter the path",
-        "esc / q from input mode returns to launcher",
+        "esc / q from input mode returns to the picker",
     ]
 
     def __init__(self) -> None:
@@ -6543,7 +6651,7 @@ class ExtensionsScreen(Screen):
         "j/k or ↑/↓   move within section",
         "a            add a new value",
         "d            delete the focused entry (confirms)",
-        "esc / q      back to launcher",
+        "esc / q      back to the picker",
     ]
 
     # (display label, register kind, value-source iterable)
@@ -6783,7 +6891,7 @@ class ChannelScreen(Screen):
         "r            refresh the device list from the relay",
         "j            paste a secret to add (re-pair) this device",
         "l            leave the channel on this device",
-        "esc / q      back to launcher",
+        "esc / q      back to the picker",
     ]
 
     def __init__(self) -> None:
@@ -6938,431 +7046,6 @@ class ChannelScreen(Screen):
             self.message = "left the channel; paste a secret to re-pair"
             self.mode = "join"
         return ScreenAction.CONTINUE
-
-
-class BundleScreen(Screen):
-    """Two-step bundle flow inside the TUI: enter a repo path, then pick.
-
-    Step 1 ('path'): user types the repo to bundle (default cwd). Enter
-                     validates `is_dir`, scans, then opens the picker.
-    Step 2 ('done'): writes the bundle via `_emit_bundle` (file/clipboard
-                     /send only — STDOUT is hidden from the picker cycle
-                     because curses owns the terminal). Esc returns to
-                     the launcher."""
-
-    title = "Bundle"
-    help_lines = [
-        "type a repo path; enter to scan",
-        "in picker: d cycles file/clipboard/send, t toggles tree, p preview",
-        "esc / q from input mode returns to launcher",
-    ]
-
-    def __init__(self) -> None:
-        self.step = "path"
-        self.path_buf = str(Path.cwd())
-        self.error = ""
-        self.messages: list[str] = []
-
-    def _scan_and_pick(self, stdscr) -> bool:
-        """Validate path → scan → pick → emit. Returns False to send the
-        screen back to the launcher (cancelled), True to stay (error or
-        done state). All status is recorded on self for `render` to show."""
-        self.error = ""
-        self.messages = []
-        root = Path(self.path_buf.strip()).expanduser().resolve()
-        if not root.is_dir():
-            self.error = f"not a directory: {root}"
-            return True
-        repo_name = root.name
-        if not repo_name:
-            self.error = f"cannot derive a repo name from {root}"
-            return True
-
-        gi = load_gitignore(root)
-        items = scan_repo(root, gi, skip_secrets=True)
-        file_items = [it for it in items if not it.is_dir]
-        if not file_items:
-            self.error = "no files found after applying excludes."
-            return True
-
-        stats = collect_stats(root, items)
-        nodes = build_tree(items, stats=stats)
-
-        allow_git_verbs = _is_inside_git_repo(root)
-        result = _picker_ui(
-            stdscr, nodes, root=root,
-            allow_stdout=False, allow_git_verbs=allow_git_verbs,
-        )
-        if result is None:
-            return False
-
-        if result.verb != Verb.BUNDLE:
-            self._run_git_verb(result, root, stdscr)
-            self.step = "done"
-            return True
-
-        if not result.selected:
-            self.error = "no files selected."
-            self.step = "done"
-            return True
-
-        selected = sorted(result.selected)
-
-        out_buf = io.StringIO()
-        err_buf = io.StringIO()
-        # _tui_tofu turns any first-contact prompt during a SEND into a modal
-        # (the redirected streams can't host input()).
-        with _tui_tofu(stdscr), \
-             contextlib.redirect_stdout(out_buf), \
-             contextlib.redirect_stderr(err_buf):
-            rc, lines = _emit_bundle(
-                repo_name, root, selected, result.include_tree,
-                result.destination,
-            )
-        captured = (err_buf.getvalue() + out_buf.getvalue()).rstrip("\n")
-        self.messages = list(lines)
-        if captured:
-            self.messages += captured.splitlines()
-        if rc != 0 and self.messages:
-            self.error = self.messages[-1]
-        self.step = "done"
-        return True
-
-    def _run_git_verb(self, result, root: Path, stdscr) -> None:
-        """Run cmd_commit / cmd_pr / cmd_item without disturbing curses.
-
-        The handlers print progress to stdout/stderr; redirect both into
-        StringIO buffers and route them through `self.messages` so the
-        BundleScreen's render path owns the screen state. `_tui_tofu` hosts
-        any first-contact prompt as a modal when the destination is SEND.
-        """
-        out_buf = io.StringIO()
-        err_buf = io.StringIO()
-        rc = 0
-        try:
-            with _tui_tofu(stdscr), \
-                 contextlib.redirect_stdout(out_buf), \
-                 contextlib.redirect_stderr(err_buf):
-                rc = _run_picker_verb(result, root, include_diff=False)
-        except NomnomError as e:
-            self.error = str(e)
-        captured = (err_buf.getvalue() + out_buf.getvalue()).rstrip("\n")
-        if captured:
-            self.messages += captured.splitlines()
-        if rc != 0 and not self.error and self.messages:
-            self.error = self.messages[-1]
-
-    def render(self, stdscr) -> None:  # pragma: no cover - curses I/O
-        theme = _setup_theme()
-        h, w = stdscr.getmaxyx()
-        try:
-            stdscr.addstr(0, 0, f" {self.title} ".ljust(max(1, w - 1)),
-                          theme["filter"])
-        except curses.error:
-            pass
-        if self.step == "path":
-            _text_input_field(stdscr, 2, 2, "Repo path:", self.path_buf, theme,
-                              max(1, w - 4))
-            if self.error:
-                try:
-                    stdscr.addstr(5, 2, f"error: {self.error}", theme["dim"])
-                except curses.error:
-                    pass
-            footer = "enter:scan  esc/q:back  ?:help"
-        else:  # done
-            row = 2
-            for line in self.messages:
-                if row >= h - 1:
-                    break
-                try:
-                    stdscr.addstr(row, 2, line[: max(1, w - 3)], 0)
-                except curses.error:
-                    pass
-                row += 1
-            if self.error:
-                try:
-                    stdscr.addstr(row + 1, 2, f"error: {self.error}",
-                                  theme["dim"])
-                except curses.error:
-                    pass
-            footer = "esc/q:back  ?:help"
-        try:
-            stdscr.addstr(h - 1, 0, footer[: max(1, w - 1)], theme["dim"])
-        except curses.error:
-            pass
-
-    def handle_key(self, ch: int, stdscr=None):
-        if self.step == "path":
-            if ch in (ord("q"), 3, 27):
-                return ScreenAction.BACK
-            if ch in (10, 13):
-                if stdscr is None:
-                    return ScreenAction.CONTINUE
-                stay = self._scan_and_pick(stdscr)
-                return ScreenAction.CONTINUE if stay else ScreenAction.BACK
-            if ch in (curses.KEY_BACKSPACE, 127, 8):
-                self.path_buf = self.path_buf[:-1]
-                return ScreenAction.CONTINUE
-            if 32 <= ch < 127:
-                self.path_buf += chr(ch)
-            return ScreenAction.CONTINUE
-        # done
-        if ch in (ord("q"), 3, 27, 10, 13):
-            return ScreenAction.BACK
-        return ScreenAction.CONTINUE
-
-
-class _GitContextScreen(Screen):
-    """Shared base for Commit / PR / Review screens.
-
-    State machine: `inputs` → `done`. The inputs step renders a field
-    list driven by `fields`; Tab/arrows cycle the focus, `d` cycles
-    destination from anywhere. Enter captures stdout/stderr around the
-    subclass's `_run_cmd` and stores the result for the done panel."""
-
-    verb = ""
-    # Field ids that accept free-text input (rendered with `> ` prompt).
-    # Anything else is treated as a read-only status row driven by a hotkey.
-    _TEXT_FIDS: tuple[str, ...] = ("repo",)
-    # Placeholder shown for a text field whose buffer is empty.
-    _PLACEHOLDERS: dict[str, str] = {"repo": "(empty)"}
-
-    def __init__(self) -> None:
-        self.step = "inputs"
-        self.field_cursor = 0
-        # Text fields keyed by field id, so the base class owns all editing;
-        # subclasses just declare `fields`, `_TEXT_FIDS`, and `_PLACEHOLDERS`.
-        self.bufs: dict[str, str] = {"repo": str(Path.cwd())}
-        self.destination = Destination.FILE
-        self.error = ""
-        self.output_lines: list[str] = []
-        self.rc = 0
-
-    @property
-    def fields(self) -> list[tuple[str, str]]:
-        """(field_id, label) — drives cursor + rendering."""
-        return [("repo", "Repo path:"), ("dest", "Destination:")]
-
-    def _cycle_dest(self) -> None:
-        allowed = (Destination.FILE, Destination.CLIPBOARD)
-        if _has_send_target():
-            allowed += (Destination.SEND,)
-        self.destination = cycle_destination(self.destination, allowed)
-
-    def _run_cmd(self) -> int:
-        """Subclass hook: dispatch to cmd_commit/pr/item with collected
-        inputs. May raise NomnomError; stdout/stderr are captured by the
-        caller."""
-        raise NotImplementedError
-
-    def _execute(self, stdscr) -> None:
-        self.error = ""
-        self.output_lines = []
-        out_buf = io.StringIO()
-        err_buf = io.StringIO()
-        try:
-            # _tui_tofu hosts any first-contact prompt as a modal when the
-            # destination is SEND (redirected streams can't host input()).
-            with _tui_tofu(stdscr), \
-                 contextlib.redirect_stdout(out_buf), \
-                 contextlib.redirect_stderr(err_buf):
-                self.rc = self._run_cmd()
-        except NomnomError as e:
-            self.rc = 1
-            self.error = str(e)
-        captured = (err_buf.getvalue() + out_buf.getvalue()).rstrip("\n")
-        if captured:
-            self.output_lines = captured.splitlines()
-        self.step = "done"
-
-    def _field_value(self, fid: str) -> str:
-        if fid == "dest":
-            return self.destination.name.lower()
-        if fid in self._TEXT_FIDS:
-            return self.bufs.get(fid, "") or self._PLACEHOLDERS.get(fid, "")
-        return ""
-
-    def _edit_field(self, fid: str, ch: int) -> None:
-        if fid in self._TEXT_FIDS:
-            if ch in (curses.KEY_BACKSPACE, 127, 8):
-                self.bufs[fid] = self.bufs.get(fid, "")[:-1]
-            elif 32 <= ch < 127:
-                self.bufs[fid] = self.bufs.get(fid, "") + chr(ch)
-
-    def render(self, stdscr) -> None:  # pragma: no cover - curses I/O
-        theme = _setup_theme()
-        h, w = stdscr.getmaxyx()
-        try:
-            stdscr.addstr(0, 0, f" {self.verb} ".ljust(max(1, w - 1)),
-                          theme["filter"])
-        except curses.error:
-            pass
-        if self.step == "inputs":
-            row = 2
-            for i, (fid, label) in enumerate(self.fields):
-                _text_input_field(
-                    stdscr, row, 2, label, self._field_value(fid), theme,
-                    width=max(1, w - 4),
-                    active=(i == self.field_cursor),
-                    read_only=fid not in self._TEXT_FIDS,
-                )
-                row += 3
-            if self.error:
-                try:
-                    stdscr.addstr(row, 2, f"error: {self.error}", theme["dim"])
-                except curses.error:
-                    pass
-            footer = ("tab:next-field  enter:run  d:dest  "
-                      "esc/q:back  ?:help")
-        else:  # done
-            try:
-                rc_attr = theme["dim"] if self.rc == 0 else theme["filter"]
-                stdscr.addstr(2, 2, f"rc: {self.rc}", rc_attr)
-            except curses.error:
-                pass
-            if self.error:
-                try:
-                    stdscr.addstr(3, 2, f"error: {self.error}", theme["dim"])
-                except curses.error:
-                    pass
-            row = 5 if self.error else 4
-            for line in self.output_lines:
-                if row >= h - 1:
-                    break
-                try:
-                    stdscr.addstr(row, 2, line[: max(1, w - 3)], 0)
-                except curses.error:
-                    pass
-                row += 1
-            footer = "esc/q:back  ?:help"
-        try:
-            stdscr.addstr(h - 1, 0, footer[: max(1, w - 1)], theme["dim"])
-        except curses.error:
-            pass
-
-    def handle_key(self, ch: int, stdscr=None):
-        if self.step == "inputs":
-            if ch in (ord("q"), 3, 27):
-                return ScreenAction.BACK
-            if ch in (9, curses.KEY_DOWN):
-                self.field_cursor = (self.field_cursor + 1) % len(self.fields)
-                return ScreenAction.CONTINUE
-            if ch == curses.KEY_UP:
-                self.field_cursor = (self.field_cursor - 1) % len(self.fields)
-                return ScreenAction.CONTINUE
-            if ch == ord("d"):
-                self._cycle_dest()
-                return ScreenAction.CONTINUE
-            if ch in (10, 13):
-                self._execute(stdscr)
-                return ScreenAction.CONTINUE
-            fid = self.fields[self.field_cursor][0]
-            self._edit_field(fid, ch)
-            return ScreenAction.CONTINUE
-        # done
-        if ch in (ord("q"), 3, 27, 10, 13):
-            return ScreenAction.BACK
-        return ScreenAction.CONTINUE
-
-
-class CommitScreen(_GitContextScreen):
-    """Bundle staged + unstaged diffs + recent commits via `cmd_commit`."""
-
-    title = "Commit"
-    verb = "Commit"
-    help_lines = [
-        "tab/arrows  move between fields",
-        "type        edit the path",
-        "d           cycle destination (file/clipboard/send)",
-        "enter       run; esc/q to go back",
-    ]
-
-    def _run_cmd(self) -> int:
-        return cmd_commit(self.bufs["repo"].strip(), destination=self.destination)
-
-
-class PRScreen(_GitContextScreen):
-    """Bundle commits-since-base + diff via `cmd_pr`."""
-
-    title = "PR"
-    verb = "PR"
-    _TEXT_FIDS = ("repo", "base")
-    _PLACEHOLDERS = {"repo": "(empty)", "base": "(default)"}
-    help_lines = [
-        "tab/arrows  move between fields",
-        "type        edit the path or base branch",
-        "d           cycle destination (file/clipboard/send)",
-        "enter       run; esc/q to go back",
-    ]
-
-    @property
-    def fields(self) -> list[tuple[str, str]]:
-        return [
-            ("repo", "Repo path:"),
-            ("base", "Base branch:"),
-            ("dest", "Destination:"),
-        ]
-
-    def _run_cmd(self) -> int:
-        base = self.bufs.get("base", "").strip() or None
-        return cmd_pr(self.bufs["repo"].strip(), base, destination=self.destination)
-
-
-class ItemScreen(_GitContextScreen):
-    """Bundle any github item via `cmd_item` (auto-detects pr/issue/commit/etc)."""
-
-    title = "Item"
-    verb = "Item"
-    _TEXT_FIDS = ("repo", "id")
-    _PLACEHOLDERS = {"repo": "(empty)", "id": "(required)"}
-    help_lines = [
-        "tab/arrows  move between fields",
-        "type        edit fields (id accepts number / sha / tag)",
-        "space       toggle the diff field when focused",
-        "d           cycle destination (file/clipboard/send)",
-        "enter       run; esc/q to go back",
-    ]
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.include_diff = False
-
-    @property
-    def fields(self) -> list[tuple[str, str]]:
-        return [
-            ("repo", "Repo path:"),
-            ("id", "Item id:"),
-            ("diff", "Include diff:"),
-            ("dest", "Destination:"),
-        ]
-
-    def _field_value(self, fid: str) -> str:
-        # `diff` is a non-text toggle; text fields fall through to the base.
-        if fid == "diff":
-            return "yes" if self.include_diff else "no"
-        return super()._field_value(fid)
-
-    def _edit_field(self, fid: str, ch: int) -> None:
-        if fid == "diff":
-            if ch == ord(" "):
-                self.include_diff = not self.include_diff
-            return
-        super()._edit_field(fid, ch)
-
-    def _run_cmd(self) -> int:
-        id_text = self.bufs.get("id", "").strip()
-        if not id_text:
-            raise NomnomError("item id is required")
-        parts = id_text.split(maxsplit=1)
-        if len(parts) == 2 and parts[0] in ITEM_KINDS:
-            kind_or_id, ident = parts[0], parts[1]
-        else:
-            kind_or_id, ident = id_text, None
-        return cmd_item(
-            self.bufs["repo"].strip(), kind_or_id, ident,
-            include_diff=self.include_diff,
-            destination=self.destination,
-        )
 
 
 def _wrap(text: str, width: int) -> list[str]:
@@ -8014,7 +7697,7 @@ def _emit_bundle(
     """Render the bundle and dispatch to the chosen destination.
 
     Returns (rc, status lines). The CLI prints the lines to stderr; the
-    TUI displays them on the done screen. STDOUT and SEND may still
+    TUI surfaces them via the picker banner/result modal. STDOUT and SEND may still
     write to their own streams as a side effect of dispatching."""
     tree_str = render_ascii_tree(selected, repo_name) if include_tree else None
     output = render_output(repo_name, root, selected, tree_str)
@@ -8103,7 +7786,7 @@ def _maybe_print_v2_migration_notice() -> None:
 def _run_picker_verb(result: PickResult, root: Path, *, include_diff: bool) -> int:
     """Dispatch a non-BUNDLE picker verb (COMMIT/PR/ITEM) to its cmd_* handler.
 
-    Shared by the bare-CLI path (`include_diff=True`) and the TUI BundleScreen
+    Shared by the bare-CLI path (`include_diff=True`) and the TUI picker loop
     (`include_diff=False`); both must stay in lock-step on how ITEM validates."""
     if result.verb == Verb.COMMIT:
         return cmd_commit(str(root), destination=result.destination)
@@ -8133,11 +7816,42 @@ def main() -> int:
         return _dispatch_subcommand(sys.argv[1:])
 
     if len(sys.argv) == 1 and sys.stdin.isatty() and sys.stdout.isatty():
+        # Interactive home: the file picker on the current directory. Scan
+        # BEFORE curses so progress prints stay off the display and the
+        # empty-guard can bail without ever entering the picker loop.
+        root = Path.cwd()
+        if not root.name:
+            print(f"error: cannot derive a repo name from {root}", file=sys.stderr)
+            return 1
         try:
-            run_app(LauncherScreen())
+            print(f"scanning {root} ...", file=sys.stderr)
+            nodes, file_items = _scan_to_nodes(root)
         except NomnomError as e:
             print(f"error: {e}", file=sys.stderr)
             return 1
+        if not file_items:
+            # A picker with no file nodes returns immediately and would
+            # busy-loop the driver; bail here instead. Git verbs live in the
+            # picker's `v` cycle, so point at their CLI form when there's
+            # nothing to pick in a git repo.
+            print("no files found after applying excludes.", file=sys.stderr)
+            if _is_inside_git_repo(root):
+                print(
+                    "  (for git context, run `nomnom commit` / `pr` / `item`.)",
+                    file=sys.stderr,
+                )
+            return 0
+        global _TUI_ACTIVE
+        _TUI_ACTIVE = True
+        try:
+            curses.wrapper(_run_picker_loop, root, nodes)
+        except KeyboardInterrupt:
+            return 130
+        except NomnomError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+        finally:
+            _TUI_ACTIVE = False
         return 0
 
     if "--copy" in sys.argv[1:]:
