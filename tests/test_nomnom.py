@@ -719,44 +719,31 @@ class TestApplyIncludeExclude:
         assert "nested/src/a.py" not in rels
 
 
-# ---------- launcher screen ----------
+# ---------- more menu (picker "m" excursions) ----------
 
-class TestLauncherScreen:
-    def test_tiles_include_every_verb(self):
-        s = nomnom.LauncherScreen()
-        labels = [t[0] for t in s.tiles]
-        for v in ("Bundle", "Commit", "PR", "Item", "Rebuild",
-                  "Send", "Receive", "Extensions", "Channel"):
-            assert v in labels
-        assert "Feeds" not in labels
+class TestMoreMenu:
+    def test_more_verbs_are_the_non_picker_verbs(self):
+        # Bundle/Send are the picker's `d` destinations; Commit/PR/Item are its
+        # `v` cycle; those must NOT be in the "more" overlay.
+        for excluded in ("Bundle", "Send", "Commit", "PR", "Item"):
+            assert excluded not in nomnom._MORE_VERBS
+        assert nomnom._MORE_VERBS == ("Receive", "Channel", "Rebuild", "Extensions")
 
-    def test_pair_tile_removed_in_v2(self):
-        s = nomnom.LauncherScreen()
-        labels = [t[0] for t in s.tiles]
-        assert "Pair" not in labels
-        assert "Pins" not in labels
+    def test_open_more_verb_mapping(self):
+        expected = {
+            "Receive": nomnom.ReceiveScreen,
+            "Channel": nomnom.ChannelScreen,
+            "Rebuild": nomnom.RebuildScreen,
+            "Extensions": nomnom.ExtensionsScreen,
+        }
+        for name, cls in expected.items():
+            screen = nomnom._open_more_verb(name)
+            assert isinstance(screen, cls)
+            assert isinstance(screen, nomnom.Screen)
 
-    def test_cursor_wraps_down(self):
-        s = nomnom.LauncherScreen()
-        # Move past the end; should wrap to top.
-        for _ in range(len(s.tiles)):
-            s.handle_key(ord("j"))
-        assert s.cursor == 0
-
-    def test_cursor_wraps_up(self):
-        s = nomnom.LauncherScreen()
-        s.handle_key(ord("k"))
-        assert s.cursor == len(s.tiles) - 1
-
-    def test_q_quits(self):
-        s = nomnom.LauncherScreen()
-        assert s.handle_key(ord("q")) == nomnom.ScreenAction.QUIT
-        assert s.handle_key(27) == nomnom.ScreenAction.QUIT  # Esc
-
-    def test_enter_pushes_a_screen(self):
-        s = nomnom.LauncherScreen()
-        result = s.handle_key(10)
-        assert isinstance(result, nomnom.Screen)
+    def test_open_more_verb_unknown_raises(self):
+        with pytest.raises(AssertionError):
+            nomnom._open_more_verb("Bundle")
 
 
 class TestRebuildScreen:
@@ -933,96 +920,6 @@ class TestExtensionsScreen:
         assert removed == {"kind": "text", "values": [".py"], "remove": True}
 
 
-class TestBundleScreen:
-    def test_init_defaults_to_cwd(self, tmp_path, monkeypatch):
-        monkeypatch.chdir(tmp_path)
-        s = nomnom.BundleScreen()
-        assert s.step == "path"
-        assert s.path_buf == str(tmp_path)
-        assert s.error == ""
-
-    def test_path_edit_appends_chars(self):
-        s = nomnom.BundleScreen()
-        s.path_buf = ""
-        s.handle_key(ord("/"))
-        s.handle_key(ord("a"))
-        assert s.path_buf == "/a"
-
-    def test_path_edit_backspace(self):
-        s = nomnom.BundleScreen()
-        s.path_buf = "/abc"
-        s.handle_key(127)  # backspace
-        assert s.path_buf == "/ab"
-
-    def test_q_in_path_returns_back(self):
-        s = nomnom.BundleScreen()
-        assert s.handle_key(ord("q")) == nomnom.ScreenAction.BACK
-        assert s.handle_key(27) == nomnom.ScreenAction.BACK
-
-    def test_enter_without_stdscr_is_a_noop(self):
-        s = nomnom.BundleScreen()
-        assert s.handle_key(10) == nomnom.ScreenAction.CONTINUE
-        # _scan_and_pick should not have been entered.
-        assert s.step == "path"
-
-    def test_scan_invalid_path_sets_error(self, tmp_path):
-        s = nomnom.BundleScreen()
-        s.path_buf = str(tmp_path / "does-not-exist")
-        stay = s._scan_and_pick(stdscr=None)  # _picker_ui won't be reached
-        assert stay is True
-        assert s.step == "path"
-        assert "not a directory" in s.error
-
-    def test_scan_empty_repo_sets_error(self, tmp_path):
-        # Empty dir → scan returns no file items → records error before
-        # touching _picker_ui, so a None stdscr is fine.
-        s = nomnom.BundleScreen()
-        s.path_buf = str(tmp_path)
-        stay = s._scan_and_pick(stdscr=None)
-        assert stay is True
-        assert s.step == "path"
-        assert "no files found" in s.error
-
-    def test_scan_happy_path(self, tmp_path, monkeypatch):
-        make_repo(tmp_path, {"a.py": "print('a')\n"})
-        out_dir = tmp_path / "out"
-        out_dir.mkdir()
-        monkeypatch.chdir(out_dir)
-
-        # Stub the picker to return a deterministic selection.
-        def fake_picker(stdscr, nodes, **kw):
-            return nomnom.PickResult({"a.py"}, nomnom.Destination.FILE, True)
-        monkeypatch.setattr(nomnom, "_picker_ui", fake_picker)
-
-        s = nomnom.BundleScreen()
-        s.path_buf = str(tmp_path)
-        stay = s._scan_and_pick(stdscr=object())  # opaque, not used by fake
-        assert stay is True
-        assert s.step == "done"
-        # File written into out_dir (cwd) by _emit_bundle.
-        bundles = list(out_dir.glob(f"{tmp_path.name}-*.txt"))
-        assert len(bundles) == 1
-        assert any("wrote" in m for m in s.messages)
-
-    def test_scan_cancelled_picker_goes_back(self, tmp_path, monkeypatch):
-        make_repo(tmp_path, {"a.py": "x\n"})
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setattr(nomnom, "_picker_ui",
-                            lambda *a, **kw: None)  # cancel
-        s = nomnom.BundleScreen()
-        s.path_buf = str(tmp_path)
-        stay = s._scan_and_pick(stdscr=object())
-        assert stay is False
-        assert s.step == "path"  # unchanged; caller sends to launcher
-
-    def test_done_state_esc_returns_back(self):
-        s = nomnom.BundleScreen()
-        s.step = "done"
-        s.messages = ["wrote foo.txt"]
-        assert s.handle_key(27) == nomnom.ScreenAction.BACK
-        assert s.handle_key(ord("q")) == nomnom.ScreenAction.BACK
-
-
 class TestEmitBundle:
     def test_file_destination_writes(self, tmp_path, monkeypatch):
         make_repo(tmp_path, {"a.py": "print('a')\n"})
@@ -1061,208 +958,6 @@ class TestEmitBundle:
         captured = capsys.readouterr()
         assert "<file path=\"a.py\">" in captured.out
         assert any("stdout" in line for line in lines)
-
-
-class TestCommitScreen:
-    def test_init_defaults(self, tmp_path, monkeypatch):
-        monkeypatch.chdir(tmp_path)
-        s = nomnom.CommitScreen()
-        assert s.step == "inputs"
-        assert s.field_cursor == 0
-        assert s.bufs["repo"] == str(tmp_path)
-        assert s.destination == nomnom.Destination.FILE
-
-    def test_tab_cycles_fields(self):
-        s = nomnom.CommitScreen()
-        n = len(s.fields)
-        for _ in range(n):
-            s.handle_key(9)  # Tab
-        assert s.field_cursor == 0
-
-    def test_d_cycles_destination(self, tmp_path, monkeypatch):
-        # Isolate config so no channel exists → SEND is not in the cycle.
-        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
-        s = nomnom.CommitScreen()
-        s.handle_key(ord("d"))
-        assert s.destination == nomnom.Destination.CLIPBOARD
-        s.handle_key(ord("d"))
-        assert s.destination == nomnom.Destination.FILE  # wraps
-
-    def test_path_edit_appends_chars(self):
-        s = nomnom.CommitScreen()
-        s.bufs["repo"] = ""
-        s.handle_key(ord("/"))
-        s.handle_key(ord("a"))
-        assert s.bufs["repo"] == "/a"
-
-    def test_q_returns_back(self):
-        s = nomnom.CommitScreen()
-        assert s.handle_key(ord("q")) == nomnom.ScreenAction.BACK
-
-    def test_execute_captures_stdout_stderr(self, monkeypatch):
-        s = nomnom.CommitScreen()
-        s.bufs["repo"] = "/tmp/some-repo"
-
-        def fake_cmd_commit(repo, *, destination):
-            print("stdout line")
-            print("stderr line", file=sys.stderr)
-            return 0
-        monkeypatch.setattr(nomnom, "cmd_commit", fake_cmd_commit)
-        s.handle_key(10)  # Enter
-        assert s.step == "done"
-        assert s.rc == 0
-        assert any("stdout line" in line for line in s.output_lines)
-        assert any("stderr line" in line for line in s.output_lines)
-
-    def test_execute_handles_nomnom_error(self, monkeypatch):
-        s = nomnom.CommitScreen()
-        s.bufs["repo"] = "/tmp/some-repo"
-
-        def boom(repo, *, destination):
-            raise nomnom.NomnomError("not a git repository: /tmp/some-repo")
-        monkeypatch.setattr(nomnom, "cmd_commit", boom)
-        s.handle_key(10)
-        assert s.rc == 1
-        assert "not a git repository" in s.error
-        assert s.step == "done"
-
-
-class TestPRScreen:
-    def test_base_field_present(self):
-        s = nomnom.PRScreen()
-        field_ids = [fid for fid, _ in s.fields]
-        assert field_ids == ["repo", "base", "dest"]
-
-    def test_base_field_edits_when_focused(self):
-        s = nomnom.PRScreen()
-        # Cursor to "base" (index 1).
-        s.handle_key(9)
-        assert s.field_cursor == 1
-        s.handle_key(ord("d"))  # 'd' would normally cycle dest — but
-        # since 'd' is intercepted first, dest cycles even when on base.
-        # We verify by testing base editing with non-d chars.
-        s.field_cursor = 1
-        s.bufs["base"] = ""
-        s.handle_key(ord("m"))
-        s.handle_key(ord("a"))
-        s.handle_key(ord("i"))
-        s.handle_key(ord("n"))
-        assert s.bufs["base"] == "main"
-
-    def test_run_passes_base_to_cmd_pr(self, monkeypatch):
-        called: dict = {}
-
-        def fake_cmd_pr(repo, base, *, destination):
-            called["repo"] = repo
-            called["base"] = base
-            called["destination"] = destination
-            return 0
-        monkeypatch.setattr(nomnom, "cmd_pr", fake_cmd_pr)
-        s = nomnom.PRScreen()
-        s.bufs["repo"] = "/tmp/r"
-        s.bufs["base"] = "develop"
-        s.destination = nomnom.Destination.CLIPBOARD
-        s.handle_key(10)
-        assert called == {"repo": "/tmp/r", "base": "develop",
-                          "destination": nomnom.Destination.CLIPBOARD}
-
-    def test_empty_base_passes_none(self, monkeypatch):
-        called: dict = {}
-
-        def fake_cmd_pr(repo, base, *, destination):
-            called["base"] = base
-            return 0
-        monkeypatch.setattr(nomnom, "cmd_pr", fake_cmd_pr)
-        s = nomnom.PRScreen()
-        s.bufs["repo"] = "/tmp/r"
-        s.bufs["base"] = ""
-        s.handle_key(10)
-        assert called["base"] is None
-
-
-class TestItemScreen:
-    def test_fields_include_id_and_diff(self):
-        s = nomnom.ItemScreen()
-        field_ids = [fid for fid, _ in s.fields]
-        assert field_ids == ["repo", "id", "diff", "dest"]
-
-    def test_id_accepts_printable_chars(self):
-        s = nomnom.ItemScreen()
-        s.field_cursor = 1  # focus id
-        for ch in "v1.2.3":
-            s.handle_key(ord(ch))
-        assert s.bufs["id"] == "v1.2.3"
-
-    def test_diff_toggled_by_space_when_focused(self):
-        s = nomnom.ItemScreen()
-        s.field_cursor = 2  # focus diff
-        assert s.include_diff is False
-        s.handle_key(ord(" "))
-        assert s.include_diff is True
-        s.handle_key(ord(" "))
-        assert s.include_diff is False
-
-    def test_run_errors_on_missing_id(self, monkeypatch):
-        monkeypatch.setattr(nomnom, "cmd_item",
-                            lambda *a, **k: 0)
-        s = nomnom.ItemScreen()
-        s.bufs["repo"] = "/tmp/r"
-        s.bufs["id"] = ""
-        s.handle_key(10)
-        assert s.rc == 1
-        assert "required" in s.error.lower()
-
-    def test_run_passes_args(self, monkeypatch):
-        called: dict = {}
-
-        def fake_cmd_item(
-            repo, kind_or_id, ident=None, *,
-            include_diff=False, all_logs=False, destination,
-        ):
-            called["repo"] = repo
-            called["kind_or_id"] = kind_or_id
-            called["ident"] = ident
-            called["diff"] = include_diff
-            called["dest"] = destination
-            return 0
-        monkeypatch.setattr(nomnom, "cmd_item", fake_cmd_item)
-        s = nomnom.ItemScreen()
-        s.bufs["repo"] = "/tmp/r"
-        s.bufs["id"] = "42"
-        s.include_diff = True
-        s.destination = nomnom.Destination.CLIPBOARD
-        s.handle_key(10)
-        assert called == {
-            "repo": "/tmp/r", "kind_or_id": "42", "ident": None,
-            "diff": True, "dest": nomnom.Destination.CLIPBOARD,
-        }
-
-    def test_kind_prefix_input_routes_explicit_kind(self, monkeypatch):
-        called: dict = {}
-
-        def fake_cmd_item(
-            repo, kind_or_id, ident=None, *,
-            include_diff=False, all_logs=False, destination,
-        ):
-            called["kind_or_id"] = kind_or_id
-            called["ident"] = ident
-            return 0
-        monkeypatch.setattr(nomnom, "cmd_item", fake_cmd_item)
-        s = nomnom.ItemScreen()
-        s.bufs["repo"] = "/tmp/r"
-        s.bufs["id"] = "discussion 7"
-        s.handle_key(10)
-        assert called == {"kind_or_id": "discussion", "ident": "7"}
-
-
-class _FakeStdscr:
-    """Just enough stdscr surface for SendScreen / ReceiveScreen tests."""
-    def clear(self) -> None:
-        pass
-    def erase(self) -> None:
-        pass
-    def refresh(self) -> None:
-        pass
 
 
 class TestNomnomError:
@@ -3709,6 +3404,179 @@ class TestCmdReceiveNoFeed:
         err = capsys.readouterr().err.lower()
         assert "no channel yet" in err
         assert "nomnom init" in err
+
+
+class TestBarePickerEntry:
+    """Bare `nomnom` on a TTY opens the picker on cwd; empty dirs bail early."""
+
+    def test_empty_dir_returns_zero_without_curses(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        empty = tmp_path / "empty_repo"
+        empty.mkdir()
+        monkeypatch.chdir(empty)
+        monkeypatch.setattr(sys, "argv", ["nomnom"])
+        monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+        monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+        # The empty-guard must return BEFORE ever entering curses.
+        monkeypatch.setattr(
+            nomnom.curses, "wrapper",
+            lambda *a, **k: pytest.fail("entered curses on an empty dir"),
+        )
+        rc = nomnom.main()
+        assert rc == 0
+        assert "no files found" in capsys.readouterr().err.lower()
+
+    def test_empty_git_repo_hints_at_git_verbs(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        repo = tmp_path / "gitrepo"
+        repo.mkdir()
+        monkeypatch.chdir(repo)
+        monkeypatch.setattr(sys, "argv", ["nomnom"])
+        monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+        monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+        monkeypatch.setattr(nomnom, "_scan_to_nodes", lambda root: ([], []))
+        monkeypatch.setattr(nomnom, "_is_inside_git_repo", lambda root: True)
+        monkeypatch.setattr(
+            nomnom.curses, "wrapper",
+            lambda *a, **k: pytest.fail("entered curses on an empty dir"),
+        )
+        rc = nomnom.main()
+        assert rc == 0
+        err = capsys.readouterr().err.lower()
+        assert "nomnom commit" in err
+
+
+class TestScanToNodes:
+    """`_scan_to_nodes` turns a directory into picker nodes with bundle defaults."""
+
+    def test_returns_nodes_and_file_items(self, tmp_path):
+        (tmp_path / "a.py").write_text("x=1\n", encoding="utf-8")
+        (tmp_path / "sub").mkdir()
+        (tmp_path / "sub" / "b.py").write_text("y=2\n", encoding="utf-8")
+        nodes, file_items = nomnom._scan_to_nodes(tmp_path)
+        rels = {it.rel for it in file_items}
+        assert rels == {"a.py", "sub/b.py"}
+        assert any(n.rel == "a.py" for n in nodes)
+
+    def test_empty_dir_returns_empty_pair(self, tmp_path):
+        nodes, file_items = nomnom._scan_to_nodes(tmp_path)
+        assert nodes == []
+        assert file_items == []
+
+
+class TestEmitPickerResult:
+    """`_emit_picker_result` runs the picker's action with output captured."""
+
+    def test_bundle_to_file_writes_and_banners(self, tmp_path, monkeypatch):
+        repo = tmp_path / "proj"
+        repo.mkdir()
+        (repo / "a.py").write_text("print('hi')\n", encoding="utf-8")
+        monkeypatch.chdir(tmp_path)  # pick_output_path writes to cwd
+        result = nomnom.PickResult(
+            selected={"a.py"},
+            destination=nomnom.Destination.FILE,
+            include_tree=False,
+        )
+        messages, error, banner = nomnom._emit_picker_result(None, result, repo)
+        assert error == ""
+        assert banner.startswith("wrote")
+        assert any("wrote" in m for m in messages)
+        # The bundle .txt landed in cwd.
+        assert list(tmp_path.glob("proj-*.txt"))
+
+    def test_no_selection_returns_notice(self, tmp_path):
+        repo = tmp_path / "proj"
+        repo.mkdir()
+        result = nomnom.PickResult(
+            selected=set(),
+            destination=nomnom.Destination.FILE,
+            include_tree=True,
+        )
+        messages, error, banner = nomnom._emit_picker_result(None, result, repo)
+        assert messages == []
+        assert error == ""
+        assert banner == "no files selected."
+
+
+class TestRunPickerLoop:
+    """Orchestration of the picker home loop with `_picker_ui` mocked: emit +
+    state carry, PICKER_MORE dispatch + rescan, and clean exit on None."""
+
+    def test_emit_carry_more_dispatch_rescan_and_exit(self, monkeypatch):
+        first = nomnom.PickResult(
+            selected={"a.py"},
+            destination=nomnom.Destination.CLIPBOARD,
+            include_tree=False,
+            verb=nomnom.Verb.PR,
+        )
+        seq = [first, nomnom.PICKER_MORE, None]
+        picker_calls: list = []
+        drove: list = []
+        scans: list = []
+        modals: list = []
+
+        def fake_picker(stdscr, nodes, **kw):
+            picker_calls.append((list(nodes), kw))
+            return seq.pop(0)
+
+        monkeypatch.setattr(nomnom, "_picker_ui", fake_picker)
+        monkeypatch.setattr(nomnom, "_is_inside_git_repo", lambda root: True)
+        monkeypatch.setattr(
+            nomnom, "_emit_picker_result",
+            lambda s, r, root: (["wrote /x"], "", "wrote /x"),
+        )
+        monkeypatch.setattr(nomnom, "_result_modal",
+                            lambda s, m, e: modals.append((m, e)))
+        monkeypatch.setattr(nomnom, "_more_menu", lambda s: "Extensions")
+        monkeypatch.setattr(nomnom, "_open_more_verb", lambda name: f"screen:{name}")
+        monkeypatch.setattr(nomnom, "_drive_screens",
+                            lambda s, screen: drove.append(screen))
+        monkeypatch.setattr(nomnom, "_scan_to_nodes",
+                            lambda root: (scans.append(root) or (["NEW"], ["file"])))
+
+        nomnom._run_picker_loop(object(), Path("/repo"), ["OLD"])
+
+        assert len(picker_calls) == 3  # emit(first) → more → None(exit)
+        # First call seeds the Bundle default with no banner.
+        assert picker_calls[0][1]["initial_verb"] == nomnom.Verb.BUNDLE
+        assert picker_calls[0][1]["banner"] is None
+        # Second call carries dest/tree/verb from `first` and the emit banner.
+        k2 = picker_calls[1][1]
+        assert k2["initial_destination"] == nomnom.Destination.CLIPBOARD
+        assert k2["initial_include_tree"] is False
+        assert k2["initial_verb"] == nomnom.Verb.PR
+        assert k2["banner"] == "wrote /x"
+        assert modals == []  # single-line success → no modal
+        # The more-menu drove Extensions and rescanned; 3rd call sees new nodes.
+        assert drove == ["screen:Extensions"]
+        assert len(scans) == 1
+        assert picker_calls[2][0] == ["NEW"]
+        assert picker_calls[2][1]["banner"] is None
+
+    def test_error_result_opens_modal(self, monkeypatch):
+        first = nomnom.PickResult(
+            selected={"a.py"},
+            destination=nomnom.Destination.SEND,
+            include_tree=True,
+        )
+        seq = [first, None]
+        modals: list = []
+        monkeypatch.setattr(nomnom, "_picker_ui",
+                            lambda stdscr, nodes, **kw: seq.pop(0))
+        monkeypatch.setattr(nomnom, "_is_inside_git_repo", lambda root: False)
+        monkeypatch.setattr(
+            nomnom, "_emit_picker_result",
+            lambda s, r, root: (["line1", "boom"], "boom", "boom"),
+        )
+        monkeypatch.setattr(nomnom, "_result_modal",
+                            lambda s, m, e: modals.append((m, e)))
+
+        nomnom._run_picker_loop(object(), Path("/repo"), ["OLD"])
+
+        assert len(modals) == 1
+        msgs, err = modals[0]
+        assert err == "boom"
+        assert msgs == ["line1", "boom"]
 
 
 class TestRetiredVerbs:
