@@ -216,6 +216,11 @@ export interface FeedOpenParams {
   expectMemberId?: string;
   expectSigPubHex?: string;
   onProgress?: (fraction: number) => void;
+  /** When true, decrypt the ciphertext in place inside `blob` instead of copying
+   * it out first. Only safe when the caller owns `blob` exclusively and won't
+   * read it again — e.g. the worker's freshly-transferred, single-owner buffer.
+   * Defaults to false: an in-process caller's blob must never be mutated. */
+  mutateInPlace?: boolean;
 }
 
 /** Verify and decrypt a single feed post. Throws on tamper / bad signature / hash mismatch. */
@@ -228,8 +233,12 @@ export async function feedOpen(p: FeedOpenParams): Promise<{ header: FeedHeader;
   let off = FEED_MAGIC.length;
   const nonce = blob.subarray(off, (off += FEED_NONCE_LEN));
   const mac = blob.subarray(off, (off += FEED_MAC_LEN));
-  // Copy so the in-place XOR doesn't mutate the caller's blob.
-  const ciphertext = blob.slice(off);
+  // The in-place XOR (streamXorInPlace) destroys whatever it's handed. By
+  // default copy the ciphertext out so the caller's blob is untouched; when the
+  // caller owns the buffer exclusively (mutateInPlace), alias it and skip the
+  // copy — halving peak memory on the worker path where the blob was just
+  // transferred in and is discarded after this call.
+  const ciphertext = p.mutateInPlace ? blob.subarray(off) : blob.slice(off);
 
   const { encKey, macKey } = feedSubkeys(p.feedKey);
   const expected = hmacSha256(macKey, concat(FEED_MAGIC, nonce, ciphertext));

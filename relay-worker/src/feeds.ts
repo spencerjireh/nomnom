@@ -35,7 +35,7 @@ import {
   LIST_BATCH_SIZE,
   SLOT_HEAD_CONCURRENCY,
   SlotIndex,
-  headCreatedAts,
+  listSlotCreatedAts,
   parseTs,
 } from "./slot-index";
 
@@ -314,14 +314,16 @@ export async function listMembers(
   if (!live.ok) return live.res;
 
   const deadline = pollDeadline(waitMs);
-  // Cache parsed cards across long-poll iterations keyed by R2 key.
-  // Member cards are immutable per (member_id, joined_at) tuple, so once a key
-  // is in this map we never need to re-fetch its body. Per iteration we issue
-  // exactly ONE bucket.list to detect joins/leaves; bodies are fetched only
-  // for keys we haven't seen yet. This keeps the worst-case subrequest count
-  // bounded at (initial_roster_size + iteration_count) instead of
+  // Cache parsed cards across long-poll iterations keyed by R2 key, tagged with
+  // the object etag so an overwrite is noticed. A member card is MUTABLE per
+  // member_id (putMember rewrites the same key on a rename/rekey with a fresh
+  // etag and bumped created_at), so caching by key alone would serve a stale
+  // name for the life of the poll. Per iteration we issue exactly ONE
+  // bucket.list to detect joins/leaves/updates; bodies are fetched only for keys
+  // we haven't seen OR whose etag changed. This keeps the worst-case subrequest
+  // count bounded at (initial_roster_size + updates) instead of
   // (roster_size * iteration_count).
-  const cards = new Map<string, MemberCard>();
+  const cards = new Map<string, { card: MemberCard; etag: string }>();
   while (true) {
     const list = await bucket.list({
       prefix: `feeds/${feedId}/members/`,
@@ -332,12 +334,15 @@ export async function listMembers(
     for (const k of cards.keys()) {
       if (!currentKeys.has(k)) cards.delete(k);
     }
-    // Fetch bodies only for keys we haven't seen yet, chunked like the slot
-    // head scans to respect the Workers subrequest budget (up to
-    // MAX_MEMBER_COUNT + 1 members on the first iteration).
-    const newObjs = list.objects.filter((o) => !cards.has(o.key));
-    for (let i = 0; i < newObjs.length; i += SLOT_HEAD_CONCURRENCY) {
-      const slice = newObjs.slice(i, i + SLOT_HEAD_CONCURRENCY);
+    // Fetch bodies for keys we haven't seen yet OR whose etag changed (a
+    // rename/rekey overwrites the same key), chunked to respect the Workers
+    // subrequest budget (up to MAX_MEMBER_COUNT + 1 members on the first
+    // iteration). etag is already on the listed object — no extra subrequest.
+    const staleObjs = list.objects.filter(
+      (o) => cards.get(o.key)?.etag !== o.etag,
+    );
+    for (let i = 0; i < staleObjs.length; i += SLOT_HEAD_CONCURRENCY) {
+      const slice = staleObjs.slice(i, i + SLOT_HEAD_CONCURRENCY);
       const bodies = await Promise.all(slice.map((o) => bucket.get(o.key)));
       for (let j = 0; j < slice.length; j++) {
         const body = bodies[j];
@@ -350,15 +355,18 @@ export async function listMembers(
           continue;
         }
         cards.set(slice[j].key, {
-          member_id: parsed.member_id,
-          identity_pubkey: parsed.identity_pubkey,
-          name: parsed.name,
-          joined_at: joinedAt,
+          etag: slice[j].etag,
+          card: {
+            member_id: parsed.member_id,
+            identity_pubkey: parsed.identity_pubkey,
+            name: parsed.name,
+            joined_at: joinedAt,
+          },
         });
       }
     }
 
-    const all = [...cards.values()];
+    const all = [...cards.values()].map((c) => c.card);
     const fresh = all.filter((m) => m.joined_at > sinceTs);
     if (fresh.length > 0 || waitMs <= 0) {
       return jsonResponse({ members: all, fresh }, 200);
@@ -467,28 +475,15 @@ export async function listFeedSlots(
   // liveness gate above is connect-time only; a feed closed mid-poll keeps
   // serving until the deadline, which is acceptable for ~permanent channels.
   const deadline = pollDeadline(waitMs);
-  // Cache slot created_at across long-poll iterations keyed by R2 key. Slots
-  // are immutable once written; bucket.head returns the same created_at on
-  // every call. Per iteration we issue ONE bucket.list to discover NEW keys
-  // and only head the ones we haven't seen — bounding the worst case at
-  // (current_slot_count + iteration_count * new_keys) rather than
-  // (slot_count * iteration_count) head calls.
-  const seen = new Map<string, number>(); // key -> created_at
   while (true) {
-    const list = await bucket.list({ prefix, limit: LIST_BATCH_SIZE });
-    const newObjs = list.objects.filter((o) => !seen.has(o.key));
-    // Drop departed keys (slot expired / feed extended past slot lifetime).
-    const currentKeys = new Set(list.objects.map((o) => o.key));
-    for (const k of seen.keys()) {
-      if (!currentKeys.has(k)) seen.delete(k);
-    }
-    // Head only the new keys, chunked to respect the Workers subrequest cap.
-    for (const [key, createdAt] of await headCreatedAts(bucket, newObjs)) {
-      seen.set(key, createdAt);
-    }
-
+    // Follow the R2 list cursor across ALL pages (a single capped list would
+    // hide every slot past the first LIST_BATCH_SIZE keys — and slot ids are
+    // random tokens, so the hidden ones aren't the oldest). created_at comes
+    // back on each listed object via include:["customMetadata"], so this costs
+    // one sub-request per page and no per-slot head scan.
+    const createdAts = await listSlotCreatedAts(bucket, feedId);
     const fresh: SlotIndex[] = [];
-    for (const [key, createdAt] of seen) {
+    for (const [key, createdAt] of createdAts) {
       if (createdAt <= sinceTs) continue;
       fresh.push({ slot_id: key.slice(prefix.length), created_at: createdAt });
     }

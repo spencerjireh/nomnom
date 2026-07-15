@@ -184,6 +184,51 @@ describe("members lifecycle", () => {
     const res = await SELF.fetch(req);
     expect(res.status).toBe(400);
   });
+
+  it("surfaces a member rename to an in-flight long-poll (etag change)", async () => {
+    const pubkey = randomBase64(32);
+    const m = await mintFeed(SELF, { name: "old-name", identityPubkey: pubkey });
+    // Anchor `since` at the creator's join second so the creator is not "fresh"
+    // and the long-poll blocks instead of returning immediately.
+    const since = Math.floor(Date.now() / 1000);
+    const pollReq = await signedFeedRequest(
+      "GET",
+      `/feeds/${m.feed_id}/members?since=${since}&wait=8000`,
+      m.feed_id,
+    );
+    const pollPromise = SELF.fetch(pollReq);
+
+    // Let the poll begin and cross a second boundary, then rename the creator's
+    // card — this rewrites the SAME R2 key with a fresh etag and bumped
+    // created_at. The poll caches cards by key across iterations; before the fix
+    // it never re-fetched the overwritten key and served the stale name until
+    // the deadline.
+    await new Promise((r) => setTimeout(r, 1500));
+    const renamed = {
+      member_id: m.member_id,
+      identity_pubkey: pubkey,
+      name: "new-name",
+    };
+    const renameRes = await SELF.fetch(
+      await signedFeedRequest(
+        "PUT",
+        `/feeds/${m.feed_id}/members/${m.member_id}`,
+        m.feed_id,
+        { body: JSON.stringify(renamed) },
+      ),
+    );
+    expect(renameRes.status).toBe(204);
+
+    const res = await pollPromise;
+    expect(res.status).toBe(200);
+    const data = (await res.json()) as {
+      members: { member_id: string; name: string }[];
+      fresh: { member_id: string; name: string }[];
+    };
+    const creator = data.members.find((x) => x.member_id === m.member_id);
+    expect(creator?.name).toBe("new-name");
+    expect(data.fresh.some((x) => x.name === "new-name")).toBe(true);
+  });
 });
 
 describe("slot lifecycle (multi-party broadcast)", () => {

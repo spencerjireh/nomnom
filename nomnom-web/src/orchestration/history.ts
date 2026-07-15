@@ -13,8 +13,15 @@ import { cryptoClient } from "../worker/cryptoClient";
 import { feedContext, type FeedContext } from "./feed-actions";
 import { HISTORY_MAX_AGE_DAYS } from "../config";
 import { newId } from "../util/ids";
+import { mapLimit } from "../util/concurrency";
 import type { FeedHeader } from "../crypto/feeds";
 import type { Feed, Identity, Member, TimelineEntry } from "../types";
+
+// Fetch + decrypt this many slots at once during the rebuild. Overlaps the relay
+// round-trips (the decrypts still serialize behind the single crypto worker) and
+// bounds peak memory: only ~this-many decrypted bodies are alive at once, since
+// rebuilt receive rows keep just a slot_id and re-fetch their body lazily.
+const HISTORY_FETCH_CONCURRENCY = 6;
 
 export interface HistoryParams {
   feed: Feed;
@@ -71,66 +78,74 @@ export async function runHistory(p: HistoryParams): Promise<HistoryResult> {
   // Oldest-first so the reversed result is newest-first.
   slots.sort((a, b) => (a.created_at ?? 0) - (b.created_at ?? 0));
 
-  const rows: TimelineEntry[] = [];
-  for (const slot of slots) {
-    if (p.signal.aborted) break;
-    if ((slot.created_at ?? 0) < floor) continue; // older than the relay keeps
+  // Fetch + decrypt with bounded concurrency (overlaps network waits) instead of
+  // strictly serially. mapLimit preserves slot order, so the oldest-first input
+  // yields oldest-first rows; a slot that fails to fetch/decode becomes null and
+  // is compacted out (never a duplicate, mirroring the serial version).
+  const built = await mapLimit(
+    slots,
+    HISTORY_FETCH_CONCURRENCY,
+    async (slot): Promise<TimelineEntry | null> => {
+      if (p.signal.aborted) return null;
+      if ((slot.created_at ?? 0) < floor) return null; // older than the relay keeps
 
-    let raw: ArrayBuffer | null;
-    try {
-      raw = await ctx.client.getSlot(ctx.feed.feed_id, ctx.feedKey, slot.slot_id, { signal: p.signal });
-    } catch {
-      continue; // transient fetch failure — skip; next refresh retries
-    }
-    if (raw === null) continue; // slot gone / already cleaned up
+      let raw: ArrayBuffer | null;
+      try {
+        raw = await ctx.client.getSlot(ctx.feed.feed_id, ctx.feedKey, slot.slot_id, { signal: p.signal });
+      } catch {
+        return null; // transient fetch failure — skip; next refresh retries
+      }
+      if (raw === null) return null; // slot gone / already cleaned up
 
-    let header: FeedHeader;
-    let body: ArrayBuffer;
-    try {
-      const opened = await cryptoClient.feedOpen({
-        feedKeyHex: ctx.feedKeyHex,
-        feedId: ctx.feed.feed_id,
-        blob: raw,
-      });
-      header = opened.header;
-      body = opened.body;
-    } catch {
-      continue; // foreign / tampered / undecryptable post
-    }
+      let header: FeedHeader;
+      try {
+        // Read only the header; the decrypted body is intentionally dropped so a
+        // refresh never holds every retained file in memory at once. Received
+        // rows carry a slot_id and re-fetch their body lazily on save.
+        const opened = await cryptoClient.feedOpen({
+          feedKeyHex: ctx.feedKeyHex,
+          feedId: ctx.feed.feed_id,
+          blob: raw,
+        });
+        header = opened.header;
+      } catch {
+        return null; // foreign / tampered / undecryptable post
+      }
 
-    const at = (header.pa ? header.pa * 1000 : (slot.created_at ?? 0) * 1000);
+      const at = header.pa ? header.pa * 1000 : (slot.created_at ?? 0) * 1000;
 
-    if (header.smid === ctx.feed.member_id) {
-      // Our own post — reconstruct as a delivered send row (no body needed).
-      rows.push({
+      if (header.smid === ctx.feed.member_id) {
+        // Our own post — reconstruct as a delivered send row (no body needed).
+        return {
+          id: newId(),
+          kind: "send",
+          name: header.fn,
+          bytes: header.fs,
+          at,
+          status: "served",
+        };
+      }
+
+      // A received post. Resolve the sender and reject a changed identity key
+      // (spoof), mirroring the live watch.
+      const found = roster.find((m) => m.member_id === header.smid);
+      if (found && found.identity_pubkey && found.identity_pubkey !== header.sik) {
+        return null;
+      }
+      return {
         id: newId(),
-        kind: "send",
+        kind: "receive",
         name: header.fn,
         bytes: header.fs,
         at,
-        status: "served",
-      });
-      continue;
-    }
+        status: "held", // rebuild never auto-downloads; auto_save gates live receipt only
+        peerName: found?.name || "(unknown)",
+        slot_id: slot.slot_id, // body fetched lazily on save
+      };
+    },
+  );
 
-    // A received post. Resolve the sender and reject a changed identity key
-    // (spoof), mirroring the live watch.
-    const found = roster.find((m) => m.member_id === header.smid);
-    if (found && found.identity_pubkey && found.identity_pubkey !== header.sik) {
-      continue;
-    }
-    rows.push({
-      id: newId(),
-      kind: "receive",
-      name: header.fn,
-      bytes: header.fs,
-      at,
-      status: "held", // rebuild never auto-downloads; auto_save gates live receipt only
-      peerName: found?.name || "(unknown)",
-      body,
-    });
-  }
-
+  const rows = built.filter((r): r is TimelineEntry => r !== null);
   rows.reverse(); // newest-first
   return { rows, maxCursor };
 }

@@ -36,6 +36,11 @@ export async function runSend(p: SendParams): Promise<{ recipients: number }> {
   p.onRoster?.(roster);
   const others = roster.filter((m) => m.member_id !== p.feed.member_id);
 
+  // Progress is split into two monotonic sub-ranges: the seal (XOR) pass fills
+  // 0..0.9, the upload fills 0.9..1. The seal's own fraction ends at 1.0, so
+  // forwarding it verbatim (then dropping back for the upload) made the bar jump
+  // backward mid-send — scale it into its sub-range instead.
+  const SEAL_FRACTION = 0.9;
   const blob = await cryptoClient.feedSeal(
     {
       feedKeyHex: ctx.feedKeyHex,
@@ -46,10 +51,10 @@ export async function runSend(p: SendParams): Promise<{ recipients: number }> {
       filename: p.payload.name,
       data: p.payload.data,
     },
-    (_phase, fraction) => p.onProgress(fraction),
+    (_phase, fraction) => p.onProgress(fraction * SEAL_FRACTION),
   );
 
-  p.onProgress(0.95);
+  p.onProgress(SEAL_FRACTION);
   await ctx.client.putSlot(ctx.feed.feed_id, ctx.feedKey, randomToken(12), new Uint8Array(blob), p.signal);
   p.onProgress(1);
   return { recipients: others.length };

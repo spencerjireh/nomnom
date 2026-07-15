@@ -48,6 +48,9 @@ async function handle(req: RequestMessage): Promise<{ result: unknown; transfer:
         feedKey: hexToBytes(p.feedKeyHex),
         feedId: p.feedId,
         blob: new Uint8Array(p.blob),
+        // The blob was transferred into this worker — we own it exclusively and
+        // discard it after this case, so decrypt in place instead of copying.
+        mutateInPlace: true,
         onProgress: (fraction) => progress(id, "xor", fraction),
       });
       const buf = body.slice().buffer;

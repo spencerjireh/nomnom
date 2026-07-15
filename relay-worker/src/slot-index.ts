@@ -1,12 +1,12 @@
-// Slot-index helpers. `headCreatedAts` (the chunked created_at head scan) is
-// shared by the /feeds/:id/slots long-poll and the SSE notifier's backlog
-// replay; `readSlotsSince` (one-shot scan, cursor filter, ascending sort) is
-// used only by the notifier.
+// Slot-index helpers. `listSlotCreatedAts` (paginated list with created_at from
+// customMetadata) backs both the /feeds/:id/slots long-poll and the SSE
+// notifier's backlog replay via `readSlotsSince` (one-shot scan, cursor filter,
+// ascending sort).
 
 export const LIST_BATCH_SIZE = 1000;
-// Cap on concurrent R2 head sub-requests. Workers free tier allows 50
-// subrequests per invocation, paid 1000; 16 keeps us comfortable even with the
-// long-poll's surrounding reads.
+// Cap on concurrent R2 sub-requests when fetching object bodies (e.g. the member
+// roster scan). Workers free tier allows 50 subrequests per invocation, paid
+// 1000; 16 keeps us comfortable even with surrounding reads.
 export const SLOT_HEAD_CONCURRENCY = 16;
 
 export interface SlotIndex {
@@ -20,21 +20,33 @@ export function parseTs(s: string | undefined): number | null {
   return Number.isFinite(n) ? n : null;
 }
 
-// Head `objs` in chunks of SLOT_HEAD_CONCURRENCY (subrequest budget),
-// returning key -> created_at for objects with a parseable created_at.
-export async function headCreatedAts(
+// List EVERY slot under a feed (following the R2 list cursor across pages) and
+// return key -> created_at read straight from customMetadata. Passing
+// `include: ["customMetadata"]` means created_at comes back on each listed
+// object, so we pay only for the list pages (one sub-request per page) instead
+// of an O(slot_count) per-slot head scan — which would blow the Workers
+// subrequest cap on a busy channel. A single un-paginated list capped at
+// LIST_BATCH_SIZE would silently drop every slot past the first page.
+export async function listSlotCreatedAts(
   bucket: R2Bucket,
-  objs: { key: string }[],
+  feedId: string,
 ): Promise<Map<string, number>> {
+  const prefix = `feeds/${feedId}/slots/`;
   const out = new Map<string, number>();
-  for (let i = 0; i < objs.length; i += SLOT_HEAD_CONCURRENCY) {
-    const slice = objs.slice(i, i + SLOT_HEAD_CONCURRENCY);
-    const heads = await Promise.all(slice.map((o) => bucket.head(o.key)));
-    for (let j = 0; j < slice.length; j++) {
-      const ts = parseTs(heads[j]?.customMetadata?.created_at);
-      if (ts !== null) out.set(slice[j].key, ts);
+  let cursor: string | undefined;
+  do {
+    const list = await bucket.list({
+      prefix,
+      limit: LIST_BATCH_SIZE,
+      cursor,
+      include: ["customMetadata"],
+    });
+    for (const o of list.objects) {
+      const ts = parseTs(o.customMetadata?.created_at);
+      if (ts !== null) out.set(o.key, ts);
     }
-  }
+    cursor = list.truncated ? list.cursor : undefined;
+  } while (cursor !== undefined);
   return out;
 }
 
@@ -45,8 +57,7 @@ export async function readSlotsSince(
   sinceTs: number,
 ): Promise<SlotIndex[]> {
   const prefix = `feeds/${feedId}/slots/`;
-  const list = await bucket.list({ prefix, limit: LIST_BATCH_SIZE });
-  const createdAts = await headCreatedAts(bucket, list.objects);
+  const createdAts = await listSlotCreatedAts(bucket, feedId);
   const fresh: SlotIndex[] = [];
   for (const [key, createdAt] of createdAts) {
     if (createdAt <= sinceTs) continue;
