@@ -265,6 +265,30 @@ describe("slot lifecycle (multi-party broadcast)", () => {
     expect(await get2Res.text()).toBe("hello feed");
   });
 
+  it("handles binary ZIP payload PUT and GET intact", async () => {
+    const m = await mintFeed(SELF);
+    // Arbitrary binary bytes including nulls and zip magic
+    const binaryData = new Uint8Array([0x50, 0x4b, 0x05, 0x06, ...new Array(18).fill(0)]);
+    const putReq = await signedFeedRequest(
+      "PUT",
+      `/feeds/${m.feed_id}/slots/slot-zip`,
+      m.feed_id,
+      { body: binaryData, contentLength: binaryData.byteLength },
+    );
+    const putRes = await SELF.fetch(putReq);
+    expect(putRes.status).toBe(204);
+
+    const getReq = await signedFeedRequest(
+      "GET",
+      `/feeds/${m.feed_id}/slots/slot-zip`,
+      m.feed_id,
+    );
+    const getRes = await SELF.fetch(getReq);
+    expect(getRes.status).toBe(200);
+    const received = new Uint8Array(await getRes.arrayBuffer());
+    expect(received).toEqual(binaryData);
+  });
+
   it("409 on duplicate slot id", async () => {
     const m = await mintFeed(SELF);
     const payload = new TextEncoder().encode("first");

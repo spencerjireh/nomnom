@@ -150,11 +150,12 @@ Re-display the secret (to add a third device) anytime with `nomnom channel`.
 ```sh
 nomnom receive          # watch your channel; one line per received file
 nomnom send report.txt  # send to every other device on your channel
+nomnom send archive.zip # supports any file type: .zip archives, PDFs, images, binaries
 ```
 
 `receive` stays open after each delivery, so you can leave a laptop listening and fire off `send` from another machine all afternoon — new posts arrive in real time (the relay pushes them over Server-Sent Events, falling back to long-polling). Pass `--once` to exit after the first file (handy for scripting).
 
-Max transfer size is 256 MB (100 MB on Cloudflare's free tier — see [`relay-worker/README.md`](relay-worker/README.md)).
+All transfers are end-to-end encrypted client-side and support arbitrary binary files (such as `.zip` archives) up to 256 MB (100 MB on Cloudflare's free tier — see [`relay-worker/README.md`](relay-worker/README.md)). Received files land byte-for-byte intact.
 
 ### From a browser
 

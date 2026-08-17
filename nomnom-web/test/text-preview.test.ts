@@ -38,6 +38,11 @@ describe("looksLikeText", () => {
     expect(looksLikeText(buf([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))).toBe(false);
   });
 
+  it("rejects a ZIP archive header as binary", () => {
+    // PK\x03\x04 header with NUL byte flags
+    expect(looksLikeText(buf([0x50, 0x4b, 0x03, 0x04, 0x14, 0x00, 0x00, 0x00]))).toBe(false);
+  });
+
   it("rejects dense control bytes", () => {
     const noise = new Uint8Array(64);
     for (let i = 0; i < noise.length; i++) noise[i] = 0x01; // SOH, a control char

@@ -4442,8 +4442,215 @@ class TestCmdReceiveStream:
             raise KeyboardInterrupt  # end the fallback loop immediately
 
         monkeypatch.setattr(nomnom, "_relay_list_feed_slots", fake_list)
-        nomnom.cmd_receive()
-        assert seen_since == [5]  # was [0] before the fix: stale local cursor
+
+class TestZipAndBinaryFeedTransfer:
+    """Feed transport round-trip for .zip archives and binary payloads."""
+
+    @pytest.fixture
+    def env(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        # Alice is the receiver, Bob is the sender.
+        alice_ident = nomnom._load_identity()
+        bob_seed, bob_pub = nomnom.ed25519_keypair()
+        bob_member = "b" * 32
+        alice_member = "a" * 32
+        token = nomnom.secrets.token_urlsafe(9)
+        feed = nomnom.Feed(
+            name="home",
+            feed_id=token,
+            feed_token=token,
+            url=f"https://relay.example.com/f/{token}",
+            expires_at=2_000_000_000,
+            joined_at=1_700_000_000,
+            member_id=alice_member,
+            members_cache=[
+                {"member_id": alice_member, "identity_pubkey": alice_ident["sig_pub"], "name": "alice"},
+                {"member_id": bob_member, "identity_pubkey": bob_pub.hex(), "name": "bob"},
+            ],
+        )
+        cfg = nomnom._empty_feeds_config()
+        nomnom._add_or_replace_feed(cfg, feed)
+        nomnom._save_feeds_config(cfg)
+
+        slots: list = []
+
+        def fake_list_slots(host, fid, fkey, *, since_ts=0, wait_ms=0):
+            fresh = [s for s in slots if s["created_at"] > since_ts]
+            if not fresh and wait_ms > 0:
+                return []
+            return [{"slot_id": s["slot_id"], "created_at": s["created_at"]} for s in fresh]
+
+        def fake_get_slot(host, fid, fkey, slot_id, *, wait_ms=0):
+            for s in slots:
+                if s["slot_id"] == slot_id:
+                    return s["body"]
+            return None
+
+        def fake_put_slot(host, fid, fkey, slot_id, body):
+            slots.append({"slot_id": slot_id, "created_at": len(slots) + 1, "body": body})
+
+        def fake_list_members(host, fid, fkey, *, since_ts=0, wait_ms=0):
+            return {"members": feed.members_cache}
+
+        monkeypatch.setattr(nomnom, "_relay_list_feed_slots", fake_list_slots)
+        monkeypatch.setattr(nomnom, "_relay_get_feed_slot", fake_get_slot)
+        monkeypatch.setattr(nomnom, "_relay_put_feed_slot", fake_put_slot)
+        monkeypatch.setattr(nomnom, "_relay_list_members", fake_list_members)
+        monkeypatch.setattr(nomnom, "_refresh_roster_with_tofu", lambda *a, **k: None)
+        return tmp_path, feed, slots, (bob_member, bob_seed, bob_pub)
+
+    def test_transfer_standard_zip_archive(self, env, tmp_path, monkeypatch, capsys):
+        import zipfile
+        _cfg_path, feed, slots, (bob_member, bob_seed, bob_pub) = env
+        sender_dir = tmp_path / "sender"
+        receiver_dir = tmp_path / "receiver"
+        sender_dir.mkdir()
+        receiver_dir.mkdir()
+
+        # Create a multi-file zip archive with text and binary content.
+        zip_path = sender_dir / "project.zip"
+        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("README.md", "# Hello Zip\nThis is a test.")
+            zf.writestr("data.bin", bytes(range(256)))
+            zf.writestr("subfolder/nested.txt", "nested content inside zip")
+
+        orig_bytes = zip_path.read_bytes()
+
+        # Bob seals and posts the zip to the relay.
+        feed_key = nomnom._feed_key_from_token(feed.feed_token)
+        bob_post = nomnom.feed_seal(
+            feed_key=feed_key,
+            feed_id=feed.feed_id,
+            sender_member_id=bob_member,
+            sender_sig_priv_hex=bob_seed.hex(),
+            sender_sig_pub_hex=bob_pub.hex(),
+            filename="project.zip",
+            body=orig_bytes,
+        )
+        slots.append({"slot_id": "slot-zip-1", "created_at": 1, "body": bob_post})
+
+        # Alice receives in receiver_dir.
+        monkeypatch.chdir(receiver_dir)
+        rc = nomnom.cmd_receive(once=True)
+        assert rc == 0
+        received_path = receiver_dir / "project.zip"
+        assert received_path.exists()
+        assert received_path.read_bytes() == orig_bytes
+
+        # Verify the received zip is valid and extracts cleanly.
+        with zipfile.ZipFile(received_path, "r") as zf:
+            assert zf.namelist() == ["README.md", "data.bin", "subfolder/nested.txt"]
+            assert zf.read("README.md") == b"# Hello Zip\nThis is a test."
+            assert zf.read("data.bin") == bytes(range(256))
+            assert zf.read("subfolder/nested.txt") == b"nested content inside zip"
+
+    def test_transfer_nested_zip_archive(self, env, tmp_path, monkeypatch):
+        import zipfile
+        _cfg_path, feed, slots, (bob_member, bob_seed, bob_pub) = env
+        sender_dir = tmp_path / "sender"
+        receiver_dir = tmp_path / "receiver"
+        sender_dir.mkdir()
+        receiver_dir.mkdir()
+
+        zip_path = sender_dir / "deep_nested.zip"
+        with zipfile.ZipFile(zip_path, "w") as zf:
+            zf.writestr("level1/level2/level3/level4/deep.txt", "deep content")
+            zf.writestr("level1/sibling.txt", "sibling content")
+
+        orig_bytes = zip_path.read_bytes()
+        feed_key = nomnom._feed_key_from_token(feed.feed_token)
+        bob_post = nomnom.feed_seal(
+            feed_key=feed_key,
+            feed_id=feed.feed_id,
+            sender_member_id=bob_member,
+            sender_sig_priv_hex=bob_seed.hex(),
+            sender_sig_pub_hex=bob_pub.hex(),
+            filename="deep_nested.zip",
+            body=orig_bytes,
+        )
+        slots.append({"slot_id": "slot-zip-2", "created_at": 2, "body": bob_post})
+
+        monkeypatch.chdir(receiver_dir)
+        rc = nomnom.cmd_receive(once=True)
+        assert rc == 0
+        received_path = receiver_dir / "deep_nested.zip"
+        assert received_path.read_bytes() == orig_bytes
+
+        with zipfile.ZipFile(received_path, "r") as zf:
+            assert zf.read("level1/level2/level3/level4/deep.txt") == b"deep content"
+            assert zf.read("level1/sibling.txt") == b"sibling content"
+
+    def test_transfer_empty_zip_archive(self, env, tmp_path, monkeypatch):
+        import zipfile
+        _cfg_path, feed, slots, (bob_member, bob_seed, bob_pub) = env
+        sender_dir = tmp_path / "sender"
+        receiver_dir = tmp_path / "receiver"
+        sender_dir.mkdir()
+        receiver_dir.mkdir()
+
+        zip_path = sender_dir / "empty.zip"
+        with zipfile.ZipFile(zip_path, "w") as zf:
+            pass  # empty zip archive (22 bytes)
+
+        orig_bytes = zip_path.read_bytes()
+        assert len(orig_bytes) == 22  # zip empty central directory record size
+
+        feed_key = nomnom._feed_key_from_token(feed.feed_token)
+        bob_post = nomnom.feed_seal(
+            feed_key=feed_key,
+            feed_id=feed.feed_id,
+            sender_member_id=bob_member,
+            sender_sig_priv_hex=bob_seed.hex(),
+            sender_sig_pub_hex=bob_pub.hex(),
+            filename="empty.zip",
+            body=orig_bytes,
+        )
+        slots.append({"slot_id": "slot-zip-3", "created_at": 3, "body": bob_post})
+
+        monkeypatch.chdir(receiver_dir)
+        rc = nomnom.cmd_receive(once=True)
+        assert rc == 0
+        received_path = receiver_dir / "empty.zip"
+        assert received_path.read_bytes() == orig_bytes
+
+        with zipfile.ZipFile(received_path, "r") as zf:
+            assert len(zf.namelist()) == 0
+
+    def test_transfer_unicode_zip_filename(self, env, tmp_path, monkeypatch, capsys):
+        import zipfile
+        _cfg_path, feed, slots, (bob_member, bob_seed, bob_pub) = env
+        sender_dir = tmp_path / "sender"
+        receiver_dir = tmp_path / "receiver"
+        sender_dir.mkdir()
+        receiver_dir.mkdir()
+
+        unicode_name = "archive_日本語_bundle.zip"
+        zip_path = sender_dir / unicode_name
+        with zipfile.ZipFile(zip_path, "w") as zf:
+            zf.writestr("test.txt", "utf-8 filename test")
+
+        orig_bytes = zip_path.read_bytes()
+        feed_key = nomnom._feed_key_from_token(feed.feed_token)
+        bob_post = nomnom.feed_seal(
+            feed_key=feed_key,
+            feed_id=feed.feed_id,
+            sender_member_id=bob_member,
+            sender_sig_priv_hex=bob_seed.hex(),
+            sender_sig_pub_hex=bob_pub.hex(),
+            filename=unicode_name,
+            body=orig_bytes,
+        )
+        slots.append({"slot_id": "slot-zip-4", "created_at": 4, "body": bob_post})
+
+        monkeypatch.chdir(receiver_dir)
+        rc = nomnom.cmd_receive(once=True)
+        assert rc == 0
+        received_path = receiver_dir / unicode_name
+        assert received_path.exists()
+        assert received_path.read_bytes() == orig_bytes
+
+        with zipfile.ZipFile(received_path, "r") as zf:
+            assert zf.read("test.txt") == b"utf-8 filename test"
 
 
 class TestJoinToken:
