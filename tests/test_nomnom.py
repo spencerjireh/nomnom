@@ -9,12 +9,14 @@ loop itself is excluded — it needs a TTY.
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import subprocess
 import sys
 import threading
 import time
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -259,6 +261,22 @@ class TestScanRepo:
         assert "code.py" in paths
         assert "blob.bin" not in paths
 
+    def test_zip_files_kept(self, tmp_path):
+        make_repo(tmp_path, {"code.py": "print('hi')"})
+        with zipfile.ZipFile(tmp_path / "assets.zip", "w") as zf:
+            zf.writestr("data.txt", "inside")
+        gi = nomnom.load_gitignore(tmp_path)
+        items = nomnom.scan_repo(tmp_path, gi)
+        paths = rels(items)
+        assert "code.py" in paths
+        assert "assets.zip" in paths
+        # Stats come from stat() alone: loc=0, tokens estimated on the
+        # base64 expansion (size * 4/3 / 4 ~= size // 3).
+        stats = nomnom.collect_stats(tmp_path, items)
+        size = (tmp_path / "assets.zip").stat().st_size
+        assert stats["assets.zip"] == (size, 0, size * 4 // 3 // 4)
+        assert stats["code.py"][1] == 1
+
     @pytest.mark.skipif(sys.platform == "win32", reason="symlinks unreliable on Windows")
     def test_symlinks_skipped(self, tmp_path):
         make_repo(tmp_path, {"real.py": "x"})
@@ -442,6 +460,24 @@ class TestRenderOutput:
     def test_read_error_inlined(self, tmp_path):
         out = nomnom.render_output("r", tmp_path, ["does-not-exist.py"], None)
         assert "<<read error" in out
+
+    def test_zip_embedded_as_base64(self, tmp_path):
+        with zipfile.ZipFile(tmp_path / "assets.zip", "w") as zf:
+            zf.writestr("data.bin", bytes(range(256)))
+        raw = (tmp_path / "assets.zip").read_bytes()
+        out = nomnom.render_output("r", tmp_path, ["assets.zip"], None)
+        assert '<file path="assets.zip" encoding="base64">' in out
+        block = out.split('encoding="base64">', 1)[1].split("</file>", 1)[0]
+        # Wrapped at 76 cols; whitespace must be stripped before decoding.
+        for line in block.strip().splitlines():
+            assert len(line) <= 76
+        assert base64.b64decode("".join(block.split())) == raw
+
+    def test_zip_read_error_inlined(self, tmp_path):
+        # A .zip-named path that vanishes still renders a read-error block.
+        out = nomnom.render_output("r", tmp_path, ["gone.zip"], None)
+        assert "<<read error" in out
+        assert 'encoding="base64"' not in out
 
 
 # ---------- _unique_path ----------
@@ -3040,6 +3076,17 @@ class TestParseBundle:
         _, files = nomnom.parse_bundle(out)
         assert files == [("a.py", "no-newline\n")]
 
+    def test_zip_round_trips_as_bytes(self, tmp_path):
+        (tmp_path / "a.py").write_text("x\n")
+        with zipfile.ZipFile(tmp_path / "assets.zip", "w") as zf:
+            zf.writestr("data.bin", bytes(range(256)))
+        raw = (tmp_path / "assets.zip").read_bytes()
+        out = nomnom.render_output(
+            "myrepo", tmp_path, ["a.py", "assets.zip"], None,
+        )
+        _, files = nomnom.parse_bundle(out)
+        assert files == [("a.py", "x\n"), ("assets.zip", raw)]
+
     def test_rejects_git_bundle(self):
         out = nomnom.render_git_bundle(
             "repo", "commit", "main", [("status", "clean")], tree=None,
@@ -3093,6 +3140,26 @@ class TestParseBundle:
             '<file path="a.py">\nprint(1)\n'
         )
         with pytest.raises(ValueError, match="unterminated"):
+            nomnom.parse_bundle(text)
+
+    def test_rejects_invalid_base64(self):
+        text = (
+            "This is a packed representation of selected files from repo, "
+            "bundled on 2026-05-11T12:00:00. Each file is wrapped in "
+            '<file path="..."> tags.\n\n'
+            '<file path="a.zip" encoding="base64">\n!!!not-base64!!!\n</file>\n'
+        )
+        with pytest.raises(ValueError, match="invalid base64"):
+            nomnom.parse_bundle(text)
+
+    def test_rejects_unknown_encoding(self):
+        text = (
+            "This is a packed representation of selected files from repo, "
+            "bundled on 2026-05-11T12:00:00. Each file is wrapped in "
+            '<file path="..."> tags.\n\n'
+            '<file path="a.zip" encoding="rot13">\nabc\n</file>\n'
+        )
+        with pytest.raises(ValueError, match="unknown encoding"):
             nomnom.parse_bundle(text)
 
 
@@ -3241,6 +3308,30 @@ class TestCmdRebuild:
         assert rc == 1
         assert "path separator" in capsys.readouterr().err
         assert list(out_dir.iterdir()) == []
+
+    def test_zip_round_trip_byte_identical(self, tmp_path, monkeypatch):
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "a.py").write_text("x\n", encoding="utf-8")
+        with zipfile.ZipFile(src / "assets.zip", "w") as zf:
+            zf.writestr("inner/data.txt", "payload")
+        raw = (src / "assets.zip").read_bytes()
+        bundle = nomnom.render_output("myrepo", src, ["a.py", "assets.zip"], None)
+        bundle_file = tmp_path / "bundle.txt"
+        bundle_file.write_text(bundle, encoding="utf-8")
+
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        monkeypatch.chdir(out_dir)
+
+        rc = nomnom.cmd_rebuild(str(bundle_file), None)
+        assert rc == 0
+        rebuilt = out_dir / "myrepo" / "assets.zip"
+        assert rebuilt.read_bytes() == raw
+        assert (out_dir / "myrepo" / "a.py").read_text() == "x\n"
+        # The rebuilt zip is a real, readable archive.
+        with zipfile.ZipFile(rebuilt) as zf:
+            assert zf.read("inner/data.txt") == b"payload"
 
 
 # ---------- encryption (wire format) ----------

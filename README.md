@@ -25,6 +25,8 @@ nomnom .
 
 Opens a picker for the current directory. Pick files, hit `Enter`, get `./<repo>-<timestamp>.txt`. `.gitignore`, junk dirs (`.git`, `node_modules`, …), binaries, symlinks, and obvious secrets are skipped before the picker loads.
 
+`.zip` is the one binary exception: zips show up in the picker and are embedded base64-encoded (`<file path="…" encoding="base64">`), so `nomnom rebuild` restores them byte-for-byte.
+
 Run bare `nomnom` on a TTY to open a launcher with tiles for Bundle, Send, Receive, Channel, Commit, PR, Item, Rebuild, and Extensions. Inside the picker, `v` cycles bundle / `commit` / `pr` / `item` when run from inside a git repo.
 
 Output mirrors [repomix](https://github.com/yamadashy/repomix)'s shape:

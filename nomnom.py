@@ -226,6 +226,13 @@ SECRET_PATTERNS = [
 ]
 # --- end nomnom:extensions ---
 
+# Binary types nomnom can round-trip through a bundle. They stay listed in
+# BINARY_EXTENSIONS (previews still say "binary") but scan_repo keeps them;
+# render_output embeds them base64-encoded and parse_bundle decodes them on
+# rebuild. Must live OUTSIDE the marker block — `register` rewrites only the
+# four KINDS sets and would drop anything else placed inside it.
+EMBEDDABLE_EXTENSIONS = {'.zip'}
+
 
 # ---------- gitignore ----------
 
@@ -464,7 +471,8 @@ def scan_repo(
             items.append(ScanItem(rel=rel, is_dir=True))
             walk(abs_path, rel)
         for _name, rel, abs_path in files:
-            if is_binary(abs_path):
+            if is_binary(abs_path) and \
+                    abs_path.suffix.lower() not in EMBEDDABLE_EXTENSIONS:
                 continue
             items.append(ScanItem(rel=rel, is_dir=False))
 
@@ -517,12 +525,24 @@ def apply_include_exclude(
 def collect_stats(
     root: Path, items: list[ScanItem]
 ) -> dict[str, tuple[int, int, int] | None]:
-    """One read pass per file. Returns rel -> (bytes, loc, tokens), or None on read error."""
+    """One read pass per file. Returns rel -> (bytes, loc, tokens), or None on read error.
+
+    Embeddable binaries (.zip & co) are never decoded as text — stats come
+    from stat() alone, with tokens estimated on the base64 expansion."""
     out: dict[str, tuple[int, int, int] | None] = {}
     for it in items:
         if it.is_dir:
             continue
         p = root / it.rel
+        if p.suffix.lower() in EMBEDDABLE_EXTENSIONS:
+            try:
+                size = p.stat().st_size
+            except OSError:
+                out[it.rel] = None
+                continue
+            tokens = size * 4 // 3 // APPROX_BYTES_PER_TOKEN
+            out[it.rel] = (size, 0, tokens)
+            continue
         try:
             size = p.stat().st_size
             content = p.read_text(encoding="utf-8", errors="replace")
@@ -1302,6 +1322,22 @@ def render_output(
         parts.append("")
     for rel in files:
         abs_p = repo_root / rel
+        if abs_p.suffix.lower() in EMBEDDABLE_EXTENSIONS:
+            try:
+                raw = abs_p.read_bytes()
+            except OSError as e:
+                parts.append(f'<file path="{rel}">')
+                parts.append(f"<<read error: {e}>>")
+                parts.append("</file>")
+                parts.append("")
+                continue
+            b64 = base64.b64encode(raw).decode("ascii")
+            parts.append(f'<file path="{rel}" encoding="base64">')
+            for i in range(0, len(b64), 76):
+                parts.append(b64[i:i + 76])
+            parts.append("</file>")
+            parts.append("")
+            continue
         try:
             content = abs_p.read_text(encoding="utf-8", errors="replace")
         except OSError as e:
@@ -1362,14 +1398,19 @@ _REBUILD_FILE_HEADER_RE = re.compile(
 _REBUILD_GIT_HEADER_RE = re.compile(
     r"^This is a packed representation of git context for "
 )
-_REBUILD_FILE_OPEN_RE = re.compile(r'^<file path="(.+)">$')
+_REBUILD_FILE_OPEN_RE = re.compile(
+    r'^<file path="(.+?)"(?: encoding="([^"]+)")?>$'
+)
 
 
-def parse_bundle(text: str) -> tuple[str, list[tuple[str, str]]]:
+def parse_bundle(text: str) -> tuple[str, list[tuple[str, str | bytes]]]:
     """Parse a nomnom file bundle into (repo_name, [(rel_path, content), ...]).
 
-    Raises ValueError on a malformed bundle, a git-context bundle, or any path
-    that would escape the target folder (absolute, leading slash, `..` segment).
+    Entries without an encoding attribute parse as text; entries marked
+    encoding="base64" decode to bytes (written binary-exact on rebuild).
+    Raises ValueError on a malformed bundle, a git-context bundle, an unknown
+    encoding, undecodable base64, or any path that would escape the target
+    folder (absolute, leading slash, `..` segment).
     Known limitation: file contents containing a literal `</file>` line on its
     own line will end the block early — the bundle format itself has no escape.
     """
@@ -1387,7 +1428,7 @@ def parse_bundle(text: str) -> tuple[str, list[tuple[str, str]]]:
     if not repo_name:
         raise ValueError("bundle header has an empty repo name")
 
-    files: list[tuple[str, str]] = []
+    files: list[tuple[str, str | bytes]] = []
     lines = text.splitlines()
     i = 0
     n = len(lines)
@@ -1410,6 +1451,7 @@ def parse_bundle(text: str) -> tuple[str, list[tuple[str, str]]]:
             i += 1
             continue
         rel = om.group(1)
+        encoding = om.group(2)
         _validate_rebuild_path(rel)
         i += 1
         body: list[str] = []
@@ -1429,7 +1471,21 @@ def parse_bundle(text: str) -> tuple[str, list[tuple[str, str]]]:
         # common source-file convention); files that originally lacked one
         # will gain one on rebuild.
         content = "\n".join(body)
-        files.append((rel, content))
+        if encoding == "base64":
+            compact = "".join(content.split())
+            try:
+                decoded = base64.b64decode(compact, validate=True)
+            except (binascii.Error, ValueError) as e:
+                raise ValueError(
+                    f"invalid base64 in bundle for {rel!r}: {e}"
+                ) from e
+            files.append((rel, decoded))
+        elif encoding is None:
+            files.append((rel, content))
+        else:
+            raise ValueError(
+                f"unknown encoding {encoding!r} in bundle for {rel!r}"
+            )
 
     if not files:
         raise ValueError("bundle contains no <file> blocks")
@@ -1451,13 +1507,14 @@ def pick_target_dir(cwd: Path, name: str) -> Path:
 
 
 def _write_bundle_files(
-    target: Path, files: list[tuple[str, str]],
+    target: Path, files: list[tuple[str, str | bytes]],
 ) -> tuple[int, str | None]:
     """Create `target` and write the parsed bundle files into it.
 
-    Returns (files_written, error). On error, writing stops; partial output
-    may remain. Shared by cmd_rebuild and the TUI RebuildScreen so OSError
-    handling and the path-escape re-check stay in lock-step.
+    Bytes entries (base64-embedded binaries) are written byte-exact; text
+    entries as UTF-8. Returns (files_written, error). On error, writing stops;
+    partial output may remain. Shared by cmd_rebuild and the TUI RebuildScreen
+    so OSError handling and the path-escape re-check stay in lock-step.
     """
     target_resolved = target.resolve()
     try:
@@ -1475,7 +1532,10 @@ def _write_bundle_files(
             return written, f"refusing to write outside target: {rel!r}"
         try:
             dest.parent.mkdir(parents=True, exist_ok=True)
-            dest.write_text(content, encoding="utf-8")
+            if isinstance(content, bytes):
+                dest.write_bytes(content)
+            else:
+                dest.write_text(content, encoding="utf-8")
         except OSError as e:
             return written, f"cannot write {dest}: {e}"
         written += 1
@@ -6574,7 +6634,7 @@ class RebuildScreen(Screen):
         preview->input back path, so a new field can't be forgotten in one)."""
         self.bundle_text = ""
         self.repo_name = ""
-        self.files: list[tuple[str, str]] = []
+        self.files: list[tuple[str, str | bytes]] = []
         self.target: Path | None = None
 
     def _parse(self) -> None:
