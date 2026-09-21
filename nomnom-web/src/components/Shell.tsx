@@ -13,7 +13,7 @@ import { TofuModal } from "./TofuModal";
 export function Shell() {
   const identity = useStore((s) => s.identity);
   const channel = useStore((s) => s.channel);
-  // Key the watch on feed_id only: roster/last_post_ts mutations on the
+  // Key the watch on feed_id only: roster/last_seq mutations on the
   // channel object would otherwise restart the loop on every poll.
   const channelFeedId = channel?.feed_id;
 

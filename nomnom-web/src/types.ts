@@ -18,17 +18,17 @@ export interface Member {
 /** A feed this device has opened or joined. Shape mirrors the CLI's feeds.json,
  * plus a local-only `auto_save` toggle: when true, received files decrypt
  * straight to disk; when false (the safe default) they hold in the timeline
- * awaiting an explicit [save] / [discard]. */
+ * awaiting an explicit [save] / [discard]. `last_seq` is the relay's monotonic
+ * post cursor: the highest seq this device has processed. */
 export interface Feed {
   name: string; // local nickname
   feed_id: string;
   feed_token: string;
   url: string; // https://host/f/<token>
-  expires_at: number;
   joined_at: number;
   member_id: string; // this device's id within the feed
   members_cache: Member[];
-  last_post_ts: number;
+  last_seq: number;
   auto_save: boolean;
 }
 
@@ -81,9 +81,10 @@ export interface TimelineEntry {
   progress?: number;   // 0..1, for in_flight sends
   error?: string;      // failed sends
   body?: ArrayBuffer;  // receive only; present from "held" through "saved"
-  slot_id?: string;    // receive only; set on history-rebuilt rows so their body
-                       // can be re-fetched + decrypted lazily on save (the
-                       // rebuild doesn't keep every body in memory at once)
+  slot_id?: string;    // the post's id on the relay. Set on every relay-backed
+                       // row (send and receive); absent only on in-flight or
+                       // failed sends. Lets a held row re-fetch its body lazily
+                       // on save and lets [delete] target the post.
 }
 
 /** The synthetic global pin id for an Ed25519 identity (matches CLI `_feed_peer_id`). */

@@ -49,7 +49,7 @@ export async function verifyFeedKey(
   feedId: string,
 ): Promise<AuthResult> {
   const url = new URL(req.url);
-  // EventSource (the SSE /stream endpoint) can't set an Authorization header,
+  // A browser WebSocket (the /ws endpoint) can't set an Authorization header,
   // so accept the same `<ts>:<mac>` envelope from an `?auth=` query param as a
   // fallback. The MAC signs the bare pathname (query excluded), so carrying it
   // in the query doesn't change what's signed.

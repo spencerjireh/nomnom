@@ -12,7 +12,7 @@ import { runHistory } from "../orchestration/history";
 import { openFeed, joinFeed, leaveFeed, feedContext, type TofuHooks } from "../orchestration/feed-actions";
 import { cryptoClient } from "../worker/cryptoClient";
 import { friendlyRelayMessage } from "../relay/errors";
-import { CHANNEL_NAME, PERMANENT_TTL_SECONDS } from "../config";
+import { CHANNEL_NAME } from "../config";
 import { downloadBlob } from "../util/dom";
 import { newId } from "../util/ids";
 import type { Feed } from "../types";
@@ -64,6 +64,7 @@ export async function send(payload: {
       status: "served",
       progress: 1,
       recipients: result.recipients,
+      slot_id: result.slotId,
     });
   } catch (e) {
     const msg = abort.signal.aborted ? "canceled" : friendlyRelayMessage(e);
@@ -85,13 +86,13 @@ export async function receive(feed: Feed, signal: AbortSignal): Promise<void> {
   // Phase 1: rebuild the session timeline from the relay's still-live posts, so a
   // refresh restores history (sent + received) instead of starting blank. Runs
   // once per mount; the live watch below resumes after the newest rebuilt post.
-  let resumeFrom = feed.last_post_ts;
+  let resumeFrom = feed.last_seq;
   try {
     const { rows, maxCursor } = await runHistory({ feed, identity, signal });
     if (signal.aborted) return; // StrictMode unmount / re-pair — don't clobber
     useStore.getState().rebuildTimeline(rows);
-    resumeFrom = Math.max(feed.last_post_ts, maxCursor);
-    useStore.getState().patchChannel({ last_post_ts: resumeFrom });
+    resumeFrom = Math.max(feed.last_seq, maxCursor);
+    useStore.getState().patchChannel({ last_seq: resumeFrom });
   } catch (e) {
     if (signal.aborted) return;
     // runHistory is best-effort and already swallows relay errors; a throw here
@@ -105,7 +106,7 @@ export async function receive(feed: Feed, signal: AbortSignal): Promise<void> {
   // identity.
   try {
     await runReceive({
-      feed: { ...feed, last_post_ts: resumeFrom },
+      feed: { ...feed, last_seq: resumeFrom },
       identity,
       hooks: tofuHooks(),
       onFile: (f) => {
@@ -123,6 +124,7 @@ export async function receive(feed: Feed, signal: AbortSignal): Promise<void> {
             peerName: f.peerName,
             status: "saved",
             body: f.body,
+            slot_id: f.slot_id,
           });
         } else {
           useStore.getState().appendTimeline({
@@ -134,11 +136,13 @@ export async function receive(feed: Feed, signal: AbortSignal): Promise<void> {
             peerName: f.peerName,
             status: "held",
             body: f.body,
+            slot_id: f.slot_id,
           });
         }
       },
-      onAdvance: (ts) => useStore.getState().patchChannel({ last_post_ts: ts }),
+      onAdvance: (seq) => useStore.getState().patchChannel({ last_seq: seq }),
       onRoster: (roster) => useStore.getState().patchChannel({ members_cache: roster }),
+      onDeleted: (slotId) => useStore.getState().removeTimelineEntryBySlot(slotId),
       signal,
     });
   } catch (e) {
@@ -194,9 +198,32 @@ export async function saveHeld(id: string): Promise<void> {
   }
 }
 
-/** Discard a received file: remove its row (and bytes) from the timeline. */
+/** Discard a received file: remove its row (and bytes) from the timeline.
+ * Local only — the post stays on the relay for other devices. */
 export function discardHeld(id: string): void {
   useStore.getState().removeTimelineEntry(id);
+}
+
+/** Delete a post from the relay for every device. Rows without a slot_id (an
+ * in-flight or failed send) are only removed locally. On success — or if the
+ * post is already gone — the row disappears; on failure the row stays with an
+ * error. Never throws. */
+export async function deletePost(id: string): Promise<void> {
+  const s = useStore.getState();
+  const row = s.timeline.find((r) => r.id === id);
+  if (!row) return;
+  const feed = s.channel;
+  if (!row.slot_id || !s.identity || !feed) {
+    useStore.getState().removeTimelineEntry(id);
+    return;
+  }
+  try {
+    const ctx = feedContext(feed, s.identity);
+    await ctx.client.deleteSlot(feed.feed_id, ctx.feedKey, row.slot_id);
+    useStore.getState().removeTimelineEntry(id);
+  } catch (e) {
+    useStore.getState().patchTimelineEntry(id, { error: friendlyRelayMessage(e) });
+  }
 }
 
 /** Create the channel (owner only — needs a configured relay). Throws on failure. */
@@ -208,7 +235,6 @@ export async function openChannel(): Promise<Feed> {
     identity: s.identity,
     relay: s.relay,
     name: CHANNEL_NAME,
-    ttlSeconds: PERMANENT_TTL_SECONDS,
   });
   useStore.getState().setChannel(feed);
   return feed;

@@ -3886,7 +3886,6 @@ class TestCmdSendFeed:
             feed_id=token,
             feed_token=token,
             url=f"https://relay.example.com/f/{token}",
-            expires_at=2_000_000_000,
             joined_at=1_700_000_000,
             member_id=member_id,
             members_cache=[
@@ -3956,7 +3955,6 @@ class TestSendDestination:
             feed_id=token,
             feed_token=token,
             url=f"https://relay.example.com/f/{token}",
-            expires_at=2_000_000_000,
             joined_at=1_700_000_000,
             member_id=member_id,
             members_cache=[
@@ -4099,7 +4097,7 @@ class TestReceiveOnePostSkipsOwn:
         feed = nomnom.Feed(
             name="home", feed_id=token, feed_token=token,
             url=f"https://relay.example.com/f/{token}",
-            expires_at=2_000_000_000, joined_at=1_700_000_000,
+            joined_at=1_700_000_000,
             member_id=member_id,
         )
         feed_key = nomnom._feed_key_from_token(token)
@@ -4135,7 +4133,6 @@ class TestCmdReceiveFeed:
             feed_id=token,
             feed_token=token,
             url=f"https://relay.example.com/f/{token}",
-            expires_at=2_000_000_000,
             joined_at=1_700_000_000,
             member_id=alice_member,
             members_cache=[
@@ -4158,16 +4155,21 @@ class TestCmdReceiveFeed:
             body=b"hello alice",
         )
 
-        slots: list = [{"slot_id": "slot-1", "created_at": 1, "body": bob_post}]
+        slots: list = [{"seq": 2, "slot_id": "slot-1", "created_at": 1, "body": bob_post}]
 
-        def fake_list_slots(host, fid, fkey, *, since_ts=0, wait_ms=0):
-            fresh = [s for s in slots if s["created_at"] > since_ts]
+        def fake_list_slots(host, fid, fkey, *, since_seq=0, wait_ms=0):
+            fresh = sorted(
+                (s for s in slots if s["seq"] > since_seq), key=lambda s: s["seq"],
+            )
             if not fresh and wait_ms > 0:
                 # Simulate a 30s timeout returning empty (avoid actually sleeping).
                 return []
-            return [{"slot_id": s["slot_id"], "created_at": s["created_at"]} for s in fresh]
+            return [
+                {"seq": s["seq"], "slot_id": s["slot_id"], "created_at": s["created_at"]}
+                for s in fresh
+            ]
 
-        def fake_get_slot(host, fid, fkey, slot_id, *, wait_ms=0):
+        def fake_get_slot(host, fid, fkey, slot_id):
             for s in slots:
                 if s["slot_id"] == slot_id:
                     return s["body"]
@@ -4202,7 +4204,7 @@ class TestCmdReceiveFeed:
             filename="echo.txt",
             body=b"my own",
         )
-        slots.insert(0, {"slot_id": "slot-0", "created_at": 0.5, "body": alice_post})
+        slots.insert(0, {"seq": 1, "slot_id": "slot-0", "created_at": 1, "body": alice_post})
         rc = nomnom.cmd_receive(once=True)
         assert rc == 0
         # Only bob's file was written; alice's echo was skipped.
@@ -4217,7 +4219,7 @@ class TestCmdReceiveFeed:
         feed = nomnom.Feed(
             name="home", feed_id=token, feed_token=token,
             url=f"https://relay.example.com/f/{token}",
-            expires_at=2_000_000_000, joined_at=1_700_000_000,
+            joined_at=1_700_000_000,
             member_id="a" * 32, members_cache=[],
         )
         cfg = nomnom._empty_feeds_config()
@@ -4258,7 +4260,7 @@ class TestCmdReceiveFeed:
         feed = nomnom.Feed(
             name="home", feed_id="tok", feed_token="tok",
             url="https://relay.example.com/f/tok",
-            expires_at=2_000_000_000, joined_at=1_700_000_000,
+            joined_at=1_700_000_000,
             member_id="a" * 32, members_cache=[],
         )
         with pytest.raises(nomnom.NomnomTransportError):
@@ -4276,7 +4278,7 @@ class TestCmdReceiveFeed:
         feed = nomnom.Feed(
             name="home", feed_id="tok", feed_token="tok",
             url="https://relay.example.com/f/tok",
-            expires_at=2_000_000_000, joined_at=1_700_000_000,
+            joined_at=1_700_000_000,
             member_id="a" * 32, members_cache=[],
         )
         landed = nomnom._receive_and_report(
@@ -4294,7 +4296,7 @@ class TestCmdReceiveFeed:
         real_body = slots[0]["body"]
         calls = {"n": 0}
 
-        def flaky_get_slot(host, fid, fkey, slot_id, *, wait_ms=0):
+        def flaky_get_slot(host, fid, fkey, slot_id):
             calls["n"] += 1
             if calls["n"] == 1:
                 raise nomnom.NomnomTransportError("relay returned HTTP 503")
@@ -4309,110 +4311,55 @@ class TestCmdReceiveFeed:
         assert "warning" in err
         # The persisted cursor only advanced once the post actually landed.
         ch = nomnom._the_channel()
-        assert ch is not None and ch.last_post_ts == 1
+        assert ch is not None and ch.last_seq == 2
 
-
-class _FakeStreamResp:
-    def __init__(self, status, chunks):
-        self.status = status
-        self._chunks = list(chunks)
-
-    def readline(self, *_a):
-        return self._chunks.pop(0) if self._chunks else b""
-
-    def read(self, *_a):
-        return b""
-
-
-class _FakeStreamConn:
-    def __init__(self, resp):
-        self._resp = resp
-        self.closed = False
-
-    def request(self, *_a, **_k):
-        pass
-
-    def getresponse(self):
-        return self._resp
-
-    def close(self):
-        self.closed = True
-
-
-class TestFeedStreamLines:
-    def _patch_conn(self, monkeypatch, resp):
-        conn = _FakeStreamConn(resp)
-        monkeypatch.setattr(
-            nomnom, "_relay_open", lambda relay, *, timeout=0: conn,
+    def test_transient_error_does_not_skip_later_entries(self, env, capsys, monkeypatch):
+        # Two posts in one batch; the FIRST fails transiently. The loop must
+        # stop consuming the batch (not process the second and advance past
+        # the first), then re-list and land both.
+        tmp_path, feed, slots = env
+        monkeypatch.chdir(tmp_path)
+        alice_ident = nomnom._load_identity()
+        feed_key = nomnom._feed_key_from_token(feed.feed_token)
+        bob_member = "b" * 32
+        bob_pub = feed.members_cache[1]["identity_pubkey"]
+        # Second post from bob needs bob's private key; seal with a fresh pair
+        # under the same member id is not possible, so reuse alice's echo as a
+        # skip-safe second entry: it must NOT be processed before slot-1 lands.
+        alice_post = nomnom.feed_seal(
+            feed_key=feed_key,
+            feed_id=feed.feed_id,
+            sender_member_id=feed.member_id,
+            sender_sig_priv_hex=alice_ident["sig_priv"],
+            sender_sig_pub_hex=alice_ident["sig_pub"],
+            filename="echo.txt",
+            body=b"my own",
         )
-        return conn
+        del bob_member, bob_pub
+        slots.append({"seq": 3, "slot_id": "slot-2", "created_at": 2, "body": alice_post})
+        real_bodies = {s["slot_id"]: s["body"] for s in slots}
+        fetched: list = []
 
-    def test_yields_lines_until_eof(self, monkeypatch):
-        conn = self._patch_conn(
-            monkeypatch, _FakeStreamResp(200, [b"data: x\n", b": ping\r\n"]),
-        )
-        out = list(nomnom._feed_stream_lines("h", b"k", "/feeds/f/stream"))
-        assert out == ["data: x", ": ping"]
-        assert conn.closed  # connection always closed on exit
+        def flaky_get_slot(host, fid, fkey, slot_id):
+            fetched.append(slot_id)
+            if len(fetched) == 1:
+                raise nomnom.NomnomTransportError("relay returned HTTP 503")
+            return real_bodies[slot_id]
 
-    def test_404_raises_stream_unsupported(self, monkeypatch):
-        conn = self._patch_conn(monkeypatch, _FakeStreamResp(404, []))
-        with pytest.raises(nomnom._StreamUnsupported):
-            list(nomnom._feed_stream_lines("h", b"k", "/feeds/f/stream"))
-        assert conn.closed
-
-    def test_other_status_raises_nomnomerror(self, monkeypatch):
-        self._patch_conn(monkeypatch, _FakeStreamResp(410, []))
-        with pytest.raises(nomnom.NomnomError):
-            list(nomnom._feed_stream_lines("h", b"k", "/feeds/f/stream"))
-
-
-class TestRelayStreamFeedSlots:
-    def test_parses_data_frames_and_skips_noise(self, monkeypatch):
-        lines = [
-            ": ok",
-            "id: 5",
-            'data: {"slot_id": "a", "created_at": 5}',
-            "",
-            ": ping",
-            'data: {"slot_id": "b", "created_at": 6}',
-            "data: not-json{",            # malformed → skipped
-            'data: {"created_at": 7}',     # no slot_id → skipped
-        ]
-
-        def fake_lines(host, feed_key, path):
-            for ln in lines:
-                yield ln
-
-        monkeypatch.setattr(nomnom, "_feed_stream_lines", fake_lines)
-        stop = nomnom.threading.Event()
-        got = []
-        for item in nomnom._relay_stream_feed_slots(
-            "h", "fid", b"k", since_fn=lambda: 0, stop=stop,
-        ):
-            got.append(item)
-            if len(got) == 2:
-                stop.set()  # stop once we've collected both valid frames
-        assert got == [
-            {"slot_id": "a", "created_at": 5},
-            {"slot_id": "b", "created_at": 6},
-        ]
-
-    def test_stop_set_before_iteration_yields_nothing(self, monkeypatch):
-        monkeypatch.setattr(
-            nomnom, "_feed_stream_lines",
-            lambda *a, **k: iter(["data: {\"slot_id\": \"a\", \"created_at\": 1}"]),
-        )
-        stop = nomnom.threading.Event()
-        stop.set()
-        assert list(
-            nomnom._relay_stream_feed_slots(
-                "h", "fid", b"k", since_fn=lambda: 0, stop=stop,
-            )
-        ) == []
+        monkeypatch.setattr(nomnom, "_relay_get_feed_slot", flaky_get_slot)
+        rc = nomnom.cmd_receive(once=True)
+        assert rc == 0
+        # First attempt failed on slot-1 and stopped the batch; the re-list
+        # fetched slot-1 again before ever touching slot-2.
+        assert fetched[:2] == ["slot-1", "slot-1"]
+        assert (tmp_path / "from-bob.txt").read_bytes() == b"hello alice"
+        ch = nomnom._the_channel()
+        assert ch is not None and ch.last_seq == 2
 
 
-class TestCmdReceiveStream:
+class TestCmdReceiveContinuous:
+    """Continuous (non --once) receive over the long-poll."""
+
     @pytest.fixture
     def env(self, tmp_path, monkeypatch):
         monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
@@ -4424,7 +4371,7 @@ class TestCmdReceiveStream:
         feed = nomnom.Feed(
             name="home", feed_id=token, feed_token=token,
             url=f"https://relay.example.com/f/{token}",
-            expires_at=2_000_000_000, joined_at=1_700_000_000,
+            joined_at=1_700_000_000,
             member_id=alice_member,
             members_cache=[
                 {"member_id": alice_member, "identity_pubkey": alice_ident["sig_pub"], "name": "alice"},
@@ -4436,105 +4383,71 @@ class TestCmdReceiveStream:
         nomnom._save_feeds_config(cfg)
         feed_key = nomnom._feed_key_from_token(token)
         bob_post = nomnom.feed_seal(
-            feed_key=feed_key, feed_id=token,
+            feed_key=feed_key,
+            feed_id=token,
             sender_member_id=bob_member,
             sender_sig_priv_hex=bob_seed.hex(),
             sender_sig_pub_hex=bob_pub.hex(),
-            filename="from-bob.txt", body=b"hello alice",
+            filename="from-bob.txt",
+            body=b"hello alice",
         )
-        # Roster refresh is network; stub it out (the cache already has bob).
-        monkeypatch.setattr(nomnom, "_refresh_roster_with_tofu", lambda *a, **k: None)
         monkeypatch.setattr(
-            nomnom, "_relay_get_feed_slot",
-            lambda host, fid, fkey, slot_id, *, wait_ms=0: bob_post,
+            nomnom, "_refresh_roster_with_tofu", lambda *a, **k: None,
+        )
+        monkeypatch.setattr(
+            nomnom, "_relay_get_feed_slot", lambda h, f, k, slot_id: bob_post,
         )
         return tmp_path, feed, bob_post
 
-    def test_stream_receives_post(self, env, monkeypatch, capsys):
-        tmp_path, feed, _bob_post = env
+    def test_delivers_a_batch_then_exits_cleanly_on_ctrl_c(self, env, monkeypatch, capsys):
+        tmp_path, feed, _ = env
         monkeypatch.chdir(tmp_path)
+        seen_since: list[int] = []
+        batches = [[{"seq": 5, "slot_id": "slot-1", "created_at": 1}]]
 
-        def fake_stream(host, fid, fkey, *, since_fn, stop=None):
-            yield {"slot_id": "slot-1", "created_at": 1}
-            raise KeyboardInterrupt  # simulate Ctrl-C after delivery
+        def fake_list(host, fid, fkey, *, since_seq=0, wait_ms=0):
+            seen_since.append(since_seq)
+            if batches:
+                return batches.pop(0)
+            raise KeyboardInterrupt  # the user stops the watch
 
-        monkeypatch.setattr(nomnom, "_relay_stream_feed_slots", fake_stream)
+        monkeypatch.setattr(nomnom, "_relay_list_feed_slots", fake_list)
         rc = nomnom.cmd_receive()
-        assert rc == 0
-        err = capsys.readouterr().err
-        assert "from-bob.txt" in err and "from bob" in err
+        assert rc == 0  # received something → clean exit
         assert (tmp_path / "from-bob.txt").read_bytes() == b"hello alice"
+        # The second poll resumed from the seq the first batch advanced to.
+        assert seen_since == [0, 5]
+        ch = nomnom._the_channel()
+        assert ch is not None and ch.last_seq == 5
+        assert "from-bob.txt" in capsys.readouterr().err
 
-    def test_stream_dedups_already_seen(self, env, monkeypatch):
-        tmp_path, feed, _bob_post = env
+    def test_entries_at_or_below_cursor_are_not_refetched(self, env, monkeypatch):
+        tmp_path, feed, _ = env
         monkeypatch.chdir(tmp_path)
+        cfg = nomnom._load_feeds_config()
+        cfg["feeds"][0].last_seq = 5
+        nomnom._save_feeds_config(cfg)
+        fetched: list[str] = []
 
-        # created_at <= cursor (last_post_ts starts at 0; feed cursor is 0, so
-        # advance it first via a real post, then re-emit the same ts).
-        def fake_stream(host, fid, fkey, *, since_fn, stop=None):
-            yield {"slot_id": "slot-1", "created_at": 1}
-            yield {"slot_id": "slot-1", "created_at": 1}  # duplicate → skipped
+        def counting_get(host, fid, fkey, slot_id):
+            fetched.append(slot_id)
+            return b""
+
+        monkeypatch.setattr(nomnom, "_relay_get_feed_slot", counting_get)
+        batches = [[
+            {"seq": 4, "slot_id": "old", "created_at": 1},
+            {"seq": 5, "slot_id": "cur", "created_at": 1},
+        ]]
+
+        def fake_list(host, fid, fkey, *, since_seq=0, wait_ms=0):
+            if batches:
+                return batches.pop(0)
             raise KeyboardInterrupt
 
-        writes = {"n": 0}
-        orig = nomnom._receive_one_post
-
-        def counting(*a, **k):
-            writes["n"] += 1
-            return orig(*a, **k)
-
-        monkeypatch.setattr(nomnom, "_receive_one_post", counting)
-        monkeypatch.setattr(nomnom, "_relay_stream_feed_slots", fake_stream)
-        rc = nomnom.cmd_receive()
-        assert rc == 0
-        assert writes["n"] == 1  # the duplicate did not re-fetch/write
-
-    def test_stream_unsupported_falls_back_to_longpoll(self, env, monkeypatch, capsys):
-        tmp_path, feed, _bob_post = env
-        monkeypatch.chdir(tmp_path)
-
-        def fake_stream(host, fid, fkey, *, since_fn, stop=None):
-            raise nomnom._StreamUnsupported()
-            yield  # pragma: no cover - marks this a generator
-
-        monkeypatch.setattr(nomnom, "_relay_stream_feed_slots", fake_stream)
-
-        calls = {"n": 0}
-
-        def fake_list(host, fid, fkey, *, since_ts=0, wait_ms=0):
-            calls["n"] += 1
-            if calls["n"] == 1:
-                return [{"slot_id": "slot-1", "created_at": 1}]
-            raise KeyboardInterrupt  # end the fallback loop after delivery
-
         monkeypatch.setattr(nomnom, "_relay_list_feed_slots", fake_list)
         rc = nomnom.cmd_receive()
-        assert rc == 0
-        err = capsys.readouterr().err
-        assert "no /stream" in err  # announced the fallback
-        assert (tmp_path / "from-bob.txt").read_bytes() == b"hello alice"
-
-    def test_fallback_resumes_from_persisted_cursor(self, env, monkeypatch):
-        # Regression: a mid-stream _StreamUnsupported (e.g. relay redeployed
-        # without /stream) must not rewind the long-poll fallback to the
-        # cursor captured before the stream delivered posts.
-        tmp_path, feed, _bob_post = env
-        monkeypatch.chdir(tmp_path)
-
-        def fake_stream(host, fid, fkey, *, since_fn, stop=None):
-            yield {"slot_id": "slot-1", "created_at": 5}  # persists cursor=5
-            raise nomnom._StreamUnsupported()  # reconnect hits a 404
-
-        monkeypatch.setattr(nomnom, "_relay_stream_feed_slots", fake_stream)
-        seen_since: list[int] = []
-
-        def fake_list(host, fid, fkey, *, since_ts=0, wait_ms=0):
-            seen_since.append(since_ts)
-            raise KeyboardInterrupt  # end the fallback loop immediately
-
-        monkeypatch.setattr(nomnom, "_relay_list_feed_slots", fake_list)
-        nomnom.cmd_receive()
-        assert seen_since == [5]  # was [0] before the fix: stale local cursor
+        assert rc == 130  # nothing received → SIGINT status
+        assert fetched == []
 
 
 class TestJoinToken:
@@ -4639,129 +4552,229 @@ class TestRelayHmac:
 
 
 class _MockRelay:
-    """An in-process Worker stand-in. Stores slots in a dict; HMACs the same
-    way the real Worker does. Used by integration tests to exercise the
-    Python HTTP client without touching Cloudflare."""
+    """An in-process Worker stand-in for the /feeds/* surface. Verifies both
+    auth schemes the way the real Worker does (relay HMAC on POST /feeds and
+    GET /auth; the per-feed key everywhere else), keeps feeds + posts in
+    dicts, and serves the long-poll on /feeds/:id/slots. Used by integration
+    tests to exercise the Python HTTP client without touching Cloudflare."""
 
     def __init__(self, secret: str = "test-secret"):
         import hashlib as _h
         import hmac as _hm
         import http.server
+        import json as _json
+        import re
         import socketserver
         import threading as _t
         import time as _time
 
         self.secret = secret
-        self.slots: dict = {}
+        # feed_id -> {"created_at", "members": {mid: card}, "posts": [(seq, slot_id, created_at)], "blobs": {slot_id: bytes}, "next_seq"}
+        self.feeds: dict = {}
         self.lock = _t.Lock()
-        self.put_event = _t.Event()
+        self.post_event = _t.Event()
 
         relay = self
+
+        def _check_mac(handler, key: bytes, prefix: str) -> bool:
+            auth = handler.headers.get("Authorization", "")
+            if not auth.startswith(prefix):
+                handler.send_error(401, "missing-mac"); return False
+            rest = auth[len(prefix):]
+            if ":" not in rest:
+                handler.send_error(401, "bad-mac"); return False
+            ts, mac = rest.split(":", 1)
+            try:
+                ts_int = int(ts)
+            except ValueError:
+                handler.send_error(401, "bad-mac"); return False
+            if abs(int(_time.time()) - ts_int) > 300:
+                handler.send_error(401, "clock-skew"); return False
+            path_only = handler.path.split("?", 1)[0]
+            msg = f"{handler.command}\n{path_only}\n{ts}".encode("utf-8")
+            expected = _hm.new(key, msg, _h.sha256).hexdigest()
+            if not _hm.compare_digest(expected, mac.lower()):
+                handler.send_error(401, "bad-mac"); return False
+            return True
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def log_message(self, *a, **kw):  # silence test noise
                 pass
 
-            def _verify(self):
-                if self.path == "/health":
-                    return True
-                auth = self.headers.get("Authorization", "")
-                prefix = "NMNM-HMAC-SHA256 "
-                if not auth.startswith(prefix):
-                    self.send_error(401, "missing-mac"); return False
-                rest = auth[len(prefix):]
-                if ":" not in rest:
-                    self.send_error(401, "bad-mac"); return False
-                ts, mac = rest.split(":", 1)
-                try:
-                    ts_int = int(ts)
-                except ValueError:
-                    self.send_error(401, "bad-mac"); return False
-                if abs(int(_time.time()) - ts_int) > 300:
-                    self.send_error(401, "clock-skew"); return False
-                # Path on the request line excludes query for HMAC
-                path_only = self.path.split("?", 1)[0]
-                msg = f"{self.command}\n{path_only}\n{ts}".encode("utf-8")
-                expected = _hm.new(relay.secret.encode(), msg,
-                                   _h.sha256).hexdigest()
-                if not _hm.compare_digest(expected, mac.lower()):
-                    self.send_error(401, "bad-mac"); return False
-                return True
+            def _json(self, status: int, obj) -> None:
+                body = _json.dumps(obj).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def _empty(self, status: int) -> None:
+                self.send_response(status)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def _query(self) -> dict:
+                q = self.path.split("?", 1)[1] if "?" in self.path else ""
+                out: dict = {}
+                for kv in q.split("&"):
+                    if "=" in kv:
+                        k, v = kv.split("=", 1)
+                        try:
+                            out[k] = int(v)
+                        except ValueError:
+                            pass
+                return out
+
+            def _feed(self):
+                """Verify the feed-key MAC and return (feed_id, feed, subpath) or None."""
+                path = self.path.split("?", 1)[0]
+                m = re.match(r"^/feeds/([A-Za-z0-9_-]{8,32})(/.*)?$", path)
+                if not m:
+                    self.send_error(404, "not-found"); return None
+                feed_id = m.group(1)
+                key = nomnom._feed_key_from_token(feed_id)
+                if not _check_mac(self, key, "NMNM-FEEDKEY-SHA256 "):
+                    return None
+                with relay.lock:
+                    feed = relay.feeds.get(feed_id)
+                if feed is None:
+                    self._json(404, {"error": "feed-not-found"}); return None
+                return feed_id, feed, m.group(2) or ""
 
             def do_GET(self):
-                if self.path == "/health":
+                path = self.path.split("?", 1)[0]
+                if path == "/health":
                     self.send_response(200)
                     self.send_header("Content-Type", "text/plain")
+                    self.send_header("Content-Length", "2")
                     self.end_headers()
                     self.wfile.write(b"ok")
                     return
-                if not self._verify():
+                if path == "/auth":
+                    if _check_mac(self, relay.secret.encode(), "NMNM-HMAC-SHA256 "):
+                        self._empty(204)
                     return
-                path = self.path.split("?", 1)[0]
-                q = self.path.split("?", 1)[1] if "?" in self.path else ""
-                wait_ms = 0
-                for kv in q.split("&"):
-                    if kv.startswith("wait="):
-                        try:
-                            wait_ms = int(kv.split("=", 1)[1])
-                        except ValueError:
-                            pass
-                m = re.match(r"^/slots/([A-Za-z0-9_-]+)$", path)
-                if not m:
-                    self.send_error(404, "not-found"); return
-                key = m.group(1)
-                deadline = _time.time() + (wait_ms / 1000.0)
-                while True:
+                got = self._feed()
+                if got is None:
+                    return
+                feed_id, feed, sub = got
+                if sub == "/meta":
+                    self._json(200, {"created_at": feed["created_at"], "last_used_at": feed["created_at"]})
+                    return
+                if sub == "/members":
                     with relay.lock:
-                        val = relay.slots.pop(key, None)
-                    if val is not None:
-                        self.send_response(200)
-                        self.send_header("Content-Type", "application/octet-stream")
-                        self.send_header("Content-Length", str(len(val)))
-                        self.end_headers()
-                        self.wfile.write(val)
-                        return
-                    remaining = deadline - _time.time()
-                    if remaining <= 0:
-                        self.send_error(404, "not-found"); return
-                    relay.put_event.wait(min(0.1, remaining))
-                    relay.put_event.clear()
-
-            def do_PUT(self):
-                if not _verify_self(self): return
-                path = self.path.split("?", 1)[0]
-                m = re.match(r"^/slots/([A-Za-z0-9_-]+)$", path)
-                if not m:
-                    self.send_error(404, "not-found"); return
-                key = m.group(1)
-                clen = int(self.headers.get("Content-Length", "0"))
-                if clen > 256 * 1024 * 1024:
-                    self.send_error(413, "too-large"); return
-                body = self.rfile.read(clen) if clen > 0 else b""
-                with relay.lock:
-                    if key in relay.slots:
-                        self.send_error(409, "occupied"); return
-                    relay.slots[key] = body
-                relay.put_event.set()
-                self.send_response(204)
-                self.end_headers()
-
-            def do_DELETE(self):
-                if not self._verify(): return
-                path = self.path.split("?", 1)[0]
-                m = re.match(r"^/slots/([A-Za-z0-9_-]+)$", path)
+                        members = list(feed["members"].values())
+                    self._json(200, {"members": members, "fresh": []})
+                    return
+                if sub == "/slots":
+                    q = self._query()
+                    since = q.get("since", 0)
+                    deadline = _time.time() + q.get("wait", 0) / 1000.0
+                    while True:
+                        with relay.lock:
+                            fresh = [
+                                {"seq": seq, "slot_id": sid, "created_at": ts}
+                                for seq, sid, ts in feed["posts"] if seq > since
+                            ]
+                        if fresh or _time.time() >= deadline:
+                            self._json(200, {"slots": fresh}); return
+                        relay.post_event.wait(0.1)
+                        relay.post_event.clear()
+                m = re.match(r"^/slots/([A-Za-z0-9_-]{1,128})$", sub)
                 if m:
                     with relay.lock:
-                        relay.slots.pop(m.group(1), None)
-                self.send_response(204)
-                self.end_headers()
+                        val = feed["blobs"].get(m.group(1))
+                    if val is None:
+                        self._json(404, {"error": "not-found"}); return
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/octet-stream")
+                    self.send_header("Content-Length", str(len(val)))
+                    self.end_headers()
+                    self.wfile.write(val)
+                    return
+                self.send_error(404, "not-found")
 
-        # local helper because Python doesn't let the inner class call self._verify
-        # cleanly from another method when send_error closes the connection
-        def _verify_self(h):
-            return h._verify()
+            def do_POST(self):
+                path = self.path.split("?", 1)[0]
+                if path != "/feeds":
+                    self.send_error(404, "not-found"); return
+                if not _check_mac(self, relay.secret.encode(), "NMNM-HMAC-SHA256 "):
+                    return
+                clen = int(self.headers.get("Content-Length", "0"))
+                try:
+                    body = _json.loads(self.rfile.read(clen) or b"{}")
+                    card = body["member_card"]
+                    mid = card["member_id"]
+                except (ValueError, KeyError, TypeError):
+                    self._json(400, {"error": "bad-member-card"}); return
+                feed_id = nomnom.secrets.token_urlsafe(9)
+                now = int(_time.time())
+                with relay.lock:
+                    relay.feeds[feed_id] = {
+                        "created_at": now,
+                        "members": {mid: dict(card, joined_at=now)},
+                        "posts": [],
+                        "blobs": {},
+                        "next_seq": 1,
+                    }
+                self._json(201, {"feed_id": feed_id, "created_at": now})
 
-        import re  # imported locally so module-level imports stay tidy
+            def do_PUT(self):
+                got = self._feed()
+                if got is None:
+                    return
+                feed_id, feed, sub = got
+                clen = int(self.headers.get("Content-Length", "0"))
+                body = self.rfile.read(clen) if clen > 0 else b""
+                m = re.match(r"^/members/([A-Za-z0-9_-]{8,64})$", sub)
+                if m:
+                    try:
+                        card = _json.loads(body)
+                    except ValueError:
+                        self._json(400, {"error": "bad-json"}); return
+                    with relay.lock:
+                        feed["members"][m.group(1)] = dict(card, joined_at=int(_time.time()))
+                    self._empty(204); return
+                m = re.match(r"^/slots/([A-Za-z0-9_-]{1,128})$", sub)
+                if m:
+                    if clen > 256 * 1024 * 1024:
+                        self._json(413, {"error": "payload-too-large"}); return
+                    sid = m.group(1)
+                    with relay.lock:
+                        if sid in feed["blobs"]:
+                            self._json(409, {"error": "slot-occupied"}); return
+                        feed["blobs"][sid] = body
+                        seq = feed["next_seq"]; feed["next_seq"] += 1
+                        feed["posts"].append((seq, sid, int(_time.time())))
+                    relay.post_event.set()
+                    self._empty(204); return
+                self.send_error(404, "not-found")
+
+            def do_DELETE(self):
+                got = self._feed()
+                if got is None:
+                    return
+                feed_id, feed, sub = got
+                if sub in ("", "/"):
+                    with relay.lock:
+                        relay.feeds.pop(feed_id, None)
+                    self._empty(204); return
+                m = re.match(r"^/members/([A-Za-z0-9_-]{8,64})$", sub)
+                if m:
+                    with relay.lock:
+                        feed["members"].pop(m.group(1), None)
+                    self._empty(204); return
+                m = re.match(r"^/slots/([A-Za-z0-9_-]{1,128})$", sub)
+                if m:
+                    sid = m.group(1)
+                    with relay.lock:
+                        if sid not in feed["blobs"]:
+                            self._json(404, {"error": "not-found"}); return
+                        del feed["blobs"][sid]
+                        feed["posts"] = [p for p in feed["posts"] if p[1] != sid]
+                    self._empty(204); return
+                self.send_error(404, "not-found")
 
         # ThreadingTCPServer so concurrent requests don't serialize: a
         # long-poll GET must not block a subsequent PUT.
@@ -4797,63 +4810,107 @@ def mock_relay():
     relay.stop()
 
 
+def _selftest_card() -> dict:
+    return {
+        "member_id": nomnom.secrets.token_hex(16),
+        "identity_pubkey": "00" * 32,
+        "name": "test-device",
+    }
+
+
 class TestRelayHttp:
     def test_health_works_without_auth(self, mock_relay):
         assert nomnom._relay_health(mock_relay.cfg()) is True
 
-    def test_put_get_round_trip(self, mock_relay):
+    def test_mint_then_post_round_trip(self, mock_relay):
         cfg = mock_relay.cfg()
-        nomnom._relay_put_slot(cfg, "abc-xyz", b"hello world")
-        got = nomnom._relay_get_slot(cfg, "abc-xyz")
-        assert got == b"hello world"
-        # delete-on-read: second GET returns None
-        assert nomnom._relay_get_slot(cfg, "abc-xyz") is None
+        minted = nomnom._relay_mint_feed(cfg, member_card=_selftest_card())
+        fid = minted["feed_id"]
+        key = nomnom._feed_key_from_token(fid)
+        st, _ = nomnom._feed_request_on(cfg, key, "PUT", f"/feeds/{fid}/slots/abc-xyz", body=b"hello world")
+        assert st == 204
+        st, got = nomnom._feed_request_on(cfg, key, "GET", f"/feeds/{fid}/slots/abc-xyz")
+        assert (st, got) == (200, b"hello world")
+        # Broadcast model: a second GET still finds it.
+        st, got = nomnom._feed_request_on(cfg, key, "GET", f"/feeds/{fid}/slots/abc-xyz")
+        assert (st, got) == (200, b"hello world")
 
-    def test_put_conflict_returns_error(self, mock_relay):
+    def test_put_conflict_is_409(self, mock_relay):
         cfg = mock_relay.cfg()
-        nomnom._relay_put_slot(cfg, "dupe", b"first")
-        with pytest.raises(nomnom.NomnomError) as exc:
-            nomnom._relay_put_slot(cfg, "dupe", b"second")
-        assert "occupied" in str(exc.value)
+        fid = nomnom._relay_mint_feed(cfg, member_card=_selftest_card())["feed_id"]
+        key = nomnom._feed_key_from_token(fid)
+        assert nomnom._feed_request_on(cfg, key, "PUT", f"/feeds/{fid}/slots/dupe", body=b"first")[0] == 204
+        st, body = nomnom._feed_request_on(cfg, key, "PUT", f"/feeds/{fid}/slots/dupe", body=b"second")
+        assert st == 409
+        with pytest.raises(nomnom.NomnomError):
+            nomnom._raise_feed_error(st, body)
 
     def test_bad_secret_is_401(self, mock_relay):
         cfg = dict(mock_relay.cfg()); cfg["secret"] = "wrong"
         with pytest.raises(nomnom.NomnomError) as exc:
-            nomnom._relay_put_slot(cfg, "abc", b"x")
+            nomnom._relay_mint_feed(cfg, member_card=_selftest_card())
         assert "auth" in str(exc.value).lower() or "secret" in str(exc.value).lower()
 
     def test_oversized_body_rejected_client_side(self, mock_relay):
-        cfg = mock_relay.cfg()
         with pytest.raises(nomnom.NomnomError) as exc:
-            nomnom._relay_put_slot(cfg, "abc", b"\x00" * (nomnom._RELAY_MAX_BODY + 1))
+            nomnom._relay_put_feed_slot(
+                "127.0.0.1", "feedfeedfeed", b"k" * 32, "abc",
+                b"\x00" * (nomnom._RELAY_MAX_BODY + 1),
+            )
         assert "too large" in str(exc.value).lower()
-
-    def test_delete_is_idempotent(self, mock_relay):
-        cfg = mock_relay.cfg()
-        nomnom._relay_delete_slot(cfg, "never-existed")  # does not raise
 
     def test_self_test_round_trip(self, mock_relay):
         rc, msg = nomnom._relay_self_test(mock_relay.cfg())
         assert rc == 0 and "ok" in msg
 
-    def test_long_poll_returns_on_arrival(self, mock_relay):
+    def test_self_test_deletes_its_throwaway_feed(self, mock_relay):
+        rc, _ = nomnom._relay_self_test(mock_relay.cfg())
+        assert rc == 0
+        assert mock_relay.feeds == {}
+
+    def test_self_test_reports_wrong_secret(self, mock_relay):
+        cfg = dict(mock_relay.cfg()); cfg["secret"] = "wrong"
+        rc, msg = nomnom._relay_self_test(cfg)
+        assert rc == 1
+        assert "secret" in msg.lower() or "auth" in msg.lower()
+
+    def test_slots_long_poll_returns_on_arrival(self, mock_relay):
         """Receiver starts polling first; sender PUTs; receiver should wake up."""
         cfg = mock_relay.cfg()
+        fid = nomnom._relay_mint_feed(cfg, member_card=_selftest_card())["feed_id"]
+        key = nomnom._feed_key_from_token(fid)
         result_q: list = []
 
         def receiver():
-            result_q.append(nomnom._relay_get_slot(cfg, "lp", wait_ms=3000))
+            st, body = nomnom._feed_request_on(cfg, key, "GET", f"/feeds/{fid}/slots?since=0&wait=3000")
+            result_q.append((st, json.loads(body)["slots"]))
 
         t = threading.Thread(target=receiver, daemon=True)
         t.start()
         time.sleep(0.2)  # let the poller establish
-        nomnom._relay_put_slot(cfg, "lp", b"delivered")
+        nomnom._feed_request_on(cfg, key, "PUT", f"/feeds/{fid}/slots/lp", body=b"delivered")
         t.join(timeout=2.0)
-        assert result_q == [b"delivered"]
+        assert len(result_q) == 1
+        st, slots = result_q[0]
+        assert st == 200
+        assert [s["slot_id"] for s in slots] == ["lp"]
+        assert slots[0]["seq"] == 1
 
-    def test_long_poll_timeout_returns_none(self, mock_relay):
-        got = nomnom._relay_get_slot(mock_relay.cfg(), "never", wait_ms=300)
-        assert got is None
+    def test_slots_long_poll_timeout_returns_empty(self, mock_relay):
+        cfg = mock_relay.cfg()
+        fid = nomnom._relay_mint_feed(cfg, member_card=_selftest_card())["feed_id"]
+        key = nomnom._feed_key_from_token(fid)
+        st, body = nomnom._feed_request_on(cfg, key, "GET", f"/feeds/{fid}/slots?since=0&wait=300")
+        assert st == 200 and json.loads(body)["slots"] == []
+
+    def test_delete_post_then_404(self, mock_relay):
+        cfg = mock_relay.cfg()
+        fid = nomnom._relay_mint_feed(cfg, member_card=_selftest_card())["feed_id"]
+        key = nomnom._feed_key_from_token(fid)
+        nomnom._feed_request_on(cfg, key, "PUT", f"/feeds/{fid}/slots/gone", body=b"x")
+        assert nomnom._feed_request_on(cfg, key, "DELETE", f"/feeds/{fid}/slots/gone")[0] == 204
+        assert nomnom._feed_request_on(cfg, key, "DELETE", f"/feeds/{fid}/slots/gone")[0] == 404
+        assert nomnom._feed_request_on(cfg, key, "GET", f"/feeds/{fid}/slots/gone")[0] == 404
 
 class TestDefenseInDepth:
     """Regression coverage for Commit D — content-length cap, SSRF allowlist,
@@ -5313,7 +5370,6 @@ def _make_feed(name: str = "home", feed_id: str = "k4n2pX9qLm3T") -> nomnom.Feed
         feed_id=feed_id,
         feed_token=feed_id,
         url=f"https://relay.example.com/f/{feed_id}",
-        expires_at=2_000_000_000,
         joined_at=1_700_000_000,
         member_id="a" * 32,
     )
@@ -5341,6 +5397,15 @@ class TestFeedDataclass:
         del d["feed_token"]
         g = nomnom.Feed.from_dict(d)
         assert g.feed_token == g.feed_id
+
+    def test_from_dict_ignores_legacy_keys_and_defaults_last_seq(self):
+        d = _make_feed().to_dict()
+        d.pop("last_seq")
+        d["expires_at"] = 2_000_000_000
+        d["last_post_ts"] = 12345
+        g = nomnom.Feed.from_dict(d)
+        assert g.last_seq == 0
+        assert not hasattr(g, "expires_at")
 
 
 class TestFeedsConfig:
@@ -5387,7 +5452,7 @@ class TestFeedsConfig:
         path = nomnom._feeds_config_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps({
-            "version": 1,
+            "version": nomnom._FEEDS_CONFIG_SCHEMA,
             "default": "nonexistent",
             "feeds": [_make_feed(name="home").to_dict()],
         }))
@@ -5403,12 +5468,26 @@ class TestFeedsConfig:
         assert cfg["default"] is None
         assert cfg["feeds"] == []
 
+    def test_load_treats_pre_seq_v1_file_as_no_channel(self, tmp_path, monkeypatch):
+        # A v1 feeds.json (timestamp cursor, expires_at) points at a feed the
+        # rewritten relay no longer has. It reads as "no channel" so the user
+        # is told to init/join rather than seeing "feed not found".
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        path = nomnom._feeds_config_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        old = dict(_make_feed(name="channel").to_dict(), expires_at=2_000_000_000, last_post_ts=12345)
+        old.pop("last_seq", None)
+        path.write_text(json.dumps({"version": 1, "default": "channel", "feeds": [old]}))
+        cfg = nomnom._load_feeds_config()
+        assert cfg["feeds"] == []
+        assert nomnom._the_channel() is None
+
     def test_load_skips_corrupt_entries(self, tmp_path, monkeypatch):
         monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
         path = nomnom._feeds_config_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps({
-            "version": 1,
+            "version": nomnom._FEEDS_CONFIG_SCHEMA,
             "default": None,
             "feeds": [
                 {"name": "broken"},
@@ -5448,15 +5527,10 @@ class TestCmdInit:
         )
         captured: dict = {}
 
-        def fake_mint(relay, *, ttl_seconds, member_card):
+        def fake_mint(relay, *, member_card):
             captured["relay"] = relay
-            captured["ttl"] = ttl_seconds
             captured["card"] = member_card
-            return {
-                "feed_id": "abcDEF12_-xy",
-                "expires_at": 1_700_000_000 + ttl_seconds,
-                "created_at": 1_700_000_000,
-            }
+            return {"feed_id": "abcDEF12_-xy", "created_at": 1_700_000_000}
 
         monkeypatch.setattr(nomnom, "_relay_mint_feed", fake_mint)
         yield captured
@@ -5473,8 +5547,8 @@ class TestCmdInit:
         assert feed.feed_id == "abcDEF12_-xy"
         assert feed.url == "https://relay.example.com/f/abcDEF12_-xy"
         assert cfg["default"] == nomnom._CHANNEL_NAME
-        # Minted with the permanent (multi-year) TTL.
-        assert fake_relay_and_identity["ttl"] == nomnom._PERMANENT_TTL_SEC
+        assert feed.last_seq == 0
+        assert fake_relay_and_identity["card"]["member_id"] == feed.member_id
         # Prints the channel secret to stdout for pasting elsewhere.
         assert "https://relay.example.com/f/abcDEF12_-xy" in capsys.readouterr().out
 
@@ -5502,7 +5576,7 @@ class TestCmdJoin:
         roster: list[dict] = []
 
         def fake_meta(host, feed_id, feed_key):
-            return {"expires_at": 1_800_000_000, "created_at": 1_700_000_000}
+            return {"created_at": 1_700_000_000, "last_used_at": 1_700_000_000}
 
         def fake_put_member(host, feed_id, feed_key, member_id, card):
             roster.append({**card, "joined_at": int(time.time())})

@@ -1,6 +1,6 @@
 name = "nomnom-relay"
 main = "src/worker.ts"
-compatibility_date = "2025-05-01"
+compatibility_date = "2026-05-01"
 
 # Custom domain. Requires the zone (spencerjireh.com) to be on Cloudflare;
 # Wrangler provisions the DNS record + SSL cert on deploy.
@@ -8,24 +8,31 @@ routes = [
   { pattern = "relay.spencerjireh.com", custom_domain = true },
 ]
 
-# R2 bucket holds short-lived rendezvous payloads.
+# R2 holds ciphertext bodies only (feeds/<id>/slots/<slot_id>). The index that
+# says which bodies exist lives in the per-feed Durable Object below; nothing
+# ever lists the bucket. Do NOT attach a lifecycle rule: the DO's alarm owns
+# expiry, and a bucket rule would delete blobs out from under live rows.
 # Create with: npx wrangler r2 bucket create nomnom-relay
 [[r2_buckets]]
 binding = "BUCKET"
 bucket_name = "nomnom-relay"
 
-# Per-feed SSE notifier. One Durable Object instance per feed (idFromName)
-# holds open text/event-stream connections and pushes new-slot notifications,
-# replacing the receivers' R2 long-poll with real push. No DO storage is used
-# (connections are in-memory, the backlog comes from R2), but SQLite-backed
-# classes are the supported default and work on every plan.
+# One SQLite-backed Durable Object per feed (idFromName). It holds the post
+# index (seq cursor), the member roster, in-flight long-poll waiters for the
+# CLI, hibernatable WebSockets for the web client, and a daily alarm that
+# enforces the 30-day retention window.
 [[durable_objects.bindings]]
-name = "FEED_NOTIFIER"
-class_name = "FeedNotifier"
+name = "FEED"
+class_name = "Feed"
 
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["FeedNotifier"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["Feed"]
+deleted_classes = ["FeedNotifier"]
 
 # HMAC secret is set out-of-band. The fastest path is to let `nomnom relay init`
 # generate it for you — it prints the exact `wrangler secret put` and

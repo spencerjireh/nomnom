@@ -47,11 +47,10 @@ function makeFeed(name: string, overrides: Partial<Feed> = {}): Feed {
     feed_id: `id-${name}`,
     feed_token: `tok-${name}`,
     url: `https://r.example/f/${name}`,
-    expires_at: 4_000_000_000,
     joined_at: 1_700_000_000,
     member_id: `me-${name}`,
     members_cache: [],
-    last_post_ts: 0,
+    last_seq: 0,
     auto_save: false,
     ...overrides,
   };
@@ -129,6 +128,21 @@ describe("timeline actions", () => {
     s.removeTimelineEntry("nope"); // unknown id is a no-op
     expect(store.useStore.getState().timeline).toHaveLength(1);
   });
+
+  it("removes every row backed by a relay post, leaving rows without a slot_id", () => {
+    const s = store.useStore.getState();
+    s.setChannel(makeFeed("channel"));
+    s.appendTimeline(entry("sent", { kind: "send", status: "served", slot_id: "slot-a" }));
+    s.appendTimeline(entry("recv", { kind: "receive", status: "held", slot_id: "slot-a" }));
+    s.appendTimeline(entry("other", { kind: "receive", status: "held", slot_id: "slot-b" }));
+    s.appendTimeline(entry("local", { kind: "send", status: "in_flight" }));
+
+    s.removeTimelineEntryBySlot("slot-a");
+    expect(store.useStore.getState().timeline.map((r) => r.id)).toEqual(["local", "other"]);
+
+    s.removeTimelineEntryBySlot("nope"); // unknown slot is a no-op
+    expect(store.useStore.getState().timeline).toHaveLength(2);
+  });
 });
 
 describe("channel set/patch/leave", () => {
@@ -195,17 +209,38 @@ describe("persistence migration", () => {
         feed_id: "id",
         feed_token: "tok",
         url: "https://r.example/f/tok",
-        expires_at: 4_000_000_000,
         joined_at: 1,
         member_id: "me",
         members_cache: [],
-        last_post_ts: 0,
+        last_seq: 0,
         // no auto_save
       }),
     );
 
     const ch = persistence.loadChannel();
     expect(ch?.auto_save).toBe(false);
+  });
+
+  it("rejects a channel persisted by the pre-seq protocol (no last_seq)", () => {
+    // Such a channel points at a feed the relay no longer has; loading it
+    // would only spin the socket backoff. Dropping it lands on the bootstrap
+    // pane, where re-joining is one paste.
+    localStorage.setItem(
+      "nomnom:channel",
+      JSON.stringify({
+        name: "channel",
+        feed_id: "id",
+        feed_token: "tok",
+        url: "https://r.example/f/tok",
+        expires_at: 4_000_000_000,
+        joined_at: 1,
+        member_id: "me",
+        members_cache: [],
+        last_post_ts: 12345,
+        auto_save: false,
+      }),
+    );
+    expect(persistence.loadChannel()).toBeNull();
   });
 
   it("migrates the first feed out of a legacy nomnom:feeds array", () => {
@@ -219,11 +254,10 @@ describe("persistence migration", () => {
             feed_id: "legacy-id",
             feed_token: "tok",
             url: "https://r.example/f/tok",
-            expires_at: 4_000_000_000,
             joined_at: 1,
             member_id: "me",
             members_cache: [],
-            last_post_ts: 0,
+            last_seq: 0,
             auto_save: true,
           },
         ],
