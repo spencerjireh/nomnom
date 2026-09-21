@@ -154,7 +154,9 @@ nomnom receive          # watch your channel; one line per received file
 nomnom send report.txt  # send to every other device on your channel
 ```
 
-`receive` stays open after each delivery, so you can leave a laptop listening and fire off `send` from another machine all afternoon — new posts arrive in real time (the relay pushes them over Server-Sent Events, falling back to long-polling). Pass `--once` to exit after the first file (handy for scripting).
+`receive` stays open after each delivery, so you can leave a laptop listening and fire off `send` from another machine all afternoon — the CLI long-polls the relay (each request is held open until a post lands), so new posts arrive within a second. Pass `--once` to exit after the first file (handy for scripting).
+
+The relay keeps each post for 30 days, so a device that was offline still finds everything from the last month. A channel that no device has used for 30 days is purged.
 
 Max transfer size is 256 MB (100 MB on Cloudflare's free tier — see [`relay-worker/README.md`](relay-worker/README.md)).
 
@@ -222,9 +224,9 @@ nomnom peers forget alice-mac        # drop a pin (TOFU fires fresh on next sigh
 
 **Worker auth.** Two layers:
 - `POST /feeds` (mint) is gated by the per-deployment HMAC secret. Only people with your relay HMAC can create feeds on your Worker.
-- `/feeds/:id/*` (member roster, slots, extend, close) is gated by a per-request signature derived from the feed key via HKDF. Anyone with the URL can talk to the Worker about that feed; nothing else on the relay is reachable.
+- `/feeds/:id/*` (member roster, posts, delete, close, and the browser client's WebSocket) is gated by a per-request signature derived from the feed key via HKDF. Anyone with the URL can talk to the Worker about that feed; nothing else on the relay is reachable.
 
-This split means the channel secret can be safely shared cross-account: the recipient gets access to that one channel without seeing or holding your relay credential. Slots live until the channel's TTL (a channel is minted with a multi-year TTL, so it's effectively permanent); the R2 bucket lifecycle collects orphans after 1 day. (The wire protocol still calls a channel a "feed" — `/feeds/:id/*` — for back-compat with the original feeds-v2 transport.)
+This split means the channel secret can be safely shared cross-account: the recipient gets access to that one channel without seeing or holding your relay credential. Posts expire 30 days after they are made; a channel expires after 30 days with no activity. Any device holding the channel secret can delete a post for every device (the relay cannot tell devices apart beyond the signature inside each post). (The wire protocol still calls a channel a "feed" — `/feeds/:id/*` — for back-compat with the original feeds-v2 transport.)
 
 </details>
 
@@ -239,7 +241,7 @@ This split means the channel secret can be safely shared cross-account: the reci
 | `nomnom send <path>` | Send a file to every other device on your channel. |
 | `nomnom receive [--once]` | Watch your channel for incoming files. |
 | `nomnom relay show [--token]` | Print URL (secret redacted). `--token` prints the `host#secret` token, which lets another *owner* device run `nomnom init` against the same relay. |
-| `nomnom relay test` | Round-trip: HMAC self-check via `/health` + `/slots`. |
+| `nomnom relay test` | Round-trip: `/health`, then mint a throwaway channel, post + read 1 KB through it, and delete it. |
 | `nomnom relay clear` | Delete `~/.config/nomnom/relay.json`. |
 | `nomnom peers list / fingerprint / forget` | Global identity pin management. |
 
