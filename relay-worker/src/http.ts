@@ -1,6 +1,5 @@
-// Shared HTTP plumbing. Both feeds.ts and slots.ts emit the same JSON
-// `{error: reason}` body on failure, guard PUT bodies identically, and the
-// long-poll handlers share one wait budget.
+// Shared HTTP plumbing: JSON/error responses, the PUT body guard, and the
+// `?since=` / `?wait=` parsers.
 
 export const MAX_BUDGET_MS = 30_000;
 
@@ -43,17 +42,15 @@ export function rejectBody(req: Request, maxBytes: number): Response | null {
   return null;
 }
 
-// Clamp a client-requested wait into [0, MAX_BUDGET_MS], anchored at now.
-export function pollDeadline(waitMs: number): number {
-  return Date.now() + Math.min(Math.max(waitMs, 0), MAX_BUDGET_MS);
-}
-
-// `?since=` / `?since_ts=` parser: non-negative integer, else 0.
-export function parseSinceTs(s: string | null): number {
+// `?since=` parser: non-negative integer (a post seq, or a joined_at timestamp
+// on /members), else 0.
+export function parseSince(s: string | null): number {
   const n = Number.parseInt(s ?? "0", 10);
   return Number.isFinite(n) && n >= 0 ? n : 0;
 }
 
-export function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+// `?wait=` parser: positive integer milliseconds, else 0 (no long-poll).
+export function parseWaitMs(s: string | null): number {
+  const n = Number.parseInt(s ?? "0", 10);
+  return Number.isFinite(n) && n > 0 ? n : 0;
 }

@@ -1,149 +1,102 @@
-// Expiry/purge lifecycle. No time mocking needed: tests rewrite the meta
-// object directly via the test R2 binding with an `expires_at` in the past,
-// then assert every read/write path 410s and the prefix gets purged.
-import { env, SELF } from "cloudflare:test";
+// Retention is the DO alarm's job: posts age out 30 days after creation, and a
+// feed with no posts left and 30 days of inactivity is purged entirely.
+
+import { env, runDurableObjectAlarm, runInDurableObject, SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { touchFeedMeta } from "../src/feeds";
-import {
-  mintFeed,
-  randomBase64,
-  randomMemberId,
-  signedFeedRequest,
-} from "./helpers";
+import { feedStub, mintFeed, putSlot, signedFeedRequest } from "./helpers";
 
-const bucket = (env as unknown as { BUCKET: R2Bucket }).BUCKET;
+const DAY = 86_400;
 
-// Mirror the mint-time meta shape (feeds.ts) with expires_at in the past.
-async function expireFeed(feedId: string, createdAt: number): Promise<void> {
-  const past = Math.floor(Date.now() / 1000) - 10;
-  await bucket.put(
-    `feeds/${feedId}/meta`,
-    JSON.stringify({ created_at: createdAt, expires_at: past }),
-    {
-      customMetadata: { expires_at: String(past) },
-      httpMetadata: { contentType: "application/json" },
-    },
+async function listSlotIds(feedId: string): Promise<string[]> {
+  const res = await SELF.fetch(
+    await signedFeedRequest("GET", `/feeds/${feedId}/slots?since=0`, feedId),
   );
+  const data = (await res.json()) as { slots: { slot_id: string }[] };
+  return data.slots.map((s) => s.slot_id);
 }
 
-describe("feed expiry", () => {
-  it("GET /meta on an expired feed returns 410 and purges the prefix", async () => {
+describe("alarm: post retention", () => {
+  it("is scheduled at mint, roughly a day out", async () => {
     const m = await mintFeed(SELF);
-    // Populate the prefix beyond meta: one slot + one extra member card.
-    const putSlot = await signedFeedRequest(
-      "PUT",
-      `/feeds/${m.feed_id}/slots/exp-slot`,
-      m.feed_id,
-      { body: "ciphertext" },
-    );
-    expect((await SELF.fetch(putSlot)).status).toBe(204);
-    const memberId = randomMemberId();
-    const putMember = await signedFeedRequest(
-      "PUT",
-      `/feeds/${m.feed_id}/members/${memberId}`,
-      m.feed_id,
-      {
-        body: JSON.stringify({
-          member_id: memberId,
-          identity_pubkey: randomBase64(32),
-          name: "second-device",
-        }),
-      },
-    );
-    expect((await SELF.fetch(putMember)).status).toBe(204);
-
-    await expireFeed(m.feed_id, m.created_at);
-
-    const metaReq = await signedFeedRequest(
-      "GET",
-      `/feeds/${m.feed_id}/meta`,
-      m.feed_id,
-    );
-    const res = await SELF.fetch(metaReq);
-    expect(res.status).toBe(410);
-    expect(((await res.json()) as { error: string }).error).toBe("feed-expired");
-
-    // The 410 is sent only after the purge completes — prefix must be empty.
-    const list = await bucket.list({ prefix: `feeds/${m.feed_id}/` });
-    expect(list.objects.length).toBe(0);
-
-    // A second read finds nothing left.
-    const again = await signedFeedRequest(
-      "GET",
-      `/feeds/${m.feed_id}/meta`,
-      m.feed_id,
-    );
-    expect((await SELF.fetch(again)).status).toBe(404);
-  });
-
-  // Each gate gets its own expired feed: the first 410 purges the prefix,
-  // so a shared feed would answer 404 (feed-not-found) to later checks.
-  it("slot write gates on feed liveness", async () => {
-    const m = await mintFeed(SELF);
-    await expireFeed(m.feed_id, m.created_at);
-    const putReq = await signedFeedRequest(
-      "PUT",
-      `/feeds/${m.feed_id}/slots/post-expiry`,
-      m.feed_id,
-      { body: "ciphertext" },
-    );
-    expect((await SELF.fetch(putReq)).status).toBe(410);
-  });
-
-  it("slot read gates on feed liveness", async () => {
-    const m = await mintFeed(SELF);
-    const putLive = await signedFeedRequest(
-      "PUT",
-      `/feeds/${m.feed_id}/slots/pre-expiry`,
-      m.feed_id,
-      { body: "ciphertext" },
-    );
-    expect((await SELF.fetch(putLive)).status).toBe(204);
-    await expireFeed(m.feed_id, m.created_at);
-    const getReq = await signedFeedRequest(
-      "GET",
-      `/feeds/${m.feed_id}/slots/pre-expiry`,
-      m.feed_id,
-    );
-    expect((await SELF.fetch(getReq)).status).toBe(410);
-  });
-
-  it("slot list gates on feed liveness", async () => {
-    const m = await mintFeed(SELF);
-    await expireFeed(m.feed_id, m.created_at);
-    const listReq = await signedFeedRequest(
-      "GET",
-      `/feeds/${m.feed_id}/slots?since=0&wait_ms=0`,
-      m.feed_id,
-    );
-    expect((await SELF.fetch(listReq)).status).toBe(410);
-  });
-});
-
-describe("touchFeedMeta", () => {
-  it("does not clobber a meta written between its get and put", async () => {
-    const m = await mintFeed(SELF);
-    const key = `feeds/${m.feed_id}/meta`;
-    const bumped = m.expires_at + 9999;
-    const newer = JSON.stringify({
-      created_at: m.created_at,
-      expires_at: bumped,
+    await runInDurableObject(feedStub(m.feed_id), async (_i, state) => {
+      const at = await state.storage.getAlarm();
+      expect(at).not.toBeNull();
+      expect(at! - Date.now()).toBeGreaterThan(23 * 3600 * 1000);
+      expect(at! - Date.now()).toBeLessThanOrEqual(24 * 3600 * 1000);
     });
-    // Wrapper bucket: an "extendFeed" lands between the touch's get and put,
-    // bumping the etag — so the touch's conditional put must be dropped.
-    const racing = {
-      get: (k: string) => bucket.get(k),
-      put: async (k: string, v: string, o: R2PutOptions) => {
-        await bucket.put(key, newer, {
-          customMetadata: { expires_at: String(bumped) },
-          httpMetadata: { contentType: "application/json" },
-        });
-        return bucket.put(k, v, o);
-      },
-    } as unknown as R2Bucket;
-    await touchFeedMeta(racing, m.feed_id);
-    const final = await bucket.get(key);
-    expect(JSON.parse(await final!.text()).expires_at).toBe(bumped);
-    expect(final!.customMetadata?.expires_at).toBe(String(bumped));
+  });
+
+  it("deletes a 31-day-old post and its blob but keeps the feed", async () => {
+    const m = await mintFeed(SELF);
+    await putSlot(m.feed_id, "old");
+    await putSlot(m.feed_id, "new");
+    const oldKey = `feeds/${m.feed_id}/slots/old`;
+    const newKey = `feeds/${m.feed_id}/slots/new`;
+    const stub = feedStub(m.feed_id);
+    await runInDurableObject(stub, async (_i, state) => {
+      state.storage.sql.exec(
+        "UPDATE posts SET created_at = ? WHERE slot_id = 'old'",
+        Math.floor(Date.now() / 1000) - 31 * DAY,
+      );
+    });
+
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+
+    expect(await env.BUCKET.head(oldKey)).toBeNull();
+    expect(await env.BUCKET.head(newKey)).not.toBeNull();
+    expect(await listSlotIds(m.feed_id)).toEqual(["new"]);
+    await runInDurableObject(stub, async (_i, state) => {
+      expect(await state.storage.getAlarm()).not.toBeNull(); // rescheduled
+    });
+  });
+
+  it("keeps a feed that is idle but still has fresh posts", async () => {
+    const m = await mintFeed(SELF);
+    await putSlot(m.feed_id, "fresh");
+    const stub = feedStub(m.feed_id);
+    await runInDurableObject(stub, async (_i, state) => {
+      state.storage.sql.exec(
+        "UPDATE feed SET last_used_at = ?",
+        Math.floor(Date.now() / 1000) - 31 * DAY,
+      );
+    });
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    // The in-memory lastUsedAt cache still says "just now"; the alarm reads
+    // the cache, so this exercises the "posts remain" branch regardless.
+    const meta = await SELF.fetch(
+      await signedFeedRequest("GET", `/feeds/${m.feed_id}/meta`, m.feed_id),
+    );
+    expect(meta.status).toBe(200);
+    expect(await listSlotIds(m.feed_id)).toEqual(["fresh"]);
+  });
+
+  it("purges an idle feed with no posts, including its DO storage", async () => {
+    const m = await mintFeed(SELF);
+    const stub = feedStub(m.feed_id);
+    // Backdate both the row and the instance's cached copy (the alarm reads the
+    // cache, which the constructor seeds from the row on a cold start).
+    await runInDurableObject(stub, async (instance, state) => {
+      const stale = Math.floor(Date.now() / 1000) - 31 * DAY;
+      state.storage.sql.exec("UPDATE feed SET last_used_at = ?", stale);
+      (instance as unknown as { lastUsedAt: number }).lastUsedAt = stale;
+    });
+
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+
+    const meta = await SELF.fetch(
+      await signedFeedRequest("GET", `/feeds/${m.feed_id}/meta`, m.feed_id),
+    );
+    expect(meta.status).toBe(404);
+    await runInDurableObject(stub, async (_i, state) => {
+      // deleteAll() drops our tables; SQLite's `sqlite_sequence` and the
+      // runtime's `_cf_METADATA` are not ours and may linger.
+      const tables = state.storage.sql
+        .exec(
+          "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_cf_%'",
+        )
+        .toArray();
+      expect(tables.map((t) => t.name)).toEqual([]);
+      expect(await state.storage.getAlarm()).toBeNull();
+    });
   });
 });
