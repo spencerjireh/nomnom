@@ -29,24 +29,22 @@ export class RelayClient {
    * Validate the relay HMAC passphrase by actually signing a request, instead of
    * just pinging /health (which takes no auth and so can't catch a wrong secret).
    *
-   * Probes a side-effect-free HMAC-gated endpoint: `GET /slots/<random>`. A bad
-   * secret yields 401 `bad-mac`/`missing-*`; a stale clock yields 401 `clock-skew`;
-   * a good secret hits the missing slot and returns 404 (delete-on-read only fires
-   * on a *found* slot, and without `?wait` the relay answers immediately). The
-   * random reserved id can never collide with — or consume — a real slot.
+   * Probes `GET /auth`, a side-effect-free HMAC-gated endpoint that answers 204
+   * to a valid signature. A bad secret yields 401 `bad-mac`/`missing-*`; a stale
+   * clock yields 401 `clock-skew`.
    */
   async verifyAuth(signal?: AbortSignal): Promise<AuthCheck> {
-    const path = `/slots/nomnom-authcheck-${crypto.randomUUID()}`;
+    const path = "/auth";
     try {
       const res = await fetch(this.url(path), {
         method: "GET",
         headers: { Authorization: relayAuthHeader(this.config.secret, "GET", path) },
         signal,
       });
-      // A good secret hits the missing slot → 404. Fail closed: only 404 means
-      // "ok"; 401 distinguishes skew vs reject; anything else (5xx, a stripped
-      // proxy response) is unexpected, so don't claim the passphrase is valid.
-      if (res.status === 404) return "ok";
+      // Fail closed: only 204 means "ok"; 401 distinguishes skew vs reject;
+      // anything else (5xx, a relay without /auth, a stripped proxy response)
+      // is unexpected, so don't claim the passphrase is valid.
+      if (res.status === 204) return "ok";
       if (res.status === 401) {
         let reason = "";
         try {

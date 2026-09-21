@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
 import { useStore } from "../state/store";
-import { saveHeld, discardHeld } from "../state/actions";
+import { saveHeld, discardHeld, deletePost } from "../state/actions";
 import { fmtSize, clock } from "../util/format";
 import {
   looksLikeText,
@@ -14,7 +14,8 @@ import type { TimelineEntry } from "../types";
 
 /** The channel's session timeline. In-flight sends show an inline progress bar;
  * received rows keep their bytes (and the view / copy / save actions) until
- * discarded — discard removes the row entirely. */
+ * discarded — discard removes the row locally. Any relay-backed row (sent or
+ * received) can also be deleted for every device. */
 export function Timeline() {
   const rows = useStore((s) => s.timeline);
 
@@ -31,7 +32,7 @@ export function Timeline() {
     <ol className="timeline" role="list">
       {rows.map((row) => (
         <li key={row.id} className={`timeline-row row-${row.status}`}>
-          <Row row={row} onSave={saveHeld} onDiscard={discardHeld} />
+          <Row row={row} onSave={saveHeld} onDiscard={discardHeld} onDelete={deletePost} />
         </li>
       ))}
     </ol>
@@ -42,15 +43,19 @@ function Row({
   row,
   onSave,
   onDiscard,
+  onDelete,
 }: {
   row: TimelineEntry;
   onSave: (id: string) => void;
   onDiscard: (id: string) => void;
+  onDelete: (id: string) => Promise<void>;
 }) {
   const [expanded, setExpanded] = useState(false);
   const [viewerOpen, setViewerOpen] = useState(false);
   const [renderMd, setRenderMd] = useState(false);
   const [copied, setCopied] = useState<"idle" | "ok" | "err">("idle");
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [deleting, setDeleting] = useState(false);
 
   // Decode the body once, only if it sniffs as text. The body survives saving,
   // so the preview (and the actions it gates) stays available until discard.
@@ -79,6 +84,19 @@ function Row({
   // receipt / already-saved) or it was rebuilt from history and carries a
   // slot_id we can re-fetch on save.
   const hasFile = row.kind === "receive" && (!!row.body || !!row.slot_id);
+  // Any row the relay knows about can be deleted for everyone. In-flight sends
+  // have no slot yet; failed ones never landed.
+  const canDelete = !!row.slot_id && row.status !== "in_flight" && row.status !== "failed";
+
+  async function confirmAndDelete() {
+    setDeleting(true);
+    try {
+      await onDelete(row.id);
+    } finally {
+      setDeleting(false);
+      setConfirmDelete(false);
+    }
+  }
 
   const arrow = row.kind === "receive" ? "←" : "→";
   const peer =
@@ -117,7 +135,7 @@ function Row({
             failed{row.error ? `: ${row.error}` : ""}
           </span>
         )}
-        {row.kind === "receive" && row.error && (
+        {row.status !== "failed" && row.error && (
           <span className="row-stamp err"> · {row.error}</span>
         )}
       </div>
@@ -166,9 +184,9 @@ function Row({
           />
         </div>
       )}
-      {hasFile && (
+      {(hasFile || canDelete) && (
         <div className="row-held-actions">
-          {preview && (
+          {hasFile && preview && (
             <button
               type="button"
               className={`chip ${copied === "ok" ? "active" : ""}`}
@@ -177,16 +195,50 @@ function Row({
               {copied === "ok" ? "copied ✓" : copied === "err" ? "copy failed" : "copy text"}
             </button>
           )}
-          <button type="button" className="chip" onClick={() => onSave(row.id)}>
-            {row.status === "saved" ? "save again" : "save to downloads"}
-          </button>
-          <button
-            type="button"
-            className="chip danger"
-            onClick={() => onDiscard(row.id)}
-          >
-            discard
-          </button>
+          {hasFile && (
+            <button type="button" className="chip" onClick={() => onSave(row.id)}>
+              {row.status === "saved" ? "save again" : "save to downloads"}
+            </button>
+          )}
+          {hasFile && (
+            <button
+              type="button"
+              className="chip danger"
+              onClick={() => onDiscard(row.id)}
+            >
+              discard
+            </button>
+          )}
+          {canDelete && !confirmDelete && (
+            <button
+              type="button"
+              className="chip danger"
+              onClick={() => setConfirmDelete(true)}
+            >
+              delete everywhere
+            </button>
+          )}
+          {canDelete && confirmDelete && (
+            <span className="row-delete-confirm">
+              <span className="err small">delete from every device?</span>
+              <button
+                type="button"
+                className="chip"
+                disabled={deleting}
+                onClick={() => setConfirmDelete(false)}
+              >
+                keep
+              </button>
+              <button
+                type="button"
+                className="chip danger"
+                disabled={deleting}
+                onClick={confirmAndDelete}
+              >
+                {deleting ? "deleting…" : "delete"}
+              </button>
+            </span>
+          )}
         </div>
       )}
       {viewerOpen && row.body && (

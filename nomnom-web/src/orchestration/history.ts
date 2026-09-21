@@ -5,13 +5,13 @@
 // bodies are decrypted in memory only.
 //
 // This is a one-shot sweep, distinct from the live watch (runReceive): it lists
-// every slot since the beginning (bounded by HISTORY_MAX_AGE_DAYS), and unlike
-// the live watch it INCLUDES our own posts (as `send` rows) — after a refresh the
-// original in-memory send rows are gone, so they must be rebuilt too.
+// every slot since seq 0 (the relay only serves posts inside its 30-day window,
+// so there is no client-side age filter), and unlike the live watch it INCLUDES
+// our own posts (as `send` rows) — after a refresh the original in-memory send
+// rows are gone, so they must be rebuilt too.
 
 import { cryptoClient } from "../worker/cryptoClient";
 import { feedContext, type FeedContext } from "./feed-actions";
-import { HISTORY_MAX_AGE_DAYS } from "../config";
 import { newId } from "../util/ids";
 import { mapLimit } from "../util/concurrency";
 import type { FeedHeader } from "../crypto/feeds";
@@ -34,8 +34,8 @@ export interface HistoryParams {
 export interface HistoryResult {
   /** Newest-first, matching the store's timeline convention. */
   rows: TimelineEntry[];
-  /** created_at to resume the live watch from — the newest slot that existed at
-   * sweep time, so runReceive won't re-emit anything we just rebuilt. */
+  /** seq to resume the live watch from — the newest slot that existed at sweep
+   * time, so runReceive won't re-emit anything we just rebuilt. */
   maxCursor: number;
 }
 
@@ -44,7 +44,6 @@ export interface HistoryResult {
  * still takes over, and the next refresh re-sweeps from scratch. */
 export async function runHistory(p: HistoryParams): Promise<HistoryResult> {
   const ctx = p.ctx ?? feedContext(p.feed, p.identity);
-  const floor = Math.floor(Date.now() / 1000) - HISTORY_MAX_AGE_DAYS * 86_400;
 
   // Resolve sender names from the roster. Plain listMembers (no TOFU) — first-
   // contact prompts are owned by the live watch's roster loop, so the rebuild
@@ -54,29 +53,29 @@ export async function runHistory(p: HistoryParams): Promise<HistoryResult> {
   try {
     roster = await ctx.client.listMembers(ctx.feed.feed_id, ctx.feedKey, { signal: p.signal });
   } catch {
-    if (p.signal.aborted) return { rows: [], maxCursor: p.feed.last_post_ts };
+    if (p.signal.aborted) return { rows: [], maxCursor: p.feed.last_seq };
     // keep the cached roster
   }
 
   let slots;
   try {
     slots = await ctx.client.listSlots(ctx.feed.feed_id, ctx.feedKey, {
-      sinceTs: 0,
-      waitMs: 0,
+      since: 0,
       signal: p.signal,
     });
   } catch {
-    return { rows: [], maxCursor: p.feed.last_post_ts };
+    return { rows: [], maxCursor: p.feed.last_seq };
   }
 
   // Resume the live watch after the newest slot that existed now — computed from
   // the list, not per-slot success, so a post that fails to fetch/decode this
   // round is simply absent until the next refresh (never a duplicate).
-  let maxCursor = p.feed.last_post_ts;
-  for (const s of slots) maxCursor = Math.max(maxCursor, s.created_at ?? 0);
+  let maxCursor = p.feed.last_seq;
+  for (const s of slots) maxCursor = Math.max(maxCursor, s.seq ?? 0);
 
-  // Oldest-first so the reversed result is newest-first.
-  slots.sort((a, b) => (a.created_at ?? 0) - (b.created_at ?? 0));
+  // The relay lists ascending by seq; sort defensively so the reversed result
+  // is newest-first.
+  slots.sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0));
 
   // Fetch + decrypt with bounded concurrency (overlaps network waits) instead of
   // strictly serially. mapLimit preserves slot order, so the oldest-first input
@@ -87,7 +86,6 @@ export async function runHistory(p: HistoryParams): Promise<HistoryResult> {
     HISTORY_FETCH_CONCURRENCY,
     async (slot): Promise<TimelineEntry | null> => {
       if (p.signal.aborted) return null;
-      if ((slot.created_at ?? 0) < floor) return null; // older than the relay keeps
 
       let raw: ArrayBuffer | null;
       try {
@@ -123,6 +121,7 @@ export async function runHistory(p: HistoryParams): Promise<HistoryResult> {
           bytes: header.fs,
           at,
           status: "served",
+          slot_id: slot.slot_id,
         };
       }
 

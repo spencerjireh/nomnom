@@ -3,7 +3,6 @@ import { useStore } from "../state/store";
 import { useSending } from "../state/store";
 import { leaveChannel } from "../state/actions";
 import { Fingerprint } from "./Fingerprint";
-import { expiry } from "../util/format";
 import type { Feed } from "../types";
 
 /** Collapsible footer under the timeline: device list, auto-save toggle, copy
@@ -29,10 +28,7 @@ export function MembersFooter({ channel }: { channel: Feed }) {
 
   return (
     <details className="members-footer">
-      <summary>
-        devices ({members.length}){" "}
-        <span className="dim small">· {expiry(channel.expires_at)}</span>
-      </summary>
+      <summary>devices ({members.length})</summary>
 
       <div className="members-grid">
         <ul className="member-list">

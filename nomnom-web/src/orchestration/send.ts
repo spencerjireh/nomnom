@@ -17,8 +17,9 @@ export interface SendParams {
   signal: AbortSignal;
 }
 
-/** Returns the number of other members the post reaches. */
-export async function runSend(p: SendParams): Promise<{ recipients: number }> {
+/** Returns the number of other members the post reaches and the relay slot id
+ * the post landed in (so the timeline row can be deleted later). */
+export async function runSend(p: SendParams): Promise<{ recipients: number; slotId: string }> {
   const byteLength = p.payload.data.byteLength; // capture before the buffer transfers
   if (byteLength === 0) {
     // A transferred/detached ArrayBuffer reads as length 0 on the main thread
@@ -55,7 +56,8 @@ export async function runSend(p: SendParams): Promise<{ recipients: number }> {
   );
 
   p.onProgress(SEAL_FRACTION);
-  await ctx.client.putSlot(ctx.feed.feed_id, ctx.feedKey, randomToken(12), new Uint8Array(blob), p.signal);
+  const slotId = randomToken(12);
+  await ctx.client.putSlot(ctx.feed.feed_id, ctx.feedKey, slotId, new Uint8Array(blob), p.signal);
   p.onProgress(1);
-  return { recipients: others.length };
+  return { recipients: others.length, slotId };
 }

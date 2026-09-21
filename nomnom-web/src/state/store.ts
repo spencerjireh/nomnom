@@ -66,6 +66,9 @@ interface Store {
   appendTimeline: (entry: TimelineEntry) => void;
   patchTimelineEntry: (id: string, patch: Partial<TimelineEntry>) => void;
   removeTimelineEntry: (id: string) => void;
+  /** Drop every row backed by this relay post (a `deleted` frame, or our own
+   * delete landing). Rows without a slot_id are untouched. */
+  removeTimelineEntryBySlot: (slotId: string) => void;
   /** Swap in the load-time history rebuild, preserving any live-only rows (an
    * in-flight or failed user send) the relay can't reconstruct. */
   rebuildTimeline: (rows: TimelineEntry[]) => void;
@@ -235,6 +238,9 @@ export const useStore = create<Store>((set, get) => {
 
     removeTimelineEntry: (id) =>
       set((s) => ({ timeline: s.timeline.filter((r) => r.id !== id) })),
+
+    removeTimelineEntryBySlot: (slotId) =>
+      set((s) => ({ timeline: s.timeline.filter((r) => r.slot_id !== slotId) })),
 
     // The rebuild computes the full history from the relay and swaps it in
     // near-atomically. But a user-driven send appended while the async sweep was

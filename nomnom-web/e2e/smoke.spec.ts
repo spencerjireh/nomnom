@@ -32,14 +32,13 @@ const CHANNEL = JSON.stringify({
   feed_id: "testfeedtoken00",
   feed_token: "testfeedtoken00",
   url: "https://relay.spencerjireh.com/f/testfeedtoken00",
-  expires_at: 4102444800, // year 2100
   joined_at: 1700000000,
   member_id: SELF_MEMBER,
   members_cache: [
     { member_id: SELF_MEMBER, identity_pubkey: SELF_SIG_PUB, name: "web-guest" },
     { member_id: PEER_MEMBER, identity_pubkey: PEER_SIG_PUB, name: "test-peer" },
   ],
-  last_post_ts: 0,
+  last_seq: 0,
   auto_save: false,
 });
 

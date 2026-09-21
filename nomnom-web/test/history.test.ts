@@ -24,14 +24,13 @@ function makeFeed(): Feed {
     feed_id: "feedtoken01",
     feed_token: "feedtoken01",
     url: "https://relay.test/f/feedtoken01",
-    expires_at: 2_000_000_000,
     joined_at: 1_700_000_000,
     member_id: "me-member-id",
     members_cache: [
       { member_id: "me-member-id", identity_pubkey: SELF_PUB, name: "me" },
       { member_id: "peer-member-id", identity_pubkey: PEER_PUB, name: "bob" },
     ],
-    last_post_ts: 0,
+    last_seq: 0,
     auto_save: false,
   };
 }
@@ -72,6 +71,11 @@ function makeParams(client: FeedClient): HistoryParams {
   };
 }
 
+function listSlotsCalledWithSinceZero(client: FeedClient): boolean {
+  const calls = (client.listSlots as unknown as ReturnType<typeof vi.fn>).mock.calls;
+  return calls.length === 1 && calls[0][2]?.since === 0;
+}
+
 afterEach(() => {
   feedOpen.mockReset();
 });
@@ -91,13 +95,14 @@ describe("runHistory", () => {
 
     const { client, getSlot } = makeStub({
       slots: [
-        { slot_id: "s2", created_at: NOW - 10 },
-        { slot_id: "s1", created_at: NOW - 20 }, // out of order on purpose
+        { seq: 2, slot_id: "s2", created_at: NOW - 10 },
+        { seq: 1, slot_id: "s1", created_at: NOW - 20 }, // out of order on purpose
       ],
     });
     const { rows, maxCursor } = await runHistory(makeParams(client));
 
     expect(getSlot).toHaveBeenCalledTimes(2);
+    expect(listSlotsCalledWithSinceZero(client)).toBe(true);
     // Newest-first: bob's receive, then our send.
     expect(rows.map((r) => ({ kind: r.kind, name: r.name }))).toEqual([
       { kind: "receive", name: "theirs.txt" },
@@ -114,16 +119,17 @@ describe("runHistory", () => {
     const sent = rows[1];
     expect(sent.status).toBe("served");
     expect(sent.body).toBeUndefined();
-    expect(maxCursor).toBe(NOW - 10);
+    expect(sent.slot_id).toBe("s1"); // so [delete everywhere] can target it
+    expect(maxCursor).toBe(2);
   });
 
   it("skips foreign/undecryptable posts but still reports the max cursor", async () => {
     feedOpen.mockRejectedValue(new Error("bad magic"));
-    const { client } = makeStub({ slots: [{ slot_id: "s1", created_at: NOW - 5 }] });
+    const { client } = makeStub({ slots: [{ seq: 4, slot_id: "s1", created_at: NOW - 5 }] });
 
     const { rows, maxCursor } = await runHistory(makeParams(client));
     expect(rows).toEqual([]);
-    expect(maxCursor).toBe(NOW - 5); // cursor advances so the live watch won't re-fetch it
+    expect(maxCursor).toBe(4); // cursor advances so the live watch won't re-fetch it
   });
 
   it("drops a post whose sender identity key changed (spoof)", async () => {
@@ -131,7 +137,7 @@ describe("runHistory", () => {
       header: { smid: "peer-member-id", fn: "x.txt", fs: 3, sik: "99".repeat(32), pa: NOW - 5 },
       body: new ArrayBuffer(3),
     } as Awaited<ReturnType<typeof cryptoClient.feedOpen>>);
-    const { client } = makeStub({ slots: [{ slot_id: "s1", created_at: NOW - 5 }] });
+    const { client } = makeStub({ slots: [{ seq: 1, slot_id: "s1", created_at: NOW - 5 }] });
 
     const { rows } = await runHistory(makeParams(client));
     expect(rows).toEqual([]);
@@ -144,27 +150,7 @@ describe("runHistory", () => {
     const { rows, maxCursor } = await runHistory(p);
     expect(rows).toEqual([]);
     expect(getSlot).not.toHaveBeenCalled();
-    expect(maxCursor).toBe(p.feed.last_post_ts);
-  });
-
-  it("ignores posts older than the retention window", async () => {
-    feedOpen.mockResolvedValue({
-      header: { smid: "peer-member-id", fn: "recent.txt", fs: 3, sik: PEER_PUB, pa: NOW - 1 },
-      body: new ArrayBuffer(3),
-    } as Awaited<ReturnType<typeof cryptoClient.feedOpen>>);
-    const { client, getSlot } = makeStub({
-      slots: [
-        { slot_id: "ancient", created_at: 1 }, // ~1970, far outside the window
-        { slot_id: "recent", created_at: NOW - 1 },
-      ],
-    });
-
-    const { rows } = await runHistory(makeParams(client));
-    // Only the recent slot is fetched + rebuilt; the ancient one is skipped.
-    expect(getSlot).toHaveBeenCalledTimes(1);
-    expect(getSlot).toHaveBeenCalledWith("feedtoken01", expect.anything(), "recent", expect.anything());
-    expect(rows).toHaveLength(1);
-    expect(rows[0].name).toBe("recent.txt");
+    expect(maxCursor).toBe(p.feed.last_seq);
   });
 
   it("bails without touching the store when the signal is already aborted", async () => {
@@ -172,7 +158,7 @@ describe("runHistory", () => {
       header: { smid: "peer-member-id", fn: "x.txt", fs: 3, sik: PEER_PUB, pa: NOW - 5 },
       body: new ArrayBuffer(3),
     } as Awaited<ReturnType<typeof cryptoClient.feedOpen>>);
-    const { client, getSlot } = makeStub({ slots: [{ slot_id: "s1", created_at: NOW - 5 }] });
+    const { client, getSlot } = makeStub({ slots: [{ seq: 1, slot_id: "s1", created_at: NOW - 5 }] });
     const p = makeParams(client);
     const ac = new AbortController();
     ac.abort();

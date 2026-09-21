@@ -19,14 +19,17 @@ Deployed as a static-assets Cloudflare Worker at `nomnom.spencerjireh.com`.
 - **Web Worker** (`src/worker/`) runs `feed_seal` / `feed_open` — the stream
   cipher over big files (up to 100 MB) — off the main thread, reporting progress.
 - **Relay client** (`src/relay/`) implements the `/feeds/*` surface: mint
-  (HMAC-gated), member cards, roster long-poll, slot put/get/list, and an
-  `EventSource` subscription to `/feeds/:id/stream` for real-time new-slot push
-  (the feed-key MAC rides the `?auth=` query, since `EventSource` can't set
-  headers; it reconnects itself with a fresh signature).
+  (HMAC-gated), member cards, roster, post put/get/list/delete, and a WebSocket
+  subscription to `/feeds/:id/ws` carrying `post`, `member`, and `deleted`
+  frames (the feed-key MAC rides the `?auth=` query, since a browser WebSocket
+  can't set headers; it reconnects itself with a fresh signature and the
+  current `seq` cursor).
 - **Orchestration** (`src/orchestration/`) implements create / join / send /
   receive as framework-free state machines over the relay client. Receive
-  subscribes to the SSE stream — falling back to the `/slots` long-poll if the
-  relay has no `/stream` — then fetches + decrypts each new slot.
+  consumes the socket's frames — fetching + decrypting each new post, updating
+  the roster on join/leave, dropping rows on delete — and on load rebuilds the
+  timeline from the relay's 30-day post window. Any relay-backed row offers
+  "delete everywhere".
 - **UI** (`src/components/`, zustand store in `src/state/`) is an editorial
   two-pane "diner-receipt" interface: a brand/status rail beside the receipt,
   showing the one channel's timeline + Settings. nomnom has a single permanent

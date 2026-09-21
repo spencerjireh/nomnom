@@ -60,7 +60,13 @@ function isFeedIdentity(id: unknown): id is Identity {
 }
 
 /** Tolerant feed shape check: requires the wire fields, leaves `auto_save`
- * optional so legacy feeds (saved before the toggle existed) load cleanly. */
+ * optional so feeds saved before the toggle existed load cleanly.
+ *
+ * `last_seq` is required on purpose. A channel persisted by the pre-seq relay
+ * protocol (it has `last_post_ts` / `expires_at` instead) points at a feed
+ * that no longer exists on the relay; loading it would only spin the socket
+ * backoff forever. Rejecting it drops the user to the bootstrap pane, where
+ * re-joining is one paste. */
 function isFeed(f: unknown): f is Omit<Feed, "auto_save"> & { auto_save?: boolean } {
   if (!f || typeof f !== "object") return false;
   const x = f as Feed;
@@ -70,9 +76,8 @@ function isFeed(f: unknown): f is Omit<Feed, "auto_save"> & { auto_save?: boolea
     typeof x.feed_token === "string" &&
     typeof x.url === "string" &&
     typeof x.member_id === "string" &&
-    typeof x.expires_at === "number" &&
     typeof x.joined_at === "number" &&
-    typeof x.last_post_ts === "number"
+    typeof x.last_seq === "number"
   );
 }
 

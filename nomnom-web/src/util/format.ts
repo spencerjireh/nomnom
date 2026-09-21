@@ -21,13 +21,3 @@ export function clock(at: number): string {
   const m = d.getMinutes().toString().padStart(2, "0");
   return `${h}:${m}`;
 }
-
-/** Relative time-left for a unix-seconds expiry: "5m left", "3h left", "2d left". */
-export function expiry(unix: number): string {
-  if (!unix) return "unknown";
-  const secs = unix - Math.floor(Date.now() / 1000);
-  if (secs <= 0) return "expired";
-  if (secs < 3600) return `${Math.floor(secs / 60)}m left`;
-  if (secs < 86_400) return `${Math.floor(secs / 3600)}h left`;
-  return `${Math.floor(secs / 86_400)}d left`;
-}

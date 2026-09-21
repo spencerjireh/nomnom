@@ -1,5 +1,5 @@
-// HTTP client for the relay Worker's /feeds/* endpoints. Status semantics mirror
-// nomnom.py's _relay_mint_feed / _relay_* feed helpers.
+// HTTP + WebSocket client for the relay Worker's /feeds/* endpoints. Status
+// semantics mirror nomnom.py's _relay_mint_feed / _relay_* feed helpers.
 //
 // Two auth schemes:
 //   - mintFeed (POST /feeds) is gated by the deployment-wide relay HMAC secret —
@@ -14,20 +14,83 @@
 import { feedAuthHeader } from "../crypto/feed-auth";
 import { feedRequestMac } from "../crypto/feeds";
 import { relayAuthHeader } from "../crypto/relay-auth";
-import { STREAM_RECONNECT_MS, STREAM_UNSUPPORTED_RETRIES } from "../config";
+import { WS_PING_INTERVAL_MS, WS_RECONNECT_MAX_MS, WS_RECONNECT_MIN_MS } from "../config";
 import { sleep } from "../util/sleep";
 import type { Member, RelayConfig } from "../types";
-import { RelayError, StreamUnsupportedError } from "./errors";
+import { RelayError } from "./errors";
 
 export interface MintResult {
   feed_id: string;
-  expires_at: number;
   created_at: number;
 }
 
+export interface FeedMeta {
+  created_at: number;
+  last_used_at: number;
+}
+
+/** One post in the relay's index. `seq` is the feed's monotonic cursor. */
 export interface SlotMeta {
+  seq: number;
   slot_id: string;
   created_at: number;
+}
+
+/** A frame pushed over the /ws socket. */
+export type FeedFrame =
+  | { type: "post"; seq: number; slot_id: string; created_at: number }
+  | { type: "member"; action: "join" | "leave"; member: Member }
+  | { type: "deleted"; slot_id: string };
+
+/**
+ * Parse a raw socket message into a FeedFrame, or null for anything that is
+ * not one: the "pong" keepalive reply, non-JSON, or an unknown/malformed type.
+ */
+export function parseFrame(data: unknown): FeedFrame | null {
+  if (typeof data !== "string") return null;
+  let obj: unknown;
+  try {
+    obj = JSON.parse(data);
+  } catch {
+    return null;
+  }
+  if (typeof obj !== "object" || obj === null) return null;
+  const f = obj as Record<string, unknown>;
+  switch (f.type) {
+    case "post":
+      if (
+        typeof f.seq === "number" &&
+        typeof f.slot_id === "string" &&
+        typeof f.created_at === "number"
+      ) {
+        return { type: "post", seq: f.seq, slot_id: f.slot_id, created_at: f.created_at };
+      }
+      return null;
+    case "member": {
+      const m = f.member as Record<string, unknown> | undefined;
+      if (
+        (f.action === "join" || f.action === "leave") &&
+        m &&
+        typeof m.member_id === "string" &&
+        typeof m.identity_pubkey === "string" &&
+        typeof m.name === "string"
+      ) {
+        const member: Member = {
+          member_id: m.member_id,
+          identity_pubkey: m.identity_pubkey,
+          name: m.name,
+        };
+        if (typeof m.joined_at === "number") member.joined_at = m.joined_at;
+        return { type: "member", action: f.action, member };
+      }
+      return null;
+    }
+    case "deleted":
+      if (typeof f.slot_id === "string") return { type: "deleted", slot_id: f.slot_id };
+      return null;
+    default:
+      return null;
+  }
 }
 
 /**
@@ -54,16 +117,15 @@ function stripTrailingSlash(u: string): string {
 
 /**
  * Mint a new feed. HMAC-gated by the relay secret. Returns the relay-chosen
- * feed_id (the URL token), the expiry, and creation time.
+ * feed_id (the URL token) and creation time.
  */
 export async function mintFeed(
   relay: RelayConfig,
-  ttlSeconds: number,
   memberCard: Member,
   signal?: AbortSignal,
 ): Promise<MintResult> {
   const path = "/feeds";
-  const body = JSON.stringify({ ttl_seconds: Math.floor(ttlSeconds), member_card: memberCard });
+  const body = JSON.stringify({ member_card: memberCard });
   const res = await fetch(stripTrailingSlash(relay.url) + path, {
     method: "POST",
     headers: {
@@ -85,6 +147,10 @@ export class FeedClient {
     return stripTrailingSlash(this.host) + path;
   }
 
+  private wsUrl(path: string): string {
+    return this.url(path).replace(/^http(s?):/, "ws$1:");
+  }
+
   private async send(
     feedKey: Uint8Array,
     method: string,
@@ -96,9 +162,9 @@ export class FeedClient {
     return fetch(this.url(path), { method, headers, body: opts.body, signal: opts.signal });
   }
 
-  async getMeta(feedId: string, feedKey: Uint8Array, signal?: AbortSignal): Promise<{ expires_at: number }> {
+  async getMeta(feedId: string, feedKey: Uint8Array, signal?: AbortSignal): Promise<FeedMeta> {
     const res = await this.send(feedKey, "GET", `/feeds/${feedId}/meta`, { signal });
-    if (res.status === 200) return (await res.json()) as { expires_at: number };
+    if (res.status === 200) return (await res.json()) as FeedMeta;
     throw new RelayError(res.status, (await safeReason(res)) || "meta-failed");
   }
 
@@ -130,31 +196,14 @@ export class FeedClient {
   async listMembers(
     feedId: string,
     feedKey: Uint8Array,
-    opts: { sinceTs?: number; waitMs?: number; signal?: AbortSignal } = {},
+    opts: { signal?: AbortSignal } = {},
   ): Promise<Member[]> {
-    const path = `/feeds/${feedId}/members${qs({ wait: opts.waitMs, since: opts.sinceTs })}`;
-    const res = await this.send(feedKey, "GET", path, { signal: opts.signal });
+    const res = await this.send(feedKey, "GET", `/feeds/${feedId}/members`, { signal: opts.signal });
     if (res.status === 200) {
       const parsed = (await res.json()) as { members?: Member[] };
       return parsed.members ?? [];
     }
     throw new RelayError(res.status, (await safeReason(res)) || "list-members-failed");
-  }
-
-  async extend(feedId: string, feedKey: Uint8Array, newTtlSeconds: number, signal?: AbortSignal): Promise<{ expires_at: number }> {
-    const res = await this.send(feedKey, "POST", `/feeds/${feedId}/extend`, {
-      body: JSON.stringify({ new_ttl_seconds: Math.floor(newTtlSeconds) }),
-      contentType: "application/json",
-      signal,
-    });
-    if (res.status === 200) return (await res.json()) as { expires_at: number };
-    throw new RelayError(res.status, (await safeReason(res)) || "extend-failed");
-  }
-
-  async close(feedId: string, feedKey: Uint8Array, signal?: AbortSignal): Promise<void> {
-    const res = await this.send(feedKey, "DELETE", `/feeds/${feedId}`, { signal });
-    if (res.status === 204 || res.status === 404) return;
-    throw new RelayError(res.status, (await safeReason(res)) || "close-failed");
   }
 
   async putSlot(
@@ -172,26 +221,38 @@ export class FeedClient {
     throw new RelayError(res.status, (await safeReason(res)) || "put-slot-failed");
   }
 
-  /** Fetch a slot (no delete-on-read). Returns null on 404. Long-polls up to waitMs. */
+  /** Fetch a post body. Returns null on 404 (never posted, deleted, or aged out). */
   async getSlot(
     feedId: string,
     feedKey: Uint8Array,
     slotId: string,
-    opts: { waitMs?: number; signal?: AbortSignal } = {},
+    opts: { signal?: AbortSignal } = {},
   ): Promise<ArrayBuffer | null> {
-    const path = `/feeds/${feedId}/slots/${slotId}${qs({ wait: opts.waitMs })}`;
-    const res = await this.send(feedKey, "GET", path, { signal: opts.signal });
+    const res = await this.send(feedKey, "GET", `/feeds/${feedId}/slots/${slotId}`, {
+      signal: opts.signal,
+    });
     if (res.status === 200) return await res.arrayBuffer();
     if (res.status === 404) return null;
     throw new RelayError(res.status, (await safeReason(res)) || "get-slot-failed");
   }
 
+  /**
+   * Hard-delete a post for every device. 204 and 404 both resolve: the goal is
+   * "gone", and a post that is already gone satisfies it.
+   */
+  async deleteSlot(feedId: string, feedKey: Uint8Array, slotId: string, signal?: AbortSignal): Promise<void> {
+    const res = await this.send(feedKey, "DELETE", `/feeds/${feedId}/slots/${slotId}`, { signal });
+    if (res.status === 204 || res.status === 404) return;
+    throw new RelayError(res.status, (await safeReason(res)) || "delete-slot-failed");
+  }
+
+  /** List posts with seq > `since`, ascending. `waitMs` long-polls when empty. */
   async listSlots(
     feedId: string,
     feedKey: Uint8Array,
-    opts: { sinceTs?: number; waitMs?: number; signal?: AbortSignal } = {},
+    opts: { since?: number; waitMs?: number; signal?: AbortSignal } = {},
   ): Promise<SlotMeta[]> {
-    const path = `/feeds/${feedId}/slots${qs({ wait: opts.waitMs, since: opts.sinceTs })}`;
+    const path = `/feeds/${feedId}/slots${qs({ wait: opts.waitMs, since: opts.since })}`;
     const res = await this.send(feedKey, "GET", path, { signal: opts.signal });
     if (res.status === 200) {
       const parsed = (await res.json()) as { slots?: SlotMeta[] };
@@ -201,35 +262,34 @@ export class FeedClient {
   }
 
   /**
-   * Push stream of new-slot notifications over SSE (the /stream endpoint backed
-   * by a Durable Object). Yields {slot_id, created_at} as posts arrive — the
-   * caller still GETs each slot body. Reconnects itself with a freshly signed
-   * URL (EventSource can't set an Authorization header, so the feed-key MAC
-   * rides the `?auth=` query; reopening keeps its timestamp inside the relay's
-   * skew window). `getSince` is read at each (re)connect so replay resumes from
-   * the caller's current cursor. Stops when `signal` aborts. Throws
-   * StreamUnsupportedError if /stream never opens (relay predates it).
+   * Live feed events over the /ws WebSocket. Yields `post` (replay of seq >
+   * getSince() on connect, then live), `member` (join/leave), and `deleted`
+   * frames. The caller still GETs each post body.
+   *
+   * A browser WebSocket can't set an Authorization header, so the feed-key MAC
+   * rides the `?auth=` query. On any drop the generator sleeps with doubling
+   * backoff and reconnects with a freshly signed URL and the caller's current
+   * cursor (`getSince` is read at each connect). Stops only when `signal`
+   * aborts; there is no give-up path.
    */
-  async *streamSlotEvents(
+  async *watch(
     feedId: string,
     feedKey: Uint8Array,
     opts: { getSince: () => number; signal: AbortSignal },
-  ): AsyncGenerator<SlotMeta> {
+  ): AsyncGenerator<FeedFrame> {
     const { getSince, signal } = opts;
-    const barePath = `/feeds/${feedId}/stream`;
-    let failsBeforeOpen = 0;
+    const barePath = `/feeds/${feedId}/ws`;
+    let backoff = WS_RECONNECT_MIN_MS;
 
     while (!signal.aborted) {
       const ts = Math.floor(Date.now() / 1000);
       const mac = feedRequestMac(feedKey, "GET", barePath, ts);
-      const url =
-        this.url(barePath) + `?since=${getSince()}&auth=${ts}:${mac}`;
-      const es = new EventSource(url);
+      const ws = new WebSocket(`${this.wsUrl(barePath)}?since=${getSince()}&auth=${ts}:${mac}`);
 
-      const queue: SlotMeta[] = [];
-      let opened = false;
+      const queue: FeedFrame[] = [];
       let dead = false;
       let wake: (() => void) | null = null;
+      let pingTimer: ReturnType<typeof setInterval> | null = null;
       const ping = () => {
         if (wake) {
           const w = wake;
@@ -237,25 +297,24 @@ export class FeedClient {
           w();
         }
       };
-      es.onopen = () => {
-        opened = true;
-        failsBeforeOpen = 0;
+      ws.onopen = () => {
+        backoff = WS_RECONNECT_MIN_MS;
+        pingTimer = setInterval(() => {
+          if (ws.readyState === ws.OPEN) ws.send("ping");
+        }, WS_PING_INTERVAL_MS);
       };
-      es.onmessage = (ev: MessageEvent) => {
-        try {
-          const d = JSON.parse(ev.data) as { slot_id?: unknown; created_at?: unknown };
-          if (typeof d.slot_id === "string") {
-            queue.push({
-              slot_id: d.slot_id,
-              created_at: typeof d.created_at === "number" ? d.created_at : 0,
-            });
-          }
-        } catch {
-          // skip a malformed frame
+      ws.onmessage = (ev: MessageEvent) => {
+        const frame = parseFrame(ev.data);
+        if (frame) {
+          queue.push(frame);
+          ping();
         }
+      };
+      ws.onerror = () => {
+        dead = true;
         ping();
       };
-      es.onerror = () => {
+      ws.onclose = () => {
         dead = true;
         ping();
       };
@@ -266,7 +325,7 @@ export class FeedClient {
       signal.addEventListener("abort", onAbort, { once: true });
 
       try {
-        // Invariant: every state change (new queue item, error, abort) calls
+        // Invariant: every state change (new queue item, close, abort) calls
         // ping(), and the loop re-checks queue.length / dead / aborted at the
         // top before awaiting again. So a ping() that fires while `wake` is null
         // (consumer mid-yield) is benign — the next iteration observes the change.
@@ -278,20 +337,20 @@ export class FeedClient {
           yield queue.shift()!;
         }
       } finally {
-        es.close();
+        if (pingTimer) clearInterval(pingTimer);
         signal.removeEventListener("abort", onAbort);
+        // Detach before closing so our own close() can't re-enter the loop.
+        ws.onopen = ws.onmessage = ws.onerror = ws.onclose = null;
+        try {
+          ws.close();
+        } catch {
+          // already closed
+        }
       }
 
       if (signal.aborted) break;
-      // Errored. If it never opened, the endpoint is likely absent — give up
-      // after a few tries so the caller can fall back to long-poll.
-      if (!opened) {
-        failsBeforeOpen++;
-        if (failsBeforeOpen >= STREAM_UNSUPPORTED_RETRIES) {
-          throw new StreamUnsupportedError();
-        }
-      }
-      await sleep(STREAM_RECONNECT_MS, signal);
+      await sleep(backoff, signal);
+      backoff = Math.min(backoff * 2, WS_RECONNECT_MAX_MS);
     }
   }
 }

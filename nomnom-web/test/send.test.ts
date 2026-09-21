@@ -29,11 +29,10 @@ function makeFeed(): Feed {
     feed_id: "feedtoken01",
     feed_token: "feedtoken01",
     url: "https://relay.test/f/feedtoken01",
-    expires_at: 2_000_000_000,
     joined_at: 1_700_000_000,
     member_id: "me",
     members_cache: [],
-    last_post_ts: 0,
+    last_seq: 0,
     auto_save: false,
   };
 }
@@ -78,6 +77,15 @@ describe("runSend progress", () => {
     });
 
     expect(result.recipients).toBe(1);
+    // The slot id the post landed in is reported so the row can be deleted later.
+    expect(typeof result.slotId).toBe("string");
+    expect(putSlot).toHaveBeenCalledWith(
+      "feedtoken01",
+      expect.anything(),
+      result.slotId,
+      expect.anything(),
+      expect.anything(),
+    );
     expect(seen.length).toBeGreaterThan(0);
     for (let i = 1; i < seen.length; i++) {
       expect(seen[i]).toBeGreaterThanOrEqual(seen[i - 1]);

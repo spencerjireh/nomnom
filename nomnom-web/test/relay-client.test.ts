@@ -1,6 +1,6 @@
 // Unit tests for RelayClient.verifyAuth — the authenticated passphrase probe that
 // replaced the unauthenticated /health check in Settings. `fetch` is mocked so we
-// can drive the relay's 401/404 responses and assert the request is HMAC-signed.
+// can drive the relay's 204/401 responses and assert the request is HMAC-signed.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { RelayClient } from "../src/relay/client";
@@ -20,8 +20,6 @@ let fetchMock: ReturnType<typeof vi.fn>;
 beforeEach(() => {
   fetchMock = vi.fn();
   vi.stubGlobal("fetch", fetchMock);
-  // crypto.randomUUID exists in node 18+, but stub for determinism of the path.
-  vi.stubGlobal("crypto", { ...globalThis.crypto, randomUUID: () => "00000000-test" });
 });
 
 afterEach(() => {
@@ -39,9 +37,14 @@ describe("RelayClient.verifyAuth", () => {
     expect(await client().verifyAuth()).toBe("skew");
   });
 
-  it("treats 404 (missing slot) as 'ok' — the passphrase signed fine", async () => {
-    fetchMock.mockResolvedValue(jsonResponse(404, { error: "not-found" }));
+  it("treats 204 as 'ok' — the passphrase signed fine", async () => {
+    fetchMock.mockResolvedValue(jsonResponse(204, null));
     expect(await client().verifyAuth()).toBe("ok");
+  });
+
+  it("does not treat 404 as 'ok' (a relay without /auth is not verified)", async () => {
+    fetchMock.mockResolvedValue(jsonResponse(404, { error: "not-found" }));
+    expect(await client().verifyAuth()).toBe("unreachable");
   });
 
   it("fails closed on an unexpected status (e.g. 500) — not 'ok'", async () => {
@@ -64,12 +67,12 @@ describe("RelayClient.verifyAuth", () => {
     expect(await client().verifyAuth()).toBe("rejected");
   });
 
-  it("signs the probe with an HMAC Authorization header against /slots/", async () => {
-    fetchMock.mockResolvedValue(jsonResponse(404, { error: "not-found" }));
+  it("signs the probe with an HMAC Authorization header against /auth", async () => {
+    fetchMock.mockResolvedValue(jsonResponse(204, null));
     await client().verifyAuth();
     expect(fetchMock).toHaveBeenCalledTimes(1);
     const [url, init] = fetchMock.mock.calls[0];
-    expect(url).toBe("https://relay.example.com/slots/nomnom-authcheck-00000000-test");
+    expect(url).toBe("https://relay.example.com/auth");
     expect(init.method).toBe("GET");
     expect(init.headers.Authorization).toMatch(/^NMNM-HMAC-SHA256 \d+:[0-9a-f]{64}$/);
   });

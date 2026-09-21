@@ -1,5 +1,5 @@
-// Relay error mapping. Mirrors nomnom.py's handling: GET 404 means "nothing in
-// the slot yet" (returned as null, not thrown); 409/410/413/401 are hard errors.
+// Relay error mapping. Mirrors nomnom.py's handling: GET 404 on a slot means
+// "not on the relay" (returned as null, not thrown); 409/413/401 are hard errors.
 
 export class RelayError extends Error {
   constructor(
@@ -8,15 +8,6 @@ export class RelayError extends Error {
   ) {
     super(`relay ${status}: ${reason}`);
     this.name = "RelayError";
-  }
-}
-
-/** Thrown by the SSE stream when /stream never opens — the relay predates the
- * push endpoint. The caller falls back to the long-poll loop. */
-export class StreamUnsupportedError extends Error {
-  constructor() {
-    super("relay does not support the SSE /stream endpoint");
-    this.name = "StreamUnsupportedError";
   }
 }
 
@@ -30,9 +21,7 @@ export function friendlyRelayMessage(e: unknown): string {
       }
       return "relay rejected the request (bad passphrase?).";
     case 409:
-      return "slot busy — a transfer to this peer is already in flight. retry shortly.";
-    case 410:
-      return "the slot expired before it was read (5 min TTL). retry.";
+      return "a post with that id already exists on the relay. retry.";
     case 413:
       return "payload too large for the relay.";
     default:
