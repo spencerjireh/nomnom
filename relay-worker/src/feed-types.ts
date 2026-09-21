@@ -15,6 +15,11 @@ export const FEED_IDLE_SEC = 30 * 86_400;
 export const TOUCH_THROTTLE_SEC = 3600;
 export const ALARM_PERIOD_MS = 24 * 3600 * 1000;
 
+// R2 key for a post body. Bodies are the only thing in the bucket.
+export function slotKey(feedId: string, slotId: string): string {
+  return `feeds/${feedId}/slots/${slotId}`;
+}
+
 // Body of a member card as posted by clients. `card` in the DB is the raw JSON
 // the client sent (re-served verbatim on list), the other columns are
 // denormalised copies for querying.

@@ -8,6 +8,7 @@
 import { cryptoClient } from "../worker/cryptoClient";
 import {
   feedContext,
+  knownIdentities,
   refreshRoster,
   tofuMember,
   type FeedContext,
@@ -56,19 +57,14 @@ export async function runReceive(p: ReceiveParams): Promise<number> {
     }
   };
 
-  // Identities TOFU has already considered this session (plus the cache we
-  // started with), so a member frame for a known device never re-prompts.
-  const knownInCache = new Set(roster.map((m) => m.identity_pubkey));
+  // Identities TOFU has already considered this session (seeded from the
+  // cache), so a member frame for a known device never re-prompts.
+  const known = knownIdentities(p.feed);
 
   // One roster fetch up front so TOFU runs on members already present before
   // any post arrives. Non-fatal: the socket's member frames take over from here.
   try {
-    roster = await refreshRoster(
-      { ...ctx, feed: { ...ctx.feed, members_cache: roster } },
-      p.hooks,
-      p.signal,
-    );
-    for (const m of roster) knownInCache.add(m.identity_pubkey);
+    roster = await refreshRoster(ctx, p.hooks, p.signal, known);
     p.onRoster?.(roster);
   } catch {
     if (p.signal.aborted) return count;
@@ -151,8 +147,7 @@ export async function runReceive(p: ReceiveParams): Promise<number> {
       roster = roster.filter((x) => x.member_id !== m.member_id);
     } else {
       roster = [...roster.filter((x) => x.member_id !== m.member_id), m];
-      await tofuMember(m, ctx, p.hooks, knownInCache);
-      knownInCache.add(m.identity_pubkey);
+      await tofuMember(m, ctx, p.hooks, known);
     }
     p.onRoster?.(roster);
   };

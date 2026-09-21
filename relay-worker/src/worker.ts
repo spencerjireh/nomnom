@@ -27,6 +27,7 @@ import { verifyFeedKey } from "./feed-auth";
 import { Feed } from "./feed";
 import {
   MAX_MEMBER_CARD_BYTES,
+  slotKey,
   type DoResult,
   type MemberCard,
 } from "./feed-types";
@@ -89,78 +90,53 @@ function withCors(res: Response, req: Request): Response {
   });
 }
 
-// Fold a DO RPC result into a Response. `body` renders the success value;
-// omitted means an empty 204-style response at `okStatus`.
-function fromResult<T>(
-  r: DoResult<T>,
-  okStatus: number,
-  body?: (v: T) => unknown,
-): Response {
+// Fold a DO RPC result into a Response: the value as JSON, or an empty body
+// for 204.
+function fromResult<T>(r: DoResult<T>, okStatus: number): Response {
   if (!r.ok) return errorResponse(r.error, r.status);
-  if (body === undefined) return new Response(null, { status: okStatus });
-  return jsonResponse(body(r.value), okStatus);
+  if (okStatus === 204) return new Response(null, { status: 204 });
+  return jsonResponse(r.value, okStatus);
 }
 
-// A rejected RPC (object evicted mid-call, runtime fault) surfaces as 502 so
-// clients can tell "retry" from "your request is wrong".
-async function rpc<T>(call: () => Promise<DoResult<T>>): Promise<DoResult<T>> {
+function parseJson(text: string): unknown | undefined {
   try {
-    return await call();
+    return JSON.parse(text);
   } catch {
-    return { ok: false, status: 502, error: "feed-unavailable" };
+    return undefined;
   }
 }
 
-// Read + validate a member card body. Returns the parsed card and its raw
-// JSON (stored verbatim), or an error Response.
-async function readCard(
-  req: Request,
+// Validate a member card and produce the JSON the DO stores verbatim, or an
+// error Response. Shared by mint (card nested in the body) and PUT member
+// (card IS the body).
+function checkCard(
+  card: unknown,
   expectMemberId?: string,
-): Promise<{ card: MemberCard; json: string } | Response> {
-  const text = await req.text();
-  if (byteLength(text) > MAX_MEMBER_CARD_BYTES) {
-    return errorResponse("member-card-too-large", 413);
-  }
-  let card: unknown;
-  try {
-    card = JSON.parse(text);
-  } catch {
-    return errorResponse("bad-json", 400);
-  }
+): { card: MemberCard; json: string } | Response {
   if (!isValidCard(card, expectMemberId)) {
     return errorResponse("bad-member-card", 400);
   }
-  return { card, json: text };
+  const json = JSON.stringify(card);
+  if (byteLength(json) > MAX_MEMBER_CARD_BYTES) {
+    return errorResponse("member-card-too-large", 413);
+  }
+  return { card, json };
 }
 
 // ---------- POST /feeds ----------
 
 async function mintFeed(env: Env, req: Request): Promise<Response> {
-  let body: { member_card?: unknown };
-  try {
-    body = JSON.parse(await req.text());
-  } catch {
-    return errorResponse("bad-json", 400);
-  }
-  const card = body.member_card;
-  if (!isValidCard(card)) {
-    return errorResponse("bad-member-card", 400);
-  }
-  const cardJson = JSON.stringify(card);
-  if (byteLength(cardJson) > MAX_MEMBER_CARD_BYTES) {
-    return errorResponse("member-card-too-large", 413);
-  }
-  // 72-bit ids never collide in practice; the retry is belt-and-braces.
-  for (let attempt = 0; attempt < 2; attempt++) {
-    const feedId = generateFeedId();
-    const stub = env.FEED.get(env.FEED.idFromName(feedId));
-    const r = await rpc(() => stub.create(feedId, card, cardJson));
-    if (r.ok) {
-      return jsonResponse({ feed_id: feedId, created_at: r.value.created_at }, 201);
-    }
-    if (r.error !== "feed-exists") return errorResponse(r.error, r.status);
-  }
-  return errorResponse("mint-failed", 500);
+  const body = parseJson(await req.text()) as { member_card?: unknown } | undefined;
+  if (body === undefined) return errorResponse("bad-json", 400);
+  const parsed = checkCard(body?.member_card);
+  if (parsed instanceof Response) return parsed;
+  // 72-bit ids never collide in practice; `feed-exists` surfaces as a 409
+  // like any other unexpected DO result.
+  const feedId = generateFeedId();
+  const stub = env.FEED.get(env.FEED.idFromName(feedId));
+  const r = await stub.create(feedId, parsed.card, parsed.json);
+  if (!r.ok) return errorResponse(r.error, r.status);
+  return jsonResponse({ feed_id: feedId, created_at: r.value.created_at }, 201);
 }
 
 // ---------- /feeds/:id/* ----------
@@ -182,31 +158,26 @@ async function routeFeed(
   url: URL,
 ): Promise<Response> {
   const stub = env.FEED.get(env.FEED.idFromName(feedId));
-  const since = () => parseSince(url.searchParams.get("since"));
-  const wait = () => parseWaitMs(url.searchParams.get("wait"));
+  const since = parseSince(url.searchParams.get("since"));
+  const wait = parseWaitMs(url.searchParams.get("wait"));
 
   const routes: FeedRoute[] = [
     {
       re: /^\/?$/,
       methods: {
-        DELETE: async () => fromResult(await rpc(() => stub.purge()), 204),
+        DELETE: async () => fromResult(await stub.purge(), 204),
       },
     },
     {
       re: /^\/meta$/,
       methods: {
-        GET: async () => fromResult(await rpc(() => stub.meta()), 200, (v) => v),
+        GET: async () => fromResult(await stub.meta(), 200),
       },
     },
     {
       re: /^\/members$/,
       methods: {
-        GET: async () =>
-          fromResult(
-            await rpc(() => stub.listMembers(since(), wait())),
-            200,
-            (v) => v,
-          ),
+        GET: async () => fromResult(await stub.listMembers(since, wait), 200),
       },
     },
     {
@@ -215,26 +186,19 @@ async function routeFeed(
         validateMemberId(m[1]) ? null : errorResponse("bad-member-id", 400),
       methods: {
         PUT: async (m) => {
-          const parsed = await readCard(req, m[1]);
+          const body = parseJson(await req.text());
+          if (body === undefined) return errorResponse("bad-json", 400);
+          const parsed = checkCard(body, m[1]);
           if (parsed instanceof Response) return parsed;
-          return fromResult(
-            await rpc(() => stub.putMember(parsed.card, parsed.json)),
-            204,
-          );
+          return fromResult(await stub.putMember(parsed.card, parsed.json), 204);
         },
-        DELETE: async (m) =>
-          fromResult(await rpc(() => stub.deleteMember(m[1])), 204),
+        DELETE: async (m) => fromResult(await stub.deleteMember(m[1]), 204),
       },
     },
     {
       re: /^\/slots$/,
       methods: {
-        GET: async () =>
-          fromResult(
-            await rpc(() => stub.listSlots(since(), wait())),
-            200,
-            (v) => v,
-          ),
+        GET: async () => fromResult(await stub.listSlots(since, wait), 200),
       },
     },
     {
@@ -254,15 +218,14 @@ async function routeFeed(
           // Straight from R2: blob existence is the liveness proof (only a
           // created feed produces blobs; purge/alarm/failed-insert remove
           // them), and ciphertext never has to cross the DO.
-          const obj = await env.BUCKET.get(`feeds/${feedId}/slots/${m[1]}`);
+          const obj = await env.BUCKET.get(slotKey(feedId, m[1]));
           if (obj === null) return errorResponse("not-found", 404);
           return new Response(obj.body, {
             status: 200,
             headers: { "Content-Type": "application/octet-stream" },
           });
         },
-        DELETE: async (m) =>
-          fromResult(await rpc(() => stub.deletePost(m[1])), 204),
+        DELETE: async (m) => fromResult(await stub.deletePost(m[1]), 204),
       },
     },
     {
@@ -273,7 +236,7 @@ async function routeFeed(
             return errorResponse("expected-websocket", 426);
           }
           const target = new URL("https://feed/ws");
-          target.searchParams.set("since", String(since()));
+          target.searchParams.set("since", String(since));
           return stub.fetch(new Request(target, req));
         },
       },
@@ -342,7 +305,14 @@ async function route(req: Request, env: Env, url: URL): Promise<Response> {
     }
     const auth = await verifyFeedKey(req, feedId);
     if (!auth.ok) return errorResponse(auth.reason, auth.status);
-    return await routeFeed(env, feedId, subpath, req, url);
+    // Every DO interaction shares one fault contract: a rejected stub call
+    // (object evicted mid-call, runtime fault) is 502, so clients can tell
+    // "retry" from "your request is wrong".
+    try {
+      return await routeFeed(env, feedId, subpath, req, url);
+    } catch {
+      return errorResponse("feed-unavailable", 502);
+    }
   }
 
   return errorResponse("not-found", 404);

@@ -30,6 +30,7 @@ import {
   TOUCH_THROTTLE_SEC,
   fail,
   ok,
+  slotKey,
   type DoResult,
   type MemberCard,
   type MemberRow,
@@ -53,12 +54,22 @@ function nowSec(): number {
   return Math.floor(Date.now() / 1000);
 }
 
+// `getWebSockets()` can hand back sockets already in CLOSING/CLOSED.
+function closeQuietly(ws: WebSocket, code: number, reason: string): void {
+  try {
+    ws.close(code, reason);
+  } catch {
+    // already closed
+  }
+}
+
 export class Feed extends DurableObject<FeedEnv> {
   // True once `create()` has run and until a purge. Every entry point 404s
   // when false and writes nothing, so a stray authed request to a never-minted
   // or already-purged id leaves zero storage behind.
   private live: boolean;
   private feedId = "";
+  private createdAt = 0;
   private lastUsedAt = 0;
   // Long-poll waiters. Only meaningful while an RPC is in flight, which blocks
   // hibernation, so losing them on eviction is safe (the caller's RPC rejects
@@ -73,16 +84,22 @@ export class Feed extends DurableObject<FeedEnv> {
 
   constructor(ctx: DurableObjectState, env: FeedEnv) {
     super(ctx, env);
-    const sql = ctx.storage.sql;
-    this.live =
-      sql
-        .exec("SELECT 1 FROM sqlite_master WHERE type='table' AND name='feed'")
-        .toArray().length > 0;
-    if (this.live) {
-      const row = sql.exec<{ feed_id: string; last_used_at: number }>(
-        "SELECT feed_id, last_used_at FROM feed",
-      ).one();
+    // One statement per wake: the feed row exists iff `create()` ran, so a
+    // "no such table" throw is the not-live signal.
+    let row: { feed_id: string; created_at: number; last_used_at: number } | null;
+    try {
+      row = ctx.storage.sql
+        .exec<{ feed_id: string; created_at: number; last_used_at: number }>(
+          "SELECT feed_id, created_at, last_used_at FROM feed",
+        )
+        .one();
+    } catch {
+      row = null;
+    }
+    this.live = row !== null;
+    if (row) {
       this.feedId = row.feed_id;
+      this.createdAt = row.created_at;
       this.lastUsedAt = row.last_used_at;
     }
     // Answer client keepalives at the edge without waking the object.
@@ -127,7 +144,9 @@ export class Feed extends DurableObject<FeedEnv> {
            size INTEGER NOT NULL
          )`,
       );
-      this.sql.exec("CREATE INDEX posts_created_at ON posts(created_at)");
+      // No index on created_at on purpose: its only reader is the daily
+      // retention sweep over at most 30 days of rows, and an index would cost
+      // a row write per insert and per delete for that one scan.
       this.sql.exec(
         "INSERT INTO feed (feed_id, created_at, last_used_at) VALUES (?, ?, ?)",
         feedId,
@@ -146,6 +165,7 @@ export class Feed extends DurableObject<FeedEnv> {
     await this.ctx.storage.setAlarm(Date.now() + ALARM_PERIOD_MS);
     this.live = true;
     this.feedId = feedId;
+    this.createdAt = now;
     this.lastUsedAt = now;
     return ok({ created_at: now });
   }
@@ -153,10 +173,7 @@ export class Feed extends DurableObject<FeedEnv> {
   async meta(): Promise<DoResult<{ created_at: number; last_used_at: number }>> {
     if (!this.live) return fail(404, "feed-not-found");
     this.touch(nowSec());
-    const row = this.sql.exec<{ created_at: number; last_used_at: number }>(
-      "SELECT created_at, last_used_at FROM feed",
-    ).one();
-    return ok(row);
+    return ok({ created_at: this.createdAt, last_used_at: this.lastUsedAt });
   }
 
   // DELETE /feeds/:id — everything goes: rows, blobs, sockets, alarm.
@@ -172,16 +189,15 @@ export class Feed extends DurableObject<FeedEnv> {
     if (!this.live) return fail(404, "feed-not-found");
     const now = nowSec();
     this.touch(now);
-    const exists =
-      this.sql
-        .exec("SELECT 1 FROM members WHERE member_id = ?", card.member_id)
-        .toArray().length > 0;
-    if (!exists) {
-      const { n } = this.sql
-        .exec<{ n: number }>("SELECT COUNT(*) AS n FROM members")
-        .one();
-      if (n >= MAX_MEMBER_COUNT) return fail(409, "feed-full");
-    }
+    // One scan (the roster is at most 64 rows) answers both "is this an
+    // update" and "is there room for a new member".
+    const { n, known } = this.sql
+      .exec<{ n: number; known: number }>(
+        "SELECT COUNT(*) AS n, COALESCE(SUM(member_id = ?), 0) AS known FROM members",
+        card.member_id,
+      )
+      .one();
+    if (!known && n >= MAX_MEMBER_COUNT) return fail(409, "feed-full");
     // A re-PUT (rename/rekey) overwrites the card and bumps joined_at, which is
     // what wakes a members long-poll and what the `fresh` filter keys on.
     this.sql.exec(
@@ -228,17 +244,14 @@ export class Feed extends DurableObject<FeedEnv> {
     sinceTs: number,
     waitMs: number,
   ): Promise<DoResult<{ members: MemberRow[]; fresh: MemberRow[] }>> {
-    if (!this.live) return fail(404, "feed-not-found");
-    this.touch(nowSec());
-    let members = this.queryMembers();
-    let fresh = members.filter((m) => m.joined_at > sinceTs);
-    if (fresh.length === 0 && waitMs > 0) {
-      await this.waitFor(this.memberWaiters, waitMs);
-      if (!this.live) return fail(404, "feed-not-found");
-      members = this.queryMembers();
-      fresh = members.filter((m) => m.joined_at > sinceTs);
-    }
-    return ok({ members, fresh });
+    const members = await this.longPoll(
+      this.memberWaiters,
+      waitMs,
+      () => this.queryMembers(),
+      (rows) => rows.some((m) => m.joined_at > sinceTs),
+    );
+    if (members === null) return fail(404, "feed-not-found");
+    return ok({ members, fresh: members.filter((m) => m.joined_at > sinceTs) });
   }
 
   private queryMembers(): MemberRow[] {
@@ -255,17 +268,36 @@ export class Feed extends DurableObject<FeedEnv> {
     sinceSeq: number,
     waitMs: number,
   ): Promise<DoResult<{ slots: PostRow[] }>> {
-    if (!this.live) return fail(404, "feed-not-found");
-    this.touch(nowSec());
-    let slots = this.querySlots(sinceSeq);
-    if (slots.length === 0 && waitMs > 0) {
-      // Single wait: a wake always coincides with a committed insert, and the
-      // deadline path returns [] by design (the client re-polls).
-      await this.waitFor(this.slotWaiters, waitMs);
-      if (!this.live) return fail(404, "feed-not-found");
-      slots = this.querySlots(sinceSeq);
-    }
+    const slots = await this.longPoll(
+      this.slotWaiters,
+      waitMs,
+      () => this.querySlots(sinceSeq),
+      (rows) => rows.length > 0,
+    );
+    if (slots === null) return fail(404, "feed-not-found");
     return ok({ slots });
+  }
+
+  // Shared long-poll shape: query; if nothing satisfies `ready` and the caller
+  // will wait, park until a writer wakes the set or the deadline passes, then
+  // query once more. A wake always coincides with a committed write, and the
+  // deadline path returns whatever is there (the client re-polls). Returns
+  // null if the feed is not live (including a purge during the wait).
+  private async longPoll<T>(
+    set: Set<Waiter>,
+    waitMs: number,
+    query: () => T[],
+    ready: (rows: T[]) => boolean,
+  ): Promise<T[] | null> {
+    if (!this.live) return null;
+    this.touch(nowSec());
+    let rows = query();
+    if (!ready(rows) && waitMs > 0) {
+      await this.waitFor(set, waitMs);
+      if (!this.live) return null;
+      rows = query();
+    }
+    return rows;
   }
 
   private querySlots(sinceSeq: number): PostRow[] {
@@ -325,17 +357,15 @@ export class Feed extends DurableObject<FeedEnv> {
     ) {
       return errorResponse("slot-occupied", 409);
     }
-    // The Worker validated Content-Length and forwarded the original request,
-    // so the length is known here; R2 refuses streams of unknown length.
-    const len = Number.parseInt(req.headers.get("Content-Length") ?? "", 10);
-    if (!Number.isFinite(len) || len < 0 || req.body === null) {
-      return errorResponse("length-required", 411);
-    }
+    // The Worker validated Content-Length (`rejectBody`) and forwarded the
+    // original request, so the length is known here (R2 needs it) and the
+    // body is present.
+    const len = Number(req.headers.get("Content-Length"));
     const key = this.slotKey(slotId);
     this.pendingSlots.add(slotId);
     let created: R2Object | null;
     try {
-      created = await this.env.BUCKET.put(key, req.body, {
+      created = await this.env.BUCKET.put(key, req.body!, {
         onlyIf: { etagDoesNotMatch: "*" },
       });
     } finally {
@@ -366,11 +396,9 @@ export class Feed extends DurableObject<FeedEnv> {
     return new Response(null, { status: 204 });
   }
 
-  private handleWs(req: Request, url: URL): Response {
+  private handleWs(_req: Request, url: URL): Response {
     if (!this.live) return errorResponse("feed-not-found", 404);
-    if (req.headers.get("Upgrade") !== "websocket") {
-      return errorResponse("expected-websocket", 426);
-    }
+    // The Worker already required `Upgrade: websocket`.
     const since = parseSince(url.searchParams.get("since"));
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
@@ -393,19 +421,11 @@ export class Feed extends DurableObject<FeedEnv> {
   }
 
   async webSocketClose(ws: WebSocket, code: number, reason: string): Promise<void> {
-    try {
-      ws.close(code, reason);
-    } catch {
-      // already closed
-    }
+    closeQuietly(ws, code, reason);
   }
 
   async webSocketError(ws: WebSocket): Promise<void> {
-    try {
-      ws.close(1011, "error");
-    } catch {
-      // already closed
-    }
+    closeQuietly(ws, 1011, "error");
   }
 
   private broadcast(frame: WsFrame): void {
@@ -437,10 +457,11 @@ export class Feed extends DurableObject<FeedEnv> {
       )
       .toArray();
     await this.deleteBlobs(stale.map((r) => r.slot_id));
-    const { n } = this.sql
-      .exec<{ n: number }>("SELECT COUNT(*) AS n FROM posts")
-      .one();
-    if (n === 0 && this.lastUsedAt < now - FEED_IDLE_SEC) {
+    // Cheap check first (in memory), then a one-row probe instead of a count.
+    if (
+      this.lastUsedAt < now - FEED_IDLE_SEC &&
+      this.sql.exec("SELECT 1 FROM posts LIMIT 1").toArray().length === 0
+    ) {
       await this.purgeStorage();
       return;
     }
@@ -452,7 +473,7 @@ export class Feed extends DurableObject<FeedEnv> {
   // ---------- helpers ----------
 
   private slotKey(slotId: string): string {
-    return `feeds/${this.feedId}/slots/${slotId}`;
+    return slotKey(this.feedId, slotId);
   }
 
   // Reset the idle clock, at most once per TOUCH_THROTTLE_SEC. Downloads skip
@@ -498,13 +519,7 @@ export class Feed extends DurableObject<FeedEnv> {
       .exec<{ slot_id: string }>("SELECT slot_id FROM posts")
       .toArray()
       .map((r) => r.slot_id);
-    for (const ws of this.ctx.getWebSockets()) {
-      try {
-        ws.close(1000, "feed-deleted");
-      } catch {
-        // already closed
-      }
-    }
+    for (const ws of this.ctx.getWebSockets()) closeQuietly(ws, 1000, "feed-deleted");
     // Flip before the waiters run so they see a dead feed on re-query.
     this.live = false;
     this.wake(this.slotWaiters);
