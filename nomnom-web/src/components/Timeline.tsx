@@ -54,8 +54,7 @@ function Row({
   const [viewerOpen, setViewerOpen] = useState(false);
   const [renderMd, setRenderMd] = useState(false);
   const [copied, setCopied] = useState<"idle" | "ok" | "err">("idle");
-  const [confirmDelete, setConfirmDelete] = useState(false);
-  const [deleting, setDeleting] = useState(false);
+  const [del, setDel] = useState<"idle" | "confirm" | "busy">("idle");
 
   // Decode the body once, only if it sniffs as text. The body survives saving,
   // so the preview (and the actions it gates) stays available until discard.
@@ -84,17 +83,16 @@ function Row({
   // receipt / already-saved) or it was rebuilt from history and carries a
   // slot_id we can re-fetch on save.
   const hasFile = row.kind === "receive" && (!!row.body || !!row.slot_id);
-  // Any row the relay knows about can be deleted for everyone. In-flight sends
-  // have no slot yet; failed ones never landed.
-  const canDelete = !!row.slot_id && row.status !== "in_flight" && row.status !== "failed";
+  // Any row the relay knows about can be deleted for everyone; `slot_id` is
+  // set exactly when a post landed.
+  const canDelete = !!row.slot_id;
 
   async function confirmAndDelete() {
-    setDeleting(true);
+    setDel("busy");
     try {
       await onDelete(row.id);
     } finally {
-      setDeleting(false);
-      setConfirmDelete(false);
+      setDel("idle");
     }
   }
 
@@ -209,33 +207,29 @@ function Row({
               discard
             </button>
           )}
-          {canDelete && !confirmDelete && (
-            <button
-              type="button"
-              className="chip danger"
-              onClick={() => setConfirmDelete(true)}
-            >
+          {canDelete && del === "idle" && (
+            <button type="button" className="chip danger" onClick={() => setDel("confirm")}>
               delete everywhere
             </button>
           )}
-          {canDelete && confirmDelete && (
+          {canDelete && del !== "idle" && (
             <span className="row-delete-confirm">
               <span className="err small">delete from every device?</span>
               <button
                 type="button"
                 className="chip"
-                disabled={deleting}
-                onClick={() => setConfirmDelete(false)}
+                disabled={del === "busy"}
+                onClick={() => setDel("idle")}
               >
                 keep
               </button>
               <button
                 type="button"
                 className="chip danger"
-                disabled={deleting}
+                disabled={del === "busy"}
                 onClick={confirmAndDelete}
               >
-                {deleting ? "deleting…" : "delete"}
+                {del === "busy" ? "deleting…" : "delete"}
               </button>
             </span>
           )}

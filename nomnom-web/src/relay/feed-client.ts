@@ -11,8 +11,7 @@
 // The query string is appended to the fetched URL but stripped before signing
 // (the Worker signs over the bare pathname).
 
-import { feedAuthHeader } from "../crypto/feed-auth";
-import { feedRequestMac } from "../crypto/feeds";
+import { feedAuthEnvelope, feedAuthHeader } from "../crypto/feed-auth";
 import { relayAuthHeader } from "../crypto/relay-auth";
 import { WS_PING_INTERVAL_MS, WS_RECONNECT_MAX_MS, WS_RECONNECT_MIN_MS } from "../config";
 import { sleep } from "../util/sleep";
@@ -91,24 +90,6 @@ export function parseFrame(data: unknown): FeedFrame | null {
     default:
       return null;
   }
-}
-
-/**
- * `?wait=..&since=..` — drop only `undefined`. `wait=0` is dropped because the
- * Worker treats absent and 0 identically (no long-poll). `since=0` is a real
- * "from the beginning" cursor that the Worker accepts (>= 0). Order is built
- * explicitly (wait, then since); the Worker strips the query before signing, so
- * order is cosmetic, not load-bearing.
- */
-function qs(params: { wait?: number; since?: number }): string {
-  const parts: string[] = [];
-  if (params.wait !== undefined && params.wait > 0) {
-    parts.push(`wait=${Math.floor(params.wait)}`);
-  }
-  if (params.since !== undefined && params.since >= 0) {
-    parts.push(`since=${Math.floor(params.since)}`);
-  }
-  return parts.length ? "?" + parts.join("&") : "";
 }
 
 function stripTrailingSlash(u: string): string {
@@ -246,13 +227,15 @@ export class FeedClient {
     throw new RelayError(res.status, (await safeReason(res)) || "delete-slot-failed");
   }
 
-  /** List posts with seq > `since`, ascending. `waitMs` long-polls when empty. */
+  /** List posts with seq > `since`, ascending (the relay orders them). The
+   * web client only sweeps history with this; live updates ride `watch`. The
+   * Worker strips the query before signing. */
   async listSlots(
     feedId: string,
     feedKey: Uint8Array,
-    opts: { since?: number; waitMs?: number; signal?: AbortSignal } = {},
+    opts: { since?: number; signal?: AbortSignal } = {},
   ): Promise<SlotMeta[]> {
-    const path = `/feeds/${feedId}/slots${qs({ wait: opts.waitMs, since: opts.since })}`;
+    const path = `/feeds/${feedId}/slots?since=${Math.floor(opts.since ?? 0)}`;
     const res = await this.send(feedKey, "GET", path, { signal: opts.signal });
     if (res.status === 200) {
       const parsed = (await res.json()) as { slots?: SlotMeta[] };
@@ -282,9 +265,8 @@ export class FeedClient {
     let backoff = WS_RECONNECT_MIN_MS;
 
     while (!signal.aborted) {
-      const ts = Math.floor(Date.now() / 1000);
-      const mac = feedRequestMac(feedKey, "GET", barePath, ts);
-      const ws = new WebSocket(`${this.wsUrl(barePath)}?since=${getSince()}&auth=${ts}:${mac}`);
+      const auth = feedAuthEnvelope(feedKey, "GET", barePath);
+      const ws = new WebSocket(`${this.wsUrl(barePath)}?since=${getSince()}&auth=${auth}`);
 
       const queue: FeedFrame[] = [];
       let dead = false;
@@ -310,19 +292,12 @@ export class FeedClient {
           ping();
         }
       };
-      ws.onerror = () => {
+      const die = () => {
         dead = true;
         ping();
       };
-      ws.onclose = () => {
-        dead = true;
-        ping();
-      };
-      const onAbort = () => {
-        dead = true;
-        ping();
-      };
-      signal.addEventListener("abort", onAbort, { once: true });
+      ws.onerror = ws.onclose = die;
+      signal.addEventListener("abort", die, { once: true });
 
       try {
         // Invariant: every state change (new queue item, close, abort) calls
@@ -338,7 +313,7 @@ export class FeedClient {
         }
       } finally {
         if (pingTimer) clearInterval(pingTimer);
-        signal.removeEventListener("abort", onAbort);
+        signal.removeEventListener("abort", die);
         // Detach before closing so our own close() can't re-enter the loop.
         ws.onopen = ws.onmessage = ws.onerror = ws.onclose = null;
         try {

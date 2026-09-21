@@ -21,6 +21,8 @@ export function friendlyRelayMessage(e: unknown): string {
       }
       return "relay rejected the request (bad passphrase?).";
     case 409:
+      // The relay's `error` reason is the stable vocabulary; status is the fallback.
+      if (e.reason === "feed-full") return "the channel is full (64 devices).";
       return "a post with that id already exists on the relay. retry.";
     case 413:
       return "payload too large for the relay.";

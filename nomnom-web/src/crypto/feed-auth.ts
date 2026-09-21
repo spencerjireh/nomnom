@@ -21,8 +21,20 @@ export function feedAuthHeader(
   path: string,
   nowSeconds?: number,
 ): string {
+  return `${FEED_AUTH_PREFIX}${feedAuthEnvelope(feedKey, method, path, nowSeconds)}`;
+}
+
+/**
+ * The bare `<ts>:<mac>` envelope, without the scheme prefix. The WebSocket
+ * endpoint takes it as `?auth=` because a browser socket can't set headers.
+ */
+export function feedAuthEnvelope(
+  feedKey: Uint8Array,
+  method: string,
+  path: string,
+  nowSeconds?: number,
+): string {
   const ts = nowSeconds ?? Math.floor(Date.now() / 1000);
   const barePath = path.split("?", 1)[0];
-  const mac = feedRequestMac(feedKey, method, barePath, ts);
-  return `${FEED_AUTH_PREFIX}${ts}:${mac}`;
+  return `${ts}:${feedRequestMac(feedKey, method, barePath, ts)}`;
 }

@@ -95,8 +95,9 @@ describe("runHistory", () => {
 
     const { client, getSlot } = makeStub({
       slots: [
+        // Ascending by seq, as the relay lists them.
+        { seq: 1, slot_id: "s1", created_at: NOW - 20 },
         { seq: 2, slot_id: "s2", created_at: NOW - 10 },
-        { seq: 1, slot_id: "s1", created_at: NOW - 20 }, // out of order on purpose
       ],
     });
     const { rows, maxCursor } = await runHistory(makeParams(client));

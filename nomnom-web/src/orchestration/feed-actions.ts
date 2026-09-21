@@ -44,19 +44,22 @@ function memberCard(identity: Identity, memberId: string): Member {
 
 /**
  * TOFU one member: prompt (or auto-trust) and pin on accept. Skips self,
- * identities already in `knownInCache`, and already-pinned ones. Advisory —
- * it pins on accept but never blocks; validly-signed posts are always
- * delivered, matching the CLI.
+ * identities already in `known`, and already-pinned ones; every identity it
+ * considers is added to `known` so a later sighting never re-prompts.
+ * Advisory — it pins on accept but never blocks; validly-signed posts are
+ * always delivered, matching the CLI.
  */
 export async function tofuMember(
   m: Member,
   ctx: FeedContext,
   hooks: TofuHooks,
-  knownInCache: Set<string>,
+  known: Set<string>,
 ): Promise<void> {
   if (!m || m.member_id === ctx.feed.member_id) return;
   const sigPub = m.identity_pubkey;
-  if (!sigPub || knownInCache.has(sigPub) || hooks.isPinned(sigPub)) return;
+  if (!sigPub || known.has(sigPub)) return;
+  known.add(sigPub);
+  if (hooks.isPinned(sigPub)) return;
   const name = m.name || "(no name)";
   const ok = hooks.trustNew
     ? true
@@ -64,15 +67,24 @@ export async function tofuMember(
   if (ok) hooks.pinPeer(sigPub, name);
 }
 
-/** Fetch the live roster and prompt TOFU on any newly-seen identities. */
+/** Identities the feed's cached roster already vouched for. */
+export function knownIdentities(feed: Feed): Set<string> {
+  return new Set((feed.members_cache ?? []).map((m) => m.identity_pubkey));
+}
+
+/**
+ * Fetch the live roster and prompt TOFU on any newly-seen identities. `known`
+ * defaults to the cached roster; a long-lived caller passes its own set so
+ * later member frames share it.
+ */
 export async function refreshRoster(
   ctx: FeedContext,
   hooks: TofuHooks,
   signal?: AbortSignal,
+  known: Set<string> = knownIdentities(ctx.feed),
 ): Promise<Member[]> {
   const roster = await ctx.client.listMembers(ctx.feed.feed_id, ctx.feedKey, { signal });
-  const knownInCache = new Set((ctx.feed.members_cache ?? []).map((m) => m.identity_pubkey));
-  for (const m of roster) await tofuMember(m, ctx, hooks, knownInCache);
+  for (const m of roster) await tofuMember(m, ctx, hooks, known);
   return roster;
 }
 

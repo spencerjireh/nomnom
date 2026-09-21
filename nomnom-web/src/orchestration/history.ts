@@ -69,13 +69,9 @@ export async function runHistory(p: HistoryParams): Promise<HistoryResult> {
 
   // Resume the live watch after the newest slot that existed now — computed from
   // the list, not per-slot success, so a post that fails to fetch/decode this
-  // round is simply absent until the next refresh (never a duplicate).
-  let maxCursor = p.feed.last_seq;
-  for (const s of slots) maxCursor = Math.max(maxCursor, s.seq ?? 0);
-
-  // The relay lists ascending by seq; sort defensively so the reversed result
-  // is newest-first.
-  slots.sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0));
+  // round is simply absent until the next refresh (never a duplicate). The
+  // relay lists ascending by seq, so the newest is last.
+  const maxCursor = slots.length ? Math.max(p.feed.last_seq, slots[slots.length - 1].seq) : p.feed.last_seq;
 
   // Fetch + decrypt with bounded concurrency (overlaps network waits) instead of
   // strictly serially. mapLimit preserves slot order, so the oldest-first input
@@ -110,7 +106,7 @@ export async function runHistory(p: HistoryParams): Promise<HistoryResult> {
         return null; // foreign / tampered / undecryptable post
       }
 
-      const at = header.pa ? header.pa * 1000 : (slot.created_at ?? 0) * 1000;
+      const at = (header.pa || slot.created_at) * 1000;
 
       if (header.smid === ctx.feed.member_id) {
         // Our own post — reconstruct as a delivered send row (no body needed).

@@ -5034,13 +5034,9 @@ def _raise_relay_error(status: int, body: bytes) -> NoReturn:
             "relay rejected authentication (wrong secret?). "
             "run `nomnom relay test` to diagnose.",
         )
-    # Malformed ids arrive as 400 (older relays sent 403); both stay specific.
-    if status in (400, 403):
-        raise NomnomError(f"relay refused slot id: {reason or '(no detail)'}")
-    if status == 409:
-        raise NomnomError("relay slot already occupied")
-    if status == 413:
-        raise NomnomError("payload too large for relay (256 MB max; 100 MB on free tier)")
+    # The only HMAC-gated write is POST /feeds; its failures are card-shaped.
+    if status in (400, 403, 413):
+        raise NomnomError(f"relay refused request: {reason or '(no detail)'}")
     raise NomnomError(f"relay returned HTTP {status}: {reason or '(no body)'}")
 
 
@@ -5062,14 +5058,14 @@ def _relay_self_test(relay: dict) -> tuple[int, str]:
     blob = secrets.token_bytes(1024)
     slot = "selftest-" + secrets.token_urlsafe(9)
     start = time.monotonic()
-    feed_id = ""
-    feed_key = b""
-    got: bytes | None = None
     try:
         feed_id = str(_relay_mint_feed(relay, member_card=card).get("feed_id") or "")
-        if not feed_id:
-            return 1, "relay minted a feed without a feed_id"
-        feed_key = _feed_key_from_token(feed_id)
+    except NomnomError as e:
+        return 1, str(e)
+    if not feed_id:
+        return 1, "relay minted a feed without a feed_id"
+    feed_key = _feed_key_from_token(feed_id)
+    try:
         status, data = _feed_request_on(
             relay, feed_key, "PUT", f"/feeds/{feed_id}/slots/{slot}", body=blob,
         )
@@ -5083,11 +5079,10 @@ def _relay_self_test(relay: dict) -> tuple[int, str]:
     except NomnomError as e:
         return 1, str(e)
     finally:
-        if feed_id:
-            try:
-                _feed_request_on(relay, feed_key, "DELETE", f"/feeds/{feed_id}")
-            except NomnomError:
-                pass  # best-effort cleanup; the relay purges idle feeds anyway
+        try:
+            _feed_request_on(relay, feed_key, "DELETE", f"/feeds/{feed_id}")
+        except NomnomError:
+            pass  # best-effort cleanup; the relay purges idle feeds anyway
     if got != blob:
         return 1, "relay round-trip body mismatch (storage wrong?)"
     elapsed_ms = int((time.monotonic() - start) * 1000)
@@ -5343,6 +5338,18 @@ def _receive_refresh_roster(
         _persist_members_cache(feed)
 
 
+def _new_posts(entries: list, last_seq: int):
+    """Yield (seq, slot_id) for the entries past the cursor, in relay order.
+
+    Shared by `cmd_receive` and the TUI's receive screen so the entry shape
+    and the at-or-below-cursor skip live in one place."""
+    for entry in entries:
+        slot_id = entry.get("slot_id")
+        seq = int(entry.get("seq") or 0)
+        if slot_id and seq > last_seq:
+            yield seq, slot_id
+
+
 def _receive_persist_seq(feed: Feed, last_seq: int) -> None:
     """Persist last_seq so a restart doesn't re-fetch already-seen posts."""
     cfg = _load_feeds_config()
@@ -5393,12 +5400,7 @@ def cmd_receive(*, once: bool = False, trust_new: bool = False) -> int:
                 sys.stderr.write("no transfer (waited 30s)\n")
                 return 0 if received_any else 1
             continue
-        # Ascending by seq (the Worker orders the list).
-        for entry in slots:
-            slot_id = entry.get("slot_id")
-            seq = int(entry.get("seq") or 0)
-            if not slot_id or seq <= last_seq:
-                continue
+        for seq, slot_id in _new_posts(slots, last_seq):
             try:
                 landed = _receive_and_report(
                     feed=target, host=host, feed_key=feed_key, slot_id=slot_id,
@@ -6356,11 +6358,7 @@ class ReceiveScreen(Screen):
                 if kind == "error":
                     self.status = f"relay error: {payload}"
                     continue
-                for entry in payload:  # kind == "slots", ascending by seq
-                    slot_id = entry.get("slot_id")
-                    seq = int(entry.get("seq") or 0)
-                    if not slot_id or seq <= self.last_seq:
-                        continue
+                for seq, slot_id in _new_posts(payload, self.last_seq):  # kind == "slots"
                     if not self._handle_slot(slot_id):
                         break  # leave the cursor put; the worker re-lists
                     self.last_seq = seq
