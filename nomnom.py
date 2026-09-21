@@ -4267,24 +4267,29 @@ def feed_open(
 # ---------- feeds.json local store ----------
 #
 # Local persistence of joined feeds. One small file at ~/.config/nomnom/feeds.json
-# tracks every feed this device has opened or joined: nickname, URL token,
-# expiry, the member id this device uses inside the feed, a roster cache (for
-# UI / TOFU prompts), and the last-seen post timestamp (for resume).
+# tracks every feed this device has opened or joined: nickname, URL token, the
+# member id this device uses inside the feed, a roster cache (for UI / TOFU
+# prompts), and the highest post seq processed so far (for resume).
 #
 # Schema:
 #   {
-#     "version": 1,
+#     "version": 2,
 #     "default": "<nickname>" | null,
 #     "feeds": [Feed.to_dict(), ...]
 #   }
+#
+# Version 2 switched the cursor from a unix timestamp (`last_post_ts`) to the
+# relay's monotonic `seq` (`last_seq`) and dropped `expires_at`. A v1 file is
+# ignored on load (read as "no channel"): its feed no longer exists on the
+# rewritten relay, and "run `nomnom init` / `nomnom join`" is the right prompt.
 
-_FEEDS_CONFIG_SCHEMA = 1
+_FEEDS_CONFIG_SCHEMA = 2
 
-# nomnom has exactly one "channel": a single permanent feed shared across all of
-# a user's own devices. It's stored as the lone entry in feeds.json under this
-# fixed name. `_PERMANENT_TTL_SEC` matches the relay Worker's raised TTL cap.
+# nomnom has exactly one "channel": a single feed shared across all of a user's
+# own devices. It's stored as the lone entry in feeds.json under this fixed
+# name. The relay keeps it alive while any device uses it and purges it after
+# 30 days of inactivity; posts age out 30 days after creation.
 _CHANNEL_NAME = "channel"
-_PERMANENT_TTL_SEC = 3650 * 86_400  # ~10 years
 
 
 @dataclass
@@ -4300,11 +4305,10 @@ class Feed:
     feed_id: str
     feed_token: str
     url: str
-    expires_at: int
     joined_at: int
     member_id: str
     members_cache: list[dict] = field(default_factory=list)
-    last_post_ts: int = 0
+    last_seq: int = 0
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -4319,11 +4323,10 @@ class Feed:
                 feed_id=str(d["feed_id"]),
                 feed_token=str(d.get("feed_token", d["feed_id"])),
                 url=str(d["url"]),
-                expires_at=int(d["expires_at"]),
                 joined_at=int(d["joined_at"]),
                 member_id=str(d["member_id"]),
                 members_cache=list(d.get("members_cache", [])),
-                last_post_ts=int(d.get("last_post_ts", 0)),
+                last_seq=int(d.get("last_seq", 0)),
             )
         except (KeyError, TypeError, ValueError) as e:
             raise ValueError(f"feed entry missing/invalid field: {e}") from e
@@ -4458,17 +4461,12 @@ def _persist_members_cache(feed: Feed) -> None:
 
 # ---------- Relay transport ----------
 # nomnom moves files through a Cloudflare Worker the user deploys to their
-# own account. The Worker is intentionally dumb: it stores HMAC-authenticated
-# PUTs at slot ids, holds GETs open for up to 30 seconds (long-poll), and
-# deletes slots on read.
-#
-# Three slots per recurring transfer: <base>_i (initiator's handshake),
-# <base>_r (responder's handshake), <base>_d (ciphertext). The base is
-# derived from the long-term DH shared secret between two pinned peers.
-#
-# First contact runs a separate identity-only pair (`_relay_pair`) at the
-# per-relay rendezvous slot, then sender/receiver use the recurring slots
-# above.
+# own account. The Worker is a blind board: each feed is an append-only index
+# of ciphertext posts with a monotonic `seq` cursor, kept for 30 days. The CLI
+# long-polls `GET /feeds/:id/slots?since=<seq>&wait=` (the Worker holds the
+# request open for up to 30 seconds until a post lands), then fetches each
+# post body. The relay HMAC secret gates minting; a per-feed key derived from
+# the feed URL signs everything else.
 
 _RELAY_AUTH_PREFIX = "NMNM-HMAC-SHA256 "
 _RELAY_MAX_BODY = 256 * 1024 * 1024          # 256 MiB; free tier caps at 100 MiB at edge
@@ -4621,10 +4619,10 @@ def _relay_hmac_headers(secret: str, method: str, path: str) -> dict[str, str]:
     """Authorization header for a single relay request.
 
     The MAC covers (method, path-without-query, unix_ts). It does NOT cover
-    the request body — body integrity comes from the AEAD wrapper inside
-    slot_data. The relay's HMAC authenticates the client; it does not vouch
-    for the payload. The query string is stripped because it carries
-    transient hints (wait=...) that the Worker signs path-only.
+    the request body — body integrity comes from the AEAD wrapper inside each
+    post. The relay's HMAC authenticates the client; it does not vouch for
+    the payload. The query string is stripped because it carries transient
+    hints (wait=..., since=...) that the Worker signs path-only.
     """
     bare_path = path.split("?", 1)[0]
     ts = str(int(time.time()))
@@ -4750,39 +4748,11 @@ def _relay_request(
 def _qs(**params: int) -> str:
     """Build `?k=v&...` from positive int kwargs; empty string if none apply.
 
-    Zero/negative params are omitted, so `since=0` can't be sent explicitly —
-    the Worker treats an absent `since` as 0, which is the same thing."""
+    Zero/negative params are omitted, so `since=0` can't be sent explicitly.
+    That is a relay contract: the Worker treats an absent `since` as 0 (from
+    the beginning), which is the same thing."""
     parts = [f"{k}={int(v)}" for k, v in params.items() if v and v > 0]
     return ("?" + "&".join(parts)) if parts else ""
-
-
-def _relay_put_slot(relay: dict, slot_id: str, body: bytes) -> None:
-    if len(body) > _RELAY_MAX_BODY:
-        raise NomnomError(
-            f"payload too large for relay: {len(body)} > {_RELAY_MAX_BODY} bytes",
-        )
-    status, data = _relay_request(relay, "PUT", f"/slots/{slot_id}", body=body)
-    if status == 204:
-        return
-    _raise_relay_error(status, data)
-
-
-def _relay_get_slot(relay: dict, slot_id: str, *, wait_ms: int = 0) -> bytes | None:
-    """Returns the slot body on 200, None on 404 (poll timeout / empty)."""
-    status, data = _relay_request(relay, "GET", f"/slots/{slot_id}{_qs(wait=wait_ms)}")
-    if status == 200:
-        return data
-    if status == 404:
-        return None
-    _raise_relay_error(status, data)
-
-
-def _relay_delete_slot(relay: dict, slot_id: str) -> None:
-    """Best-effort cleanup; swallows network errors."""
-    try:
-        _relay_request(relay, "DELETE", f"/slots/{slot_id}")
-    except NomnomError:
-        pass
 
 
 # --- feed-key-signed HTTP (parallel to the relay HMAC scheme above) ---
@@ -4828,6 +4798,29 @@ def _feed_auth_headers(feed_key: bytes, method: str, path: str) -> dict[str, str
     }
 
 
+def _feed_request_on(
+    relay: dict,
+    feed_key: bytes,
+    method: str,
+    path: str,
+    *,
+    body: bytes | None = None,
+    content_type: str = "application/octet-stream",
+) -> tuple[int, bytes]:
+    """One-shot feed-key-signed request against an explicit relay dict.
+
+    `_feed_request` builds that dict from a host via `_feed_relay_dict`, which
+    consults the SAVED relay config for the private-address opt-in. The self-
+    test runs before any config exists (during `relay init`), so it passes the
+    in-flight relay dict here directly."""
+    full_path = _relay_full_path(relay, path)
+    headers = _feed_auth_headers(feed_key, method, full_path)
+    return _http_send(
+        relay, method, full_path,
+        body=body, headers=headers, content_type=content_type,
+    )
+
+
 def _feed_request(
     host: str,
     feed_key: bytes,
@@ -4838,12 +4831,9 @@ def _feed_request(
     content_type: str = "application/octet-stream",
 ) -> tuple[int, bytes]:
     """One-shot feed-key-signed request. Returns (status, body)."""
-    relay = _feed_relay_dict(host)
-    full_path = _relay_full_path(relay, path)
-    headers = _feed_auth_headers(feed_key, method, full_path)
-    return _http_send(
-        relay, method, full_path,
-        body=body, headers=headers, content_type=content_type,
+    return _feed_request_on(
+        _feed_relay_dict(host), feed_key, method, path,
+        body=body, content_type=content_type,
     )
 
 
@@ -4879,20 +4869,15 @@ def _raise_feed_error(status: int, body: bytes) -> NoReturn:
         raise NomnomError("feed not found on relay")
     if status == 409:
         raise NomnomError(f"relay returned 409: {reason or '(no detail)'}")
-    if status == 410:
-        raise NomnomError("feed has expired on the relay")
     if status == 413:
         raise NomnomError("payload too large for relay")
     raise NomnomError(f"relay returned HTTP {status}: {reason or '(no body)'}")
 
 
-def _relay_mint_feed(
-    relay: dict, *, ttl_seconds: int, member_card: dict,
-) -> dict:
-    """POST /feeds — HMAC-gated. Returns {feed_id, expires_at, created_at}."""
+def _relay_mint_feed(relay: dict, *, member_card: dict) -> dict:
+    """POST /feeds — HMAC-gated. Returns {feed_id, created_at}."""
     body = json.dumps(
-        {"ttl_seconds": int(ttl_seconds), "member_card": member_card},
-        separators=(",", ":"),
+        {"member_card": member_card}, separators=(",", ":"),
     ).encode("utf-8")
     status, data = _relay_request(
         relay, "POST", "/feeds", body=body,
@@ -4965,16 +4950,6 @@ def _relay_list_members(
     )
 
 
-def _relay_extend_feed(
-    host: str, feed_id: str, feed_key: bytes, new_ttl_seconds: int,
-) -> dict:
-    body = json.dumps({"new_ttl_seconds": int(new_ttl_seconds)}).encode("utf-8")
-    return _feed_json(
-        host, feed_key, "POST", f"/feeds/{feed_id}/extend",
-        body=body, content_type="application/json",
-    )
-
-
 def _relay_close_feed(host: str, feed_id: str, feed_key: bytes) -> None:
     status, data = _feed_request(
         host, feed_key, "DELETE", f"/feeds/{feed_id}",
@@ -5002,7 +4977,6 @@ def _relay_put_feed_slot(
 
 def _relay_get_feed_slot(
     host: str, feed_id: str, feed_key: bytes, slot_id: str,
-    *, wait_ms: int = 0,
 ) -> bytes | None:
     # 200 -> bytes, 404 -> None (slot gone; a permanent, advance-safe outcome).
     # Everything else — a network error or a non-404 status — is a transient
@@ -5012,8 +4986,7 @@ def _relay_get_feed_slot(
     # and permanently drop an unread post.
     try:
         status, data = _feed_request(
-            host, feed_key, "GET",
-            f"/feeds/{feed_id}/slots/{slot_id}{_qs(wait=wait_ms)}",
+            host, feed_key, "GET", f"/feeds/{feed_id}/slots/{slot_id}",
         )
     except NomnomError as e:
         raise NomnomTransportError(str(e)) from e
@@ -5029,114 +5002,17 @@ def _relay_get_feed_slot(
 
 def _relay_list_feed_slots(
     host: str, feed_id: str, feed_key: bytes,
-    *, since_ts: int = 0, wait_ms: int = 0,
+    *, since_seq: int = 0, wait_ms: int = 0,
 ) -> list:
+    """Posts with seq > since_seq, ascending: [{seq, slot_id, created_at}].
+
+    With `wait_ms`, the Worker holds the request open (up to 30 s) until a post
+    lands, so an empty list means the wait timed out."""
     parsed = _feed_json(
         host, feed_key, "GET",
-        f"/feeds/{feed_id}/slots{_qs(wait=wait_ms, since=since_ts)}",
+        f"/feeds/{feed_id}/slots{_qs(wait=wait_ms, since=since_seq)}",
     )
     return parsed.get("slots") or []
-
-
-# --- SSE slot stream (real-time push; stdlib-only streaming GET) ---
-
-_STREAM_SOCKET_TIMEOUT = 40.0   # > the relay's 20s SSE heartbeat; detects a dead link
-_STREAM_RECONNECT_S = 1.0       # backoff before reopening after a drop / the ~4min cap
-_STREAM_MAX_LINE = 64 * 1024    # cap a single SSE line (frames are tiny JSON)
-
-
-class _StreamUnsupported(Exception):
-    """The relay has no /stream endpoint (predates SSE). Caller long-polls."""
-
-
-def _feed_stream_lines(host: str, feed_key: bytes, path: str):
-    """Yield decoded SSE lines from one long-lived feed-key-signed GET.
-
-    Reads the response line by line (chunk-aware via HTTPResponse.readline) so
-    notifications surface as they arrive. Raises `_StreamUnsupported` on 404 (no
-    endpoint) and `NomnomError` on other non-200s or an initial connect failure.
-    A mid-stream read error or EOF (the relay's ~4min cap) ends the generator;
-    the caller reconnects.
-    """
-    relay = _feed_relay_dict(host)
-    full_path = _relay_full_path(relay, path)
-    headers = _feed_auth_headers(feed_key, "GET", full_path)
-    headers["Accept"] = "text/event-stream"
-    try:
-        conn = _relay_open(relay, timeout=_STREAM_SOCKET_TIMEOUT)
-    except (OSError, http.client.HTTPException) as e:
-        raise NomnomError(f"relay stream connect failed: {e}") from e
-    try:
-        try:
-            conn.request("GET", full_path, headers=headers)
-            resp = conn.getresponse()
-        except (OSError, http.client.HTTPException) as e:
-            raise NomnomError(f"relay stream request failed: {e}") from e
-        if resp.status == 404:
-            try:
-                resp.read()
-            except (OSError, http.client.HTTPException):
-                pass
-            raise _StreamUnsupported()
-        if resp.status != 200:
-            body = resp.read(_RELAY_MAX_BODY + 1)
-            _raise_feed_error(resp.status, body)
-        while True:
-            try:
-                line = resp.readline(_STREAM_MAX_LINE)
-            except (OSError, http.client.HTTPException):
-                return  # transient drop — caller reconnects
-            if not line:
-                return  # EOF: server closed (cap reached) — caller reconnects
-            yield line.decode("utf-8", errors="replace").rstrip("\r\n")
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
-
-
-def _relay_stream_feed_slots(
-    host: str, feed_id: str, feed_key: bytes,
-    *, since_fn, stop: "threading.Event | None" = None,
-):
-    """Yield `{slot_id, created_at}` as posts arrive, over SSE, reconnecting.
-
-    `since_fn()` is read at each (re)connect so replay resumes from the caller's
-    current cursor (the feed-key MAC is freshly signed each time, keeping its
-    timestamp inside the relay's skew window). Stops when `stop` is set.
-    Propagates `_StreamUnsupported` / `NomnomError`; a transient drop or the
-    server's ~4min cap reconnects after a short backoff.
-    """
-    while stop is None or not stop.is_set():
-        since = max(0, int(since_fn()))
-        path = f"/feeds/{feed_id}/stream{_qs(since=since)}"
-        for line in _feed_stream_lines(host, feed_key, path):
-            if stop is not None and stop.is_set():
-                return
-            if not line.startswith("data:"):
-                continue  # comment (": ping"/": ok"), id line, or blank
-            payload = line[len("data:"):].strip()
-            if not payload:
-                continue
-            try:
-                obj = json.loads(payload)
-            except json.JSONDecodeError:
-                continue
-            slot_id = obj.get("slot_id")
-            if not isinstance(slot_id, str):
-                continue
-            created_at = obj.get("created_at")
-            yield {
-                "slot_id": slot_id,
-                "created_at": int(created_at)
-                if isinstance(created_at, (int, float)) else 0,
-            }
-        # Stream ended (drop or cap). Back off, then reconnect from the cursor.
-        if stop is None:
-            time.sleep(_STREAM_RECONNECT_S)
-        elif stop.wait(_STREAM_RECONNECT_S):
-            return
 
 
 def _relay_health(relay: dict) -> bool:
@@ -5163,8 +5039,6 @@ def _raise_relay_error(status: int, body: bytes) -> NoReturn:
         raise NomnomError(f"relay refused slot id: {reason or '(no detail)'}")
     if status == 409:
         raise NomnomError("relay slot already occupied")
-    if status == 410:
-        raise NomnomError("relay slot expired")
     if status == 413:
         raise NomnomError("payload too large for relay (256 MB max; 100 MB on free tier)")
     raise NomnomError(f"relay returned HTTP {status}: {reason or '(no body)'}")
@@ -5174,70 +5048,50 @@ def _raise_relay_error(status: int, body: bytes) -> NoReturn:
 
 
 def _relay_self_test(relay: dict) -> tuple[int, str]:
-    """End-to-end check: /health, then a round-trip PUT + GET on a random slot."""
+    """End-to-end check: /health, then mint a throwaway feed (proves the HMAC
+    secret), round-trip a 1 KB post through it with the feed key, and delete
+    the feed. Signs feed requests against `relay` directly (not the saved
+    config) so it works during `relay init`, before relay.json exists."""
     if not _relay_health(relay):
         return 1, "relay /health unreachable (URL wrong, or worker not deployed)"
-    slot = "selftest-" + secrets.token_urlsafe(16)
+    card = {
+        "member_id": secrets.token_hex(16),
+        "identity_pubkey": "00" * 32,
+        "name": "nomnom-selftest",
+    }
     blob = secrets.token_bytes(1024)
+    slot = "selftest-" + secrets.token_urlsafe(9)
     start = time.monotonic()
+    feed_id = ""
+    feed_key = b""
+    got: bytes | None = None
     try:
-        _relay_put_slot(relay, slot, blob)
-        got = _relay_get_slot(relay, slot, wait_ms=5000)
+        feed_id = str(_relay_mint_feed(relay, member_card=card).get("feed_id") or "")
+        if not feed_id:
+            return 1, "relay minted a feed without a feed_id"
+        feed_key = _feed_key_from_token(feed_id)
+        status, data = _feed_request_on(
+            relay, feed_key, "PUT", f"/feeds/{feed_id}/slots/{slot}", body=blob,
+        )
+        if status != 204:
+            _raise_feed_error(status, data)
+        status, got = _feed_request_on(
+            relay, feed_key, "GET", f"/feeds/{feed_id}/slots/{slot}",
+        )
+        if status != 200:
+            _raise_feed_error(status, got)
     except NomnomError as e:
         return 1, str(e)
+    finally:
+        if feed_id:
+            try:
+                _feed_request_on(relay, feed_key, "DELETE", f"/feeds/{feed_id}")
+            except NomnomError:
+                pass  # best-effort cleanup; the relay purges idle feeds anyway
     if got != blob:
-        return 1, "relay round-trip body mismatch (HMAC or storage wrong?)"
+        return 1, "relay round-trip body mismatch (storage wrong?)"
     elapsed_ms = int((time.monotonic() - start) * 1000)
     return 0, f"relay ok (RTT {elapsed_ms}ms)"
-
-
-# --- slot derivation + bindings ---
-
-
-def _slot_b64(digest: bytes) -> str:
-    """URL-safe base64 with no padding."""
-    return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
-
-
-# --- first-contact rendezvous (replaces pairing-code slot/binding) ---
-
-_FIRST_CONTACT_BINDING_TAG = b"nomnom-first-contact-v2"
-_FIRST_CONTACT_RENDEZVOUS_TAG = b"nomnom-rendezvous-v1"
-_FIRST_CONTACT_RESP_TAG = b"nomnom-rendezvous-resp-v1"
-
-# scrypt parameters for the first-contact binding. N=2^16 takes ~200ms on a
-# laptop; r=8/p=1/dklen=32 match common defaults. The KDF cost slows offline
-# brute-force on a captured transcript by ~10^6x, so even a short random secret
-# isn't an instant kill if the relay log ever leaks.
-_FIRST_CONTACT_SCRYPT_N = 2 ** 16
-_FIRST_CONTACT_SCRYPT_R = 8
-_FIRST_CONTACT_SCRYPT_P = 1
-
-
-# Send / receive run a three-message handshake over the Worker (recurring
-# mode, after pairing):
-#   sender PUTs <base>_i (init blob: sender's identity + ephemeral pubkeys)
-#   receiver GETs <base>_i (long-poll), PUTs <base>_r (resp blob)
-#   sender GETs <base>_r (long-poll), encrypts data, PUTs <base>_d
-#   receiver GETs <base>_d (long-poll), decrypts, writes
-# `binding` mixes the symmetric peer-pair tag into the triple-DH transcript
-# so both sides need the same shared context to arrive at the same session
-# key.
-#
-# First contact uses `_relay_pair` (identity-only, race-decided). See its
-# block-comment for the protocol.
-
-_RELAY_INIT_MAGIC = "nomnom-init-v1"
-_RELAY_RESP_MAGIC = "nomnom-resp-v1"
-_RELAY_PAIR_MAGIC = "nomnom-pair-v1"
-
-
-# Two-message identity exchange, decoupled from the send/receive ciphertext
-# pipeline. Both sides invoke `nomnom pair`; race-decided role:
-#   PUT pair_i succeeds   -> initiator. Long-poll pair_r_<own_ik>_p.
-#   PUT pair_i 409s       -> responder. GET pair_i, PUT pair_r_<their_ik>_p.
-# No DH, no session key, no payload. TOFU prompt + out-of-band fingerprint
-# check is the trust gate, same as before.
 
 
 def _the_channel() -> Feed | None:
@@ -5454,7 +5308,7 @@ def _receive_and_report(
 ) -> bool:
     """Fetch/verify/write one post and narrate to stderr. True iff a file landed.
 
-    Shared by the SSE and long-poll receive paths so tamper handling
+    Shared by `cmd_receive` and the TUI's receive screen so tamper handling
     (raise -> warn + skip) stays identical between them.
 
     Propagates NomnomTransportError (a transient fetch failure) so the caller can
@@ -5489,72 +5343,22 @@ def _receive_refresh_roster(
         _persist_members_cache(feed)
 
 
-def _receive_persist_ts(feed: Feed, last_ts: int) -> None:
-    """Persist last_post_ts so a restart doesn't re-fetch already-seen posts."""
+def _receive_persist_seq(feed: Feed, last_seq: int) -> None:
+    """Persist last_seq so a restart doesn't re-fetch already-seen posts."""
     cfg = _load_feeds_config()
     existing = _find_feed(cfg, feed.name)
-    if existing is not None and existing.last_post_ts != last_ts:
-        existing.last_post_ts = last_ts
+    if existing is not None and existing.last_seq != last_seq:
+        existing.last_seq = last_seq
         _save_feeds_config(cfg)
-
-
-def _cmd_receive_stream(
-    target: Feed, host: str, feed_key: bytes, last_ts: int, trust_new: bool,
-) -> int:
-    """Watch via the SSE /stream endpoint (real-time push).
-
-    Reuses `_receive_one_post` for fetch/verify/write. Refreshes the roster (+
-    TOFU) before each post so new senders resolve. Raises `_StreamUnsupported`
-    if the relay has no /stream (caller falls back to long-poll); handles
-    Ctrl-C and relay errors internally.
-    """
-    received_any = False
-    try:
-        # Prime the roster so the very first post can name its sender.
-        _receive_refresh_roster(target, host, feed_key, trust_new)
-        for entry in _relay_stream_feed_slots(
-            host, target.feed_id, feed_key, since_fn=lambda: last_ts,
-        ):
-            slot_id = entry.get("slot_id")
-            created_at = int(entry.get("created_at") or 0)
-            if not slot_id or created_at <= last_ts:
-                if created_at > last_ts:
-                    last_ts = created_at
-                    _receive_persist_ts(target, last_ts)
-                continue
-            # Refresh before each post so a just-joined sender resolves + TOFUs.
-            _receive_refresh_roster(target, host, feed_key, trust_new)
-            try:
-                landed = _receive_and_report(
-                    feed=target, host=host, feed_key=feed_key, slot_id=slot_id,
-                )
-            except NomnomTransportError as e:
-                # Transport hiccup fetching this slot — do NOT advance the cursor
-                # or we'd permanently drop an unread post. Leaving last_ts put
-                # lets the next event re-surface it.
-                sys.stderr.write(f"warning: {e}\n")
-                continue
-            if landed:
-                received_any = True
-            if created_at > last_ts:
-                last_ts = created_at
-            _receive_persist_ts(target, last_ts)
-    except KeyboardInterrupt:
-        sys.stderr.write("\n")
-        return 0 if received_any else 130
-    except NomnomError as e:
-        sys.stderr.write(f"error: {e}\n")
-        return 1
-    return 0
 
 
 def cmd_receive(*, once: bool = False, trust_new: bool = False) -> int:
     """Watch your channel for new files; write each to cwd.
 
-    Continuous mode pushes via the SSE /stream endpoint (falling back to the
-    /slots long-poll if the relay has no /stream). `--once` uses the long-poll
-    directly. Each new post is decrypted, signature-verified, and written to
-    disk (collisions auto-rename). Ctrl-C exits cleanly.
+    Long-polls the relay's post index from the persisted `seq` cursor (the
+    Worker holds each request open for up to 30 s until a post lands). Each
+    new post is decrypted, signature-verified, and written to disk (collisions
+    auto-rename). Ctrl-C exits cleanly.
     """
     target = _resolve_target_feed()
     if target is None:
@@ -5567,22 +5371,7 @@ def cmd_receive(*, once: bool = False, trust_new: bool = False) -> int:
         sys.stderr.write("watching for files (Ctrl-C to exit)...\n")
         sys.stderr.flush()
 
-    last_ts = target.last_post_ts
-    if not once:
-        try:
-            return _cmd_receive_stream(target, host, feed_key, last_ts, trust_new)
-        except _StreamUnsupported:
-            sys.stderr.write(
-                "note: relay has no /stream endpoint; using long-poll.\n",
-            )
-            sys.stderr.flush()
-            # The stream path persisted its cursor into feeds.json, not into
-            # our local `target`; re-read so the long-poll resumes where the
-            # stream left off instead of replaying already-received posts.
-            ch = _the_channel()
-            if ch is not None:
-                last_ts = ch.last_post_ts
-            # fall through to the long-poll loop below
+    last_seq = target.last_seq
     while True:
         # Roster refresh + TOFU prompts before each slot long-poll. Up to a
         # 30s lag between a new member joining and the prompt firing, but
@@ -5591,7 +5380,7 @@ def cmd_receive(*, once: bool = False, trust_new: bool = False) -> int:
         try:
             slots = _relay_list_feed_slots(
                 host, target.feed_id, feed_key,
-                since_ts=last_ts, wait_ms=30_000,
+                since_seq=last_seq, wait_ms=_RELAY_DEFAULT_WAIT_MS,
             )
         except KeyboardInterrupt:
             sys.stderr.write("\n")
@@ -5604,26 +5393,26 @@ def cmd_receive(*, once: bool = False, trust_new: bool = False) -> int:
                 sys.stderr.write("no transfer (waited 30s)\n")
                 return 0 if received_any else 1
             continue
-        # Iterate in chronological order; the Worker already sorts by created_at.
+        # Ascending by seq (the Worker orders the list).
         for entry in slots:
             slot_id = entry.get("slot_id")
-            created_at = int(entry.get("created_at") or 0)
-            landed = False
-            if slot_id:
-                try:
-                    landed = _receive_and_report(
-                        feed=target, host=host, feed_key=feed_key, slot_id=slot_id,
-                    )
-                except NomnomTransportError as e:
-                    # Transport hiccup fetching this slot — leave the cursor put
-                    # so the next long-poll re-lists it instead of skipping it
-                    # forever. Advancing here would permanently drop the post.
-                    sys.stderr.write(f"warning: {e}\n")
-                    continue
-                if landed:
-                    received_any = True
-            last_ts = max(last_ts, created_at)
-            _receive_persist_ts(target, last_ts)
+            seq = int(entry.get("seq") or 0)
+            if not slot_id or seq <= last_seq:
+                continue
+            try:
+                landed = _receive_and_report(
+                    feed=target, host=host, feed_key=feed_key, slot_id=slot_id,
+                )
+            except NomnomTransportError as e:
+                # Transport hiccup fetching this slot — leave the cursor put and
+                # stop consuming this batch, so the next long-poll re-lists it
+                # instead of a later entry advancing past it forever.
+                sys.stderr.write(f"warning: {e}\n")
+                break
+            if landed:
+                received_any = True
+            last_seq = seq
+            _receive_persist_seq(target, last_seq)
             if once and landed:
                 return 0
 
@@ -5779,25 +5568,19 @@ def cmd_init(args) -> int:
         "name": ident["name"],
     }
     # NomnomError propagates to the dispatcher, which prints + returns 1.
-    result = _relay_mint_feed(
-        relay, ttl_seconds=_PERMANENT_TTL_SEC, member_card=card,
-    )
+    result = _relay_mint_feed(relay, member_card=card)
 
     feed_id = str(result.get("feed_id") or "")
     if not feed_id:
         sys.stderr.write("error: relay did not return a feed_id.\n")
         return 1
     created_at = int(result.get("created_at") or time.time())
-    expires_at = int(
-        result.get("expires_at") or (created_at + _PERMANENT_TTL_SEC),
-    )
     host = _relay_split_url(relay["url"])[0]
     feed = Feed(
         name=_CHANNEL_NAME,
         feed_id=feed_id,
         feed_token=feed_id,
         url=_format_feed_url(host, feed_id),
-        expires_at=expires_at,
         joined_at=created_at,
         member_id=member_id,
         members_cache=[
@@ -5873,7 +5656,7 @@ def _join_channel(secret: str) -> "Feed":
     host, feed_id = _parse_feed_url(secret)
     feed_key = _feed_key_from_token(feed_id)
     # Probe the channel exists + the secret is correct before publishing.
-    meta = _relay_get_feed_meta(host, feed_id, feed_key)
+    _relay_get_feed_meta(host, feed_id, feed_key)  # 404s here if the URL is wrong
     ident = _load_identity()
     member_id = secrets.token_hex(16)
     card = {
@@ -5888,7 +5671,6 @@ def _join_channel(secret: str) -> "Feed":
         feed_id=feed_id,
         feed_token=feed_id,
         url=_format_feed_url(host, feed_id),
-        expires_at=int(meta.get("expires_at") or 0),
         joined_at=int(time.time()),
         member_id=member_id,
         members_cache=list(roster.get("members") or []),
@@ -6400,12 +6182,13 @@ def _run_picker_loop(stdscr, root: Path, nodes: list[Node]) -> None:  # pragma: 
 class ReceiveScreen(Screen):
     """Watch your channel for incoming posts, writing each to cwd.
 
-    A background daemon thread streams new-slot notifications over SSE and
-    drops them on a queue; `on_idle` (the curses thread) drains the queue and
-    does the fetch/verify/write — keeping all curses + TOFU work on the main
-    thread. If the relay has no /stream, it falls back to the cooperative
-    long-poll. Keys stay responsive; Esc/q stops. First-contact prompts surface
-    as a modal via `_tui_tofu`.
+    A background daemon thread runs the relay's 30 s long-poll and drops each
+    batch of new posts on a queue; `on_idle` (the curses thread) drains the
+    queue and does the fetch/verify/write — keeping all curses + TOFU work on
+    the main thread. The worker waits for `_drained` before re-listing so the
+    cursor it polls from is the one the main thread has advanced to. Keys stay
+    responsive; Esc/q stops. First-contact prompts surface as a modal via
+    `_tui_tofu`.
     """
 
     title = "Receive"
@@ -6413,7 +6196,8 @@ class ReceiveScreen(Screen):
         "watching your channel; files land in the current directory",
         "esc / q     stop and return to the picker",
     ]
-    _POLL_MS = 700
+    _TICK_MS = 250    # curses getch timeout: drain the queue, redraw
+    _RETRY_S = 2.0    # worker backoff after a relay error
 
     def __init__(self) -> None:
         self.received: list[str] = []
@@ -6422,11 +6206,11 @@ class ReceiveScreen(Screen):
         self.feed = _the_channel()
         self.host = ""
         self.feed_key = b""
-        self.last_ts = 0
+        self.last_seq = 0
         self._queue: "queue.Queue" = queue.Queue()
         self._stop = threading.Event()
+        self._drained = threading.Event()  # main -> worker: batch consumed
         self._thread: "threading.Thread | None" = None
-        self._stream_failed = False  # relay lacks /stream → cooperative long-poll
         if self.feed is None:
             self.error = _no_channel_hint()
             return
@@ -6437,13 +6221,13 @@ class ReceiveScreen(Screen):
             self.error = str(e)
             self.feed = None
             return
-        self.last_ts = self.feed.last_post_ts
+        self.last_seq = self.feed.last_seq
         self.status = "watching your channel..."
 
     def render(self, stdscr) -> None:  # pragma: no cover - curses I/O
         theme = _setup_theme()
         try:
-            stdscr.timeout(self._POLL_MS)
+            stdscr.timeout(self._TICK_MS)
         except curses.error:
             pass
         h, w = stdscr.getmaxyx()
@@ -6487,32 +6271,43 @@ class ReceiveScreen(Screen):
         except curses.error:
             pass
 
-    def _stream_worker(self) -> None:  # pragma: no cover - background thread/IO
-        """Stream new-slot notifications onto the queue. Network I/O only — all
+    def _poll_worker(self) -> None:  # pragma: no cover - background thread/IO
+        """Long-poll the post index onto the queue. Network I/O only — all
         curses/TOFU/decrypt work stays on the main (curses) thread."""
-        try:
-            for entry in _relay_stream_feed_slots(
-                self.host, self.feed.feed_id, self.feed_key,
-                since_fn=lambda: self.last_ts, stop=self._stop,
-            ):
-                if self._stop.is_set():
-                    break
-                self._queue.put(("slot", entry))
-        except _StreamUnsupported:
-            self._queue.put(("unsupported", None))
-        except NomnomError as e:
-            self._queue.put(("error", str(e)))
-        except Exception as e:  # keep the TUI alive on unexpected stream faults
-            self._queue.put(("error", str(e)))
+        while not self._stop.is_set():
+            try:
+                slots = _relay_list_feed_slots(
+                    self.host, self.feed.feed_id, self.feed_key,
+                    since_seq=self.last_seq, wait_ms=_RELAY_DEFAULT_WAIT_MS,
+                )
+            except NomnomError as e:
+                self._queue.put(("error", str(e)))
+                if self._stop.wait(self._RETRY_S):
+                    return
+                continue
+            except Exception as e:  # keep the TUI alive on unexpected faults
+                self._queue.put(("error", str(e)))
+                return
+            if not slots:
+                continue
+            # Hand the batch over and wait until the main thread has advanced
+            # last_seq before re-listing, or we'd re-fetch the same posts.
+            self._drained.clear()
+            self._queue.put(("slots", slots))
+            self._drained.wait()
 
-    def _ensure_stream(self) -> None:  # pragma: no cover - curses I/O
+    def _ensure_worker(self) -> None:  # pragma: no cover - curses I/O
         if self._thread is None and not self._stop.is_set():
-            self._thread = threading.Thread(target=self._stream_worker, daemon=True)
+            self._thread = threading.Thread(target=self._poll_worker, daemon=True)
             self._thread.start()
 
-    def _handle_slot(self, slot_id: str) -> None:  # pragma: no cover - curses I/O
+    def _handle_slot(self, slot_id: str) -> bool:  # pragma: no cover - curses I/O
         """Fetch/verify/write one slot. Caller wraps this in `_tui_tofu` +
-        redirect_stderr so prompts modal correctly and narration stays off-screen."""
+        redirect_stderr so prompts modal correctly and narration stays off-screen.
+
+        False only on a transient fetch failure (NomnomTransportError): the
+        caller then leaves the cursor put so the post is re-listed. Anything
+        else — landed, own post, or a permanent rejection — is advance-safe."""
         # Updates self.feed.members_cache in place (TUI intentionally doesn't
         # persist per-slot; ReceiveScreen persists the cursor separately).
         _refresh_roster_with_tofu(
@@ -6523,48 +6318,28 @@ class ReceiveScreen(Screen):
                 feed=self.feed, host=self.host,
                 feed_key=self.feed_key, slot_id=slot_id,
             )
+        except NomnomTransportError as e:
+            self.status = f"relay error: {e} (retrying)"
+            return False
         except (NomnomError, OSError) as e:
             self.status = f"dropped a post: {e}"
-            return
+            return True
         if res is not None:
             filename, nbytes, sender, out_path = res
             self.received.append(
                 f"{filename} ({nbytes:,} bytes) from {sender} -> {out_path}",
             )
             self.status = f"received {filename!r}"
+        return True
 
-    def _persist_ts(self) -> None:  # pragma: no cover - curses I/O
-        _receive_persist_ts(self.feed, self.last_ts)
-
-    def _poll_once(self, stdscr) -> ScreenAction:  # pragma: no cover - curses I/O
-        """Cooperative long-poll fallback when the relay has no /stream."""
-        err_buf = io.StringIO()
-        with _tui_tofu(stdscr), contextlib.redirect_stderr(err_buf):
-            try:
-                slots = _relay_list_feed_slots(
-                    self.host, self.feed.feed_id, self.feed_key,
-                    since_ts=self.last_ts, wait_ms=self._POLL_MS,
-                )
-            except NomnomError as e:
-                self.status = f"relay error: {e}"
-                return ScreenAction.CONTINUE
-            for entry in slots:
-                slot_id = entry.get("slot_id")
-                created_at = int(entry.get("created_at") or 0)
-                if slot_id:
-                    self._handle_slot(slot_id)
-                if created_at > self.last_ts:
-                    self.last_ts = created_at
-        self._persist_ts()
-        return ScreenAction.CONTINUE
+    def _persist_seq(self) -> None:  # pragma: no cover - curses I/O
+        _receive_persist_seq(self.feed, self.last_seq)
 
     def on_idle(self, stdscr) -> ScreenAction:  # pragma: no cover - curses I/O
         if self.feed is None:
             return ScreenAction.CONTINUE
-        if self._stream_failed:
-            return self._poll_once(stdscr)
-        self._ensure_stream()
-        # Drain whatever the stream thread queued since the last tick.
+        self._ensure_worker()
+        # Drain whatever the worker queued since the last tick.
         items = []
         while True:
             try:
@@ -6578,26 +6353,25 @@ class ReceiveScreen(Screen):
         err_buf = io.StringIO()
         with _tui_tofu(stdscr), contextlib.redirect_stderr(err_buf):
             for kind, payload in items:
-                if kind == "unsupported":
-                    self._stream_failed = True
-                    self.status = "relay has no /stream; using long-poll"
-                    continue
                 if kind == "error":
-                    self.status = f"stream error: {payload}"
+                    self.status = f"relay error: {payload}"
                     continue
-                entry = payload
-                slot_id = entry.get("slot_id")
-                created_at = int(entry.get("created_at") or 0)
-                if slot_id and created_at > self.last_ts:
-                    self._handle_slot(slot_id)
-                if created_at > self.last_ts:
-                    self.last_ts = created_at
-        self._persist_ts()
+                for entry in payload:  # kind == "slots", ascending by seq
+                    slot_id = entry.get("slot_id")
+                    seq = int(entry.get("seq") or 0)
+                    if not slot_id or seq <= self.last_seq:
+                        continue
+                    if not self._handle_slot(slot_id):
+                        break  # leave the cursor put; the worker re-lists
+                    self.last_seq = seq
+        self._persist_seq()
+        self._drained.set()
         return ScreenAction.CONTINUE
 
     def handle_key(self, ch: int, stdscr=None):
         if ch in (ord("q"), 3, 27):
-            self._stop.set()  # wind the stream thread down (daemon; exits on next read)
+            self._stop.set()  # wind the worker down (daemon; exits on next wake)
+            self._drained.set()  # unblock a worker parked on a handed-over batch
             if stdscr is not None:
                 try:
                     stdscr.timeout(-1)
@@ -7619,7 +7393,10 @@ def _build_relay_parser() -> argparse.ArgumentParser:
         ),
     )
     p_init.add_argument("--allow-private", action="store_true", help=private_help)
-    sp.add_parser("test", help="Round-trip check: hits /health then PUT + GET.")
+    sp.add_parser(
+        "test",
+        help="Round-trip check: /health, mint a throwaway channel, post + read, delete it.",
+    )
     p_show = sp.add_parser("show", help="Print current config (secret redacted).")
     p_show.add_argument(
         "--token", action="store_true",
